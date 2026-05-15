@@ -1,0 +1,15 @@
+diff --git a/eval_wrapper/eval.py b/eval_wrapper/eval.py
+--- a/eval_wrapper/eval.py
++++ b/eval_wrapper/eval.py
+@@
+ class EvalWrapper:
+     def __init__(self, checkpoint_path, distributed=False, device="cuda", dtype=torch.float32):
++        self.device = device
+         self.dtype = dtype
+@@
+-        return eval_model(model, views, ...)
++        return eval_model(model, views, device=self.device, ...)
+
+# Apply this intent manually if the exact upstream context differs. The
+# required behavior is that the device passed to EvalWrapper is stored and
+# forwarded into eval_model/eval_scene instead of silently defaulting to cuda:0.

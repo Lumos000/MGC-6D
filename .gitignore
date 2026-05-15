@@ -1,0 +1,75 @@
+# Python/cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editors/OS
+.DS_Store
+.idea/
+.vscode/
+
+# Environments/build outputs
+.env
+.venv/
+env/
+venv/
+build/
+dist/
+*.egg-info/
+*.so
+
+# Experiment outputs and datasets
+results/
+outputs/
+debug/
+logs/
+wandb/
+data/
+datasets/
+demo_data/*
+!demo_data/.gitkeep
+
+# Model weights/checkpoints and generated geometry
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.onnx
+*.ply
+*.obj
+*.glb
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.pdf
+
+# Vendored dependency outputs
+foundationpose/build/
+foundationpose/debug/
+foundationpose/exp/
+foundationpose/weights/*
+!foundationpose/weights/.gitkeep
+foundationpose/demo_data/*
+instantmesh/ckpts/*
+!instantmesh/ckpts/.gitkeep
+instantmesh/outputs/
+sam2/checkpoints/*
+!sam2/checkpoints/.gitkeep
+sam2/outputs/
+sam2/build/
+sam2/*.egg-info/
+bop_toolkit/results/
+
+# Local RaySt3R checkout should stay external.
+rayst3r/
+!demo_data/
+!foundationpose/weights/
+!sam2/checkpoints/
+!instantmesh/ckpts/
