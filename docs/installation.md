@@ -23,13 +23,48 @@ pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorc
 pip install -r requirements.txt
 ```
 
-FoundationPose contains CUDA/C++ extensions. Build them after activating the
-environment:
+FoundationPose contains C++/CUDA extensions. The most important one for
+query-time pose refinement is `foundationpose/mycpp`; it provides
+`cluster_poses`, which is called when the Any6D estimator initializes its
+rotation grid. Build it after activating the environment:
 
 ```bash
-cd foundationpose
-bash build_all_conda.sh
-cd ..
+# pybind11 must be visible to CMake.
+python -m pip install pybind11
+
+cd foundationpose/mycpp
+rm -rf build && mkdir -p build && cd build
+cmake .. -DPYTHON_EXECUTABLE=$(which python) \
+  -Dpybind11_DIR=$(python -m pybind11 --cmakedir)
+make -j$(nproc)
+cd ../../..
+```
+
+Verify the extension:
+
+```bash
+python - <<'PY'
+from foundationpose.Utils import mycpp
+print(mycpp.__file__)
+print('cluster_poses:', hasattr(mycpp, 'cluster_poses'))
+PY
+```
+
+The path should point to `foundationpose/mycpp/build/mycpp*.so`, and
+`cluster_poses` should be `True`. If it is `False` or `mycpp` is `None`, query
+scripts will fail with an error similar to:
+
+```text
+AttributeError: 'NoneType' object has no attribute 'cluster_poses'
+```
+
+The bundled FoundationPose helper under `foundationpose/bundlesdf/mycuda` can
+then be installed with:
+
+```bash
+cd foundationpose/bundlesdf/mycuda
+python -m pip install -e .
+cd ../../..
 ```
 
 Install SAM2 in editable mode:
@@ -51,6 +86,23 @@ If your RaySt3R checkout does not propagate the selected device into
 `eval_model`, apply `third_party/rayst3r_patches/device_eval.patch`.
 
 ## Troubleshooting
+
+### CMake Cannot Find `pybind11`
+
+If `cmake ..` in `foundationpose/mycpp/build` fails with:
+
+```text
+Could not find a package configuration file provided by "pybind11"
+```
+
+install pybind11 in the active environment and pass its CMake directory
+explicitly:
+
+```bash
+python -m pip install pybind11
+cmake .. -DPYTHON_EXECUTABLE=$(which python) \
+  -Dpybind11_DIR=$(python -m pybind11 --cmakedir)
+```
 
 ### PyOpenGL / VisPy Import Stalls
 

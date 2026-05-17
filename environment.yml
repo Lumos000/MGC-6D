@@ -36,3 +36,4 @@ dependencies:
       - yacs
       - pycocotools
       - gdown
+      - pybind11

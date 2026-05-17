@@ -37,9 +37,21 @@ TorchVision 0.20.1+cu121, CUDA 12.1, and driver 565.57.01 on RTX 3090 GPUs.
 conda env create -f environment.yml
 conda activate geoanchor
 
-cd foundationpose
-bash build_all_conda.sh
-cd ..
+# FoundationPose pose refinement requires a local C++ extension.
+# If pybind11 is not visible to CMake, install it first:
+python -m pip install pybind11
+
+cd foundationpose/mycpp
+rm -rf build && mkdir -p build && cd build
+cmake .. -DPYTHON_EXECUTABLE=$(which python) \
+  -Dpybind11_DIR=$(python -m pybind11 --cmakedir)
+make -j$(nproc)
+cd ../../..
+
+# Optional: build the FoundationPose CUDA helper used by BundleSDF paths.
+cd foundationpose/bundlesdf/mycuda
+python -m pip install -e .
+cd ../../..
 
 cd sam2
 pip install -e .
@@ -55,6 +67,25 @@ export RAYST3R_ROOT=$(realpath ../rayst3r)
 
 If your RaySt3R checkout ignores the selected CUDA device, apply the patch
 intent in `third_party/rayst3r_patches/device_eval.patch`.
+
+### Verify FoundationPose `mycpp`
+
+`query_paper.py` and the dataset-specific query scripts call
+`foundationpose.mycpp.cluster_poses` during Any6D initialization. If this
+extension is missing, the run fails early with
+`AttributeError: 'NoneType' object has no attribute 'cluster_poses'`.
+Verify the build before running experiments:
+
+```bash
+python - <<'PY'
+from foundationpose.Utils import mycpp
+print(mycpp.__file__)
+print('cluster_poses:', hasattr(mycpp, 'cluster_poses'))
+PY
+```
+
+The expected output points to
+`foundationpose/mycpp/build/mycpp*.so` and prints `cluster_poses: True`.
 
 ## Data And Checkpoints
 
@@ -123,9 +154,7 @@ python query_paper.py \
   --register_iteration 5 \
   --score_alpha 0.3 \
   --score_beta 0.7 \
-  --per_frame_selection \
-  --use_bbox_diameter \
-  --lazy_tensors
+  --per_frame_selection
 ```
 
 ## Outputs
