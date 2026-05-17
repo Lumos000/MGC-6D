@@ -8,5 +8,5 @@ This repository contains or interfaces with third-party research code:
 - `bop_toolkit/`: BOP toolkit, under its own license.
 - RaySt3R is not vendored; set `RAYST3R_ROOT` to an external checkout.
 
-The root MIT license applies to GeoAnchor-specific glue, scripts, and docs,
+The root MIT license applies to MGC-6D-specific glue, scripts, and docs,
 not to third-party subdirectories that carry their own license files.

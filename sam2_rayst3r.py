@@ -38,8 +38,6 @@ def _import_rayst3r():
         ) from exc
 
 
-EvalWrapper, eval_scene = _import_rayst3r()
-
 from sam2.sam2.build_sam import build_sam2
 from sam2.sam2.sam2_image_predictor import SAM2ImagePredictor
 
@@ -161,6 +159,7 @@ class Rayst3RRunner:
 
             checkpoint_path = hf_hub_download("bartduis/rayst3r", "rayst3r.pth")
 
+        EvalWrapper, _ = _import_rayst3r()
         self.model = EvalWrapper(checkpoint_path, distributed=False, device=device, dtype=dtype)
         self.dino_model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitl14_reg")
         self.dino_model.eval()
@@ -187,6 +186,7 @@ class Rayst3RRunner:
 
         write_rayst3r_inputs(color, depth_m, mask, intrinsic, work_dir)
 
+        _, eval_scene = _import_rayst3r()
         result = eval_scene(
             self.model,
             work_dir,

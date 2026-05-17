@@ -1,4 +1,4 @@
-"""Project-local import path setup for GeoAnchor entry points."""
+"""Project-local import path setup for MGC-6D entry points."""
 
 from __future__ import annotations
 
