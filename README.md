@@ -17,6 +17,8 @@ HO3D is the maintained one-command reproduction path.
 ```text
 anchor_paper.py                         # anchor reconstruction and candidate registry generation
 query_paper.py                          # HO3D query evaluation with multi-candidate selection
+query_paper_toyl.py                     # Toyota-Light auxiliary query evaluation
+run_real275_query.py                    # REAL275 auxiliary query evaluation
 construction.py                         # RaySt3R / InstantMesh / fusion reconstruction utilities
 sam2_rayst3r.py                         # SAM2 + RaySt3R wrappers
 sam2_instantmesh.py                     # SAM2 + InstantMesh wrappers
@@ -154,6 +156,8 @@ python query_paper.py \
   --running_stride 10 \
   --register_iteration 5
 ```
+
+Auxiliary Toyota-Light and REAL275 evaluations can be launched with `scripts/run_toyl_full.sh` and `scripts/run_real275_full.sh`.
 
 ## Outputs
 
