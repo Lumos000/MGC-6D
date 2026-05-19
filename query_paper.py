@@ -311,6 +311,127 @@ def _resolve_pose_with_symmetry(
     return best_pose
 
 
+def _relative_gain_is_better(candidate_value: float, reference_value: float, gain: float) -> bool:
+    """Return whether a lower-is-better score improves by at least a relative gain."""
+    reference_value = float(reference_value)
+    candidate_value = float(candidate_value)
+    if not np.isfinite(candidate_value) or not np.isfinite(reference_value):
+        return False
+    if reference_value <= 1e-8:
+        return candidate_value < reference_value
+    return candidate_value <= reference_value * (1.0 - gain)
+
+
+def _select_with_metric_anchor_default(
+    candidate_results: list,
+    metric_anchor_label: str,
+    args,
+) -> tuple:
+    """Select a guarded winner with metric-anchor as the default candidate.
+
+    The guard lets another candidate replace the metric anchor only when the
+    candidate is anchor-reliable and clearly better in query observation terms.
+    """
+    metric_anchor = next(
+        (r for r in candidate_results if r["label"] == metric_anchor_label),
+        None,
+    )
+    if metric_anchor is None:
+        fallback = min(candidate_results, key=lambda x: x["total_score"])
+        return fallback, {
+            "default_candidate": "",
+            "guard_override": False,
+            "guard_reason": "metric_anchor_missing",
+            "metric_anchor_total_score": np.nan,
+            "best_non_metric_total_score": float(fallback["total_score"]),
+            "metric_anchor_l_depth": np.nan,
+            "metric_anchor_l_mask": np.nan,
+            "metric_anchor_l_geom": np.nan,
+            "best_non_metric_l_depth": float(fallback["l_depth"]),
+            "best_non_metric_l_mask": float(fallback["l_mask"]),
+            "best_non_metric_l_geom": float(fallback["l_geom"]),
+            "best_non_metric_anchor_score": float(fallback["s_anchor"]),
+        }
+
+    non_metric = [r for r in candidate_results if r["label"] != metric_anchor_label]
+    best_non_metric = min(non_metric, key=lambda x: x["total_score"]) if non_metric else None
+
+    diagnostics = {
+        "default_candidate": metric_anchor_label,
+        "guard_override": False,
+        "guard_reason": "no_non_metric_candidate",
+        "metric_anchor_total_score": float(metric_anchor["total_score"]),
+        "best_non_metric_total_score": np.nan,
+        "metric_anchor_l_depth": float(metric_anchor["l_depth"]),
+        "metric_anchor_l_mask": float(metric_anchor["l_mask"]),
+        "metric_anchor_l_geom": float(metric_anchor["l_geom"]),
+        "best_non_metric_l_depth": np.nan,
+        "best_non_metric_l_mask": np.nan,
+        "best_non_metric_l_geom": np.nan,
+        "best_non_metric_anchor_score": np.nan,
+    }
+
+    if best_non_metric is None:
+        return metric_anchor, diagnostics
+
+    diagnostics.update({
+        "guard_reason": "metric_anchor_default",
+        "best_non_metric_total_score": float(best_non_metric["total_score"]),
+        "best_non_metric_l_depth": float(best_non_metric["l_depth"]),
+        "best_non_metric_l_mask": float(best_non_metric["l_mask"]),
+        "best_non_metric_l_geom": float(best_non_metric["l_geom"]),
+        "best_non_metric_anchor_score": float(best_non_metric["s_anchor"]),
+    })
+
+
+    anchor_ok = float(best_non_metric["s_anchor"]) >= args.guard_anchor_min
+    total_ok = (
+        float(best_non_metric["total_score"])
+        <= float(metric_anchor["total_score"]) - args.guard_total_margin
+    )
+    query_ok = _relative_gain_is_better(
+        best_non_metric["s_query"],
+        metric_anchor["s_query"],
+        args.guard_query_rel_gain,
+    )
+    depth_ok = _relative_gain_is_better(
+        best_non_metric["l_depth"],
+        metric_anchor["l_depth"],
+        args.guard_depth_rel_gain,
+    )
+    mask_ok = _relative_gain_is_better(
+        best_non_metric["l_mask"],
+        metric_anchor["l_mask"],
+        args.guard_mask_rel_gain,
+    )
+    geom_ok = _relative_gain_is_better(
+        best_non_metric["l_geom"],
+        metric_anchor["l_geom"],
+        args.guard_geom_rel_gain,
+    )
+
+    if anchor_ok and total_ok and query_ok and depth_ok and mask_ok and geom_ok:
+        diagnostics["guard_override"] = True
+        diagnostics["guard_reason"] = "passed_guard"
+        return best_non_metric, diagnostics
+
+    failed = []
+    if not anchor_ok:
+        failed.append("anchor")
+    if not total_ok:
+        failed.append("total")
+    if not query_ok:
+        failed.append("query")
+    if not depth_ok:
+        failed.append("depth")
+    if not mask_ok:
+        failed.append("mask")
+    if not geom_ok:
+        failed.append("geom")
+    diagnostics["guard_reason"] = "blocked_" + "_".join(failed)
+    return metric_anchor, diagnostics
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -363,6 +484,80 @@ if __name__ == "__main__":
     parser.set_defaults(per_frame_selection=True)
     parser.add_argument("--fallback_single", action="store_true", default=False,
                         help="Fallback to single-candidate mode if no registry found")
+    parser.add_argument("--fallback_only", action="store_true", default=False,
+                        help="Force legacy fallback single-candidate mode even when a registry exists")
+    parser.add_argument("--hybrid_registry_obj_folders", nargs="+", default=None,
+                        help="Use registry-only multi-candidate mode for these HO3D folders; force fallback-only for all others")
+    parser.add_argument("--obj_folders", nargs="+", default=None,
+                        help="HO3D evaluation sequence folders to run (default: all 13)")
+    parser.add_argument("--include_fallback_candidate", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Include the legacy single-candidate mesh alongside registry candidates")
+    parser.add_argument("--prefer_fallback_candidate", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Prefer fallback if its score is close to the best multi-candidate score")
+    parser.add_argument("--fallback_guard_margin", type=float, default=0.08,
+                        help="Choose fallback when fallback_score <= best_score + margin")
+    parser.add_argument(
+        "--metric_anchor_path",
+        type=str,
+        default=None,
+        help="Path to metric-grounded anchor assets used by metric-anchor guarded selection.",
+    )
+    parser.add_argument(
+        "--metric_anchor_label",
+        type=str,
+        default="metric_anchor",
+        help="Label written for the metric-grounded anchor candidate.",
+    )
+    parser.add_argument(
+        "--metric_anchor_use_bbox_diameter",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use bbox diagonal for metric-anchor diameter to match the stable single-anchor path.",
+    )
+    parser.add_argument(
+        "--metric_anchor_strict_pose_flow",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip query-path symmetry post-processing for metric-anchor to match the stable single-anchor path.",
+    )
+    parser.add_argument(
+        "--guard_total_margin",
+        type=float,
+        default=0.15,
+        help="Required total-score margin for replacing metric-anchor in guarded mode.",
+    )
+    parser.add_argument(
+        "--guard_query_rel_gain",
+        type=float,
+        default=0.20,
+        help="Required relative query-score improvement for guarded replacement.",
+    )
+    parser.add_argument(
+        "--guard_depth_rel_gain",
+        type=float,
+        default=0.15,
+        help="Required relative depth-consistency improvement for guarded replacement.",
+    )
+    parser.add_argument(
+        "--guard_mask_rel_gain",
+        type=float,
+        default=0.10,
+        help="Required relative mask-consistency improvement for guarded replacement.",
+    )
+    parser.add_argument(
+        "--guard_geom_rel_gain",
+        type=float,
+        default=0.10,
+        help="Required relative geometry-consistency improvement for guarded replacement.",
+    )
+    parser.add_argument(
+        "--guard_anchor_min",
+        type=float,
+        default=0.50,
+        help="Minimum anchor calibration score for a non-metric candidate to replace metric-anchor.",
+    )
     parser.add_argument(
         "--symmetry_consistency_enable",
         action=argparse.BooleanOptionalAction,
@@ -377,6 +572,8 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+    if not args.metric_anchor_path:
+        raise ValueError("--metric_anchor_path is required")
 
     name = args.name
     hot3d_data_root = args.hot3d_data_root
@@ -412,12 +609,28 @@ if __name__ == "__main__":
         "AP10", "AP11", "AP12", "AP13", "AP14",
         "SB11", "SB13", "SM1",
     ]
+    valid_obj_folders = set(obj_folder)
+    if args.obj_folders:
+        requested = set(args.obj_folders)
+        unknown = sorted(requested - valid_obj_folders)
+        if unknown:
+            raise ValueError(f"Unknown HO3D obj_folders: {unknown}")
+        obj_folder = [obj for obj in obj_folder if obj in requested]
+    hybrid_registry_folders = set(args.hybrid_registry_obj_folders or [])
+    unknown_hybrid = sorted(hybrid_registry_folders - valid_obj_folders)
+    if unknown_hybrid:
+        raise ValueError(f"Unknown hybrid_registry_obj_folders: {unknown_hybrid}")
 
     object_metrics = {
         obj: {
             "ADD": [], "ADD-S": [], "AR": [], "VSD": [], "MSSD": [], "MSPD": [],
             "R error": [], "T error": [], "cls_id": [], "instance_id": [],
             "chosen_candidate": [],
+            "default_candidate": [], "guard_override": [], "guard_reason": [],
+            "metric_anchor_total_score": [], "best_non_metric_total_score": [],
+            "metric_anchor_l_depth": [], "metric_anchor_l_mask": [], "metric_anchor_l_geom": [],
+            "best_non_metric_l_depth": [], "best_non_metric_l_mask": [], "best_non_metric_l_geom": [],
+            "best_non_metric_anchor_score": [],
         }
         for obj in obj_folder
     }
@@ -426,6 +639,11 @@ if __name__ == "__main__":
         "ADD-S": [], "ADD": [], "AR": [],
         "MSSD": [], "MSPD": [], "VSD": [],
         "R_error": [], "T_error": [], "Chosen_Candidate": [],
+        "Default_Candidate": [], "Guard_Override": [], "Guard_Reason": [],
+        "MetricAnchor_Total_Score": [], "BestNonMetric_Total_Score": [],
+        "MetricAnchor_L_Depth": [], "MetricAnchor_L_Mask": [], "MetricAnchor_L_Geom": [],
+        "BestNonMetric_L_Depth": [], "BestNonMetric_L_Mask": [], "BestNonMetric_L_Geom": [],
+        "BestNonMetric_Anchor_Score": [],
     }
 
     glctx = dr.RasterizeCudaContext()
@@ -479,8 +697,12 @@ if __name__ == "__main__":
         # ==================================================================
         cand_caches = []
         cand_anchor_poses = {}
+        cand_gt_anchor_poses = {}
         obj_registry = candidate_registry.get(obj_name, {})
-        obj_candidates = obj_registry.get("candidates", {})
+        hybrid_enabled = bool(hybrid_registry_folders)
+        use_hybrid_registry = obj_f in hybrid_registry_folders
+        force_fallback_only = args.fallback_only or (hybrid_enabled and not use_hybrid_registry)
+        obj_candidates = {} if force_fallback_only else obj_registry.get("candidates", {})
 
         obj_candidate_info_by_label = {}
         if obj_candidates:
@@ -509,31 +731,81 @@ if __name__ == "__main__":
                 pose_path = info.get("pose_path", "")
                 if os.path.exists(pose_path):
                     cand_anchor_poses[label] = np.loadtxt(pose_path)
+                    gt_pose_path = pose_path.replace("initial", "gt")
+                    if os.path.exists(gt_pose_path):
+                        cand_gt_anchor_poses[label] = np.loadtxt(gt_pose_path)
 
-        if not cand_caches:
-            fallback_mesh_path = reader.get_reference_view_1_mesh(anchor_path)
-            fallback_mesh = trimesh.load(fallback_mesh_path)
-            cache = CandidateCache(
-                label="fallback",
-                mesh=fallback_mesh,
+        fallback_label = "fallback"
+        include_fallback_for_obj = (
+            force_fallback_only
+            or not cand_caches
+            or (args.include_fallback_candidate and not use_hybrid_registry)
+        )
+        if include_fallback_for_obj:
+            if fallback_label not in {c.label for c in cand_caches}:
+                fallback_mesh_path = reader.get_reference_view_1_mesh(anchor_path)
+                if os.path.exists(fallback_mesh_path):
+                    fallback_mesh = trimesh.load(fallback_mesh_path)
+                    cache = CandidateCache(
+                        label=fallback_label,
+                        mesh=fallback_mesh,
+                        s_anchor=1.0,
+                        use_bbox_diameter=args.use_bbox_diameter,
+                        lazy_tensors=False,
+                    )
+                    cand_caches.append(cache)
+                    fallback_pose_path = reader.get_reference_view_1_pose(anchor_path)
+                    if os.path.exists(fallback_pose_path):
+                        cand_anchor_poses[fallback_label] = np.loadtxt(fallback_pose_path)
+                        fallback_gt_pose_path = fallback_pose_path.replace("initial", "gt")
+                        if os.path.exists(fallback_gt_pose_path):
+                            cand_gt_anchor_poses[fallback_label] = np.loadtxt(fallback_gt_pose_path)
+                elif not cand_caches:
+                    raise FileNotFoundError(f"Fallback mesh not found: {fallback_mesh_path}")
+
+        metric_anchor_label = args.metric_anchor_label
+        if args.metric_anchor_path:
+            if metric_anchor_label in {c.label for c in cand_caches}:
+                raise ValueError(f"metric_anchor_label conflicts with an existing candidate: {metric_anchor_label}")
+            metric_mesh_path = reader.get_reference_view_1_mesh(args.metric_anchor_path)
+            if not os.path.exists(metric_mesh_path):
+                raise FileNotFoundError(f"Metric-anchor mesh not found: {metric_mesh_path}")
+            metric_pose_path = reader.get_reference_view_1_pose(args.metric_anchor_path)
+            metric_gt_pose_path = metric_pose_path.replace("initial", "gt")
+            if not os.path.exists(metric_pose_path):
+                raise FileNotFoundError(f"Metric-anchor initial pose not found: {metric_pose_path}")
+            if not os.path.exists(metric_gt_pose_path):
+                raise FileNotFoundError(f"Metric-anchor GT pose not found: {metric_gt_pose_path}")
+
+            metric_mesh = trimesh.load(metric_mesh_path)
+            metric_cache = CandidateCache(
+                label=metric_anchor_label,
+                mesh=metric_mesh,
                 s_anchor=1.0,
-                use_bbox_diameter=args.use_bbox_diameter,
+                use_bbox_diameter=args.metric_anchor_use_bbox_diameter,
                 lazy_tensors=False,
             )
-            cand_caches.append(cache)
-            fallback_pose_path = reader.get_reference_view_1_pose(anchor_path)
-            if os.path.exists(fallback_pose_path):
-                cand_anchor_poses["fallback"] = np.loadtxt(fallback_pose_path)
+            cand_caches.insert(0, metric_cache)
+            cand_anchor_poses[metric_anchor_label] = np.loadtxt(metric_pose_path)
+            cand_gt_anchor_poses[metric_anchor_label] = np.loadtxt(metric_gt_pose_path)
+
+        if not cand_caches:
+            raise RuntimeError(f"No valid candidates for {obj_f} ({obj_name})")
 
         gt_pose_a_path = reader.get_reference_view_1_pose(anchor_path).replace("initial", "gt")
         gt_pose_a = np.loadtxt(gt_pose_a_path)
+        for cache in cand_caches:
+            cand_gt_anchor_poses.setdefault(cache.label, gt_pose_a)
 
         print(f"\n{obj_f} ({obj_name}): {len(cand_caches)} candidate(s): "
               f"{[c.label for c in cand_caches]}")
 
         static_object_winner = None
         prev_pred_pose_q = None
-        if len(cand_caches) > 1 and not args.per_frame_selection:
+        if (
+            len(cand_caches) > 1
+            and not args.per_frame_selection
+        ):
             # Object-level selection: use anchor-phase candidate metrics as static priors.
             static_scores = {}
             valid_l_depth = [
@@ -589,7 +861,11 @@ if __name__ == "__main__":
 
             candidate_results = []
             eval_caches = cand_caches
-            if len(cand_caches) > 1 and not args.per_frame_selection and static_object_winner is not None:
+            if (
+                len(cand_caches) > 1
+                and not args.per_frame_selection
+                and static_object_winner is not None
+            ):
                 eval_caches = [c for c in cand_caches if c.label == static_object_winner]
 
             for cache in eval_caches:
@@ -597,6 +873,7 @@ if __name__ == "__main__":
                 pred_pose_a = cand_anchor_poses.get(cache.label)
                 if pred_pose_a is None:
                     pred_pose_a = np.eye(4)
+                gt_pose_a_for_candidate = cand_gt_anchor_poses.get(cache.label, gt_pose_a)
 
                 pred_pose_q_k = est.register(
                     K=reader.K,
@@ -606,17 +883,21 @@ if __name__ == "__main__":
                     iteration=args.register_iteration,
                     name=obj_f,
                 )
-                if args.anchor_symmetry_align and len(sym_tfs_list) > 1:
+                use_strict_metric_flow = (
+                    cache.label == metric_anchor_label
+                    and args.metric_anchor_strict_pose_flow
+                )
+                if args.anchor_symmetry_align and len(sym_tfs_list) > 1 and not use_strict_metric_flow:
                     pred_pose_q_k = _resolve_pose_to_anchor_symmetry(
                         pred_pose_q_k, pred_pose_a, sym_tfs_list
                     )
-                if args.symmetry_consistency_enable and len(sym_tfs_list) > 1:
+                if args.symmetry_consistency_enable and len(sym_tfs_list) > 1 and not use_strict_metric_flow:
                     pred_pose_q_k = _resolve_pose_with_symmetry(
                         pred_pose_q_k, sym_tfs_list, prev_pred_pose_q
                     )
 
                 pose_aq = pred_pose_q_k @ np.linalg.inv(pred_pose_a)
-                pred_q_k = pose_aq @ gt_pose_a
+                pred_q_k = pose_aq @ gt_pose_a_for_candidate
 
                 # ==========================================================
                 # Observation consistency scoring (Eq. 14)
@@ -662,7 +943,25 @@ if __name__ == "__main__":
             # Best candidate selection (Eq. 15)
             # ==============================================================
             candidate_results.sort(key=lambda x: x["total_score"])
-            winner = candidate_results[0]
+            guard_diagnostics = {
+                "default_candidate": "",
+                "guard_override": False,
+                "guard_reason": "default_selection",
+                "metric_anchor_total_score": np.nan,
+                "best_non_metric_total_score": np.nan,
+                "metric_anchor_l_depth": np.nan,
+                "metric_anchor_l_mask": np.nan,
+                "metric_anchor_l_geom": np.nan,
+                "best_non_metric_l_depth": np.nan,
+                "best_non_metric_l_mask": np.nan,
+                "best_non_metric_l_geom": np.nan,
+                "best_non_metric_anchor_score": np.nan,
+            }
+            winner, guard_diagnostics = _select_with_metric_anchor_default(
+                candidate_results,
+                metric_anchor_label,
+                args,
+            )
             best_label = winner["label"]
             best_pred_pose_q = winner["pred_pose_q"]
             pred_q = winner["pred_q"]
@@ -723,6 +1022,18 @@ if __name__ == "__main__":
             object_metrics[obj_f]["cls_id"].append(obj_f)
             object_metrics[obj_f]["instance_id"].append(obj_count)
             object_metrics[obj_f]["chosen_candidate"].append(best_label)
+            object_metrics[obj_f]["default_candidate"].append(guard_diagnostics["default_candidate"])
+            object_metrics[obj_f]["guard_override"].append(guard_diagnostics["guard_override"])
+            object_metrics[obj_f]["guard_reason"].append(guard_diagnostics["guard_reason"])
+            object_metrics[obj_f]["metric_anchor_total_score"].append(guard_diagnostics["metric_anchor_total_score"])
+            object_metrics[obj_f]["best_non_metric_total_score"].append(guard_diagnostics["best_non_metric_total_score"])
+            object_metrics[obj_f]["metric_anchor_l_depth"].append(guard_diagnostics["metric_anchor_l_depth"])
+            object_metrics[obj_f]["metric_anchor_l_mask"].append(guard_diagnostics["metric_anchor_l_mask"])
+            object_metrics[obj_f]["metric_anchor_l_geom"].append(guard_diagnostics["metric_anchor_l_geom"])
+            object_metrics[obj_f]["best_non_metric_l_depth"].append(guard_diagnostics["best_non_metric_l_depth"])
+            object_metrics[obj_f]["best_non_metric_l_mask"].append(guard_diagnostics["best_non_metric_l_mask"])
+            object_metrics[obj_f]["best_non_metric_l_geom"].append(guard_diagnostics["best_non_metric_l_geom"])
+            object_metrics[obj_f]["best_non_metric_anchor_score"].append(guard_diagnostics["best_non_metric_anchor_score"])
 
             try:
                 visualize_frame_results_gt(
@@ -754,6 +1065,18 @@ if __name__ == "__main__":
             "R_error": object_metrics[obj_f]["R error"],
             "T_error": object_metrics[obj_f]["T error"],
             "Chosen_Candidate": object_metrics[obj_f]["chosen_candidate"],
+            "Default_Candidate": object_metrics[obj_f]["default_candidate"],
+            "Guard_Override": object_metrics[obj_f]["guard_override"],
+            "Guard_Reason": object_metrics[obj_f]["guard_reason"],
+            "MetricAnchor_Total_Score": object_metrics[obj_f]["metric_anchor_total_score"],
+            "BestNonMetric_Total_Score": object_metrics[obj_f]["best_non_metric_total_score"],
+            "MetricAnchor_L_Depth": object_metrics[obj_f]["metric_anchor_l_depth"],
+            "MetricAnchor_L_Mask": object_metrics[obj_f]["metric_anchor_l_mask"],
+            "MetricAnchor_L_Geom": object_metrics[obj_f]["metric_anchor_l_geom"],
+            "BestNonMetric_L_Depth": object_metrics[obj_f]["best_non_metric_l_depth"],
+            "BestNonMetric_L_Mask": object_metrics[obj_f]["best_non_metric_l_mask"],
+            "BestNonMetric_L_Geom": object_metrics[obj_f]["best_non_metric_l_geom"],
+            "BestNonMetric_Anchor_Score": object_metrics[obj_f]["best_non_metric_anchor_score"],
         })
 
         means_all = {
@@ -812,6 +1135,18 @@ if __name__ == "__main__":
         all_frame_data["R_error"].extend(object_metrics[obj_f]["R error"])
         all_frame_data["T_error"].extend(object_metrics[obj_f]["T error"])
         all_frame_data["Chosen_Candidate"].extend(object_metrics[obj_f]["chosen_candidate"])
+        all_frame_data["Default_Candidate"].extend(object_metrics[obj_f]["default_candidate"])
+        all_frame_data["Guard_Override"].extend(object_metrics[obj_f]["guard_override"])
+        all_frame_data["Guard_Reason"].extend(object_metrics[obj_f]["guard_reason"])
+        all_frame_data["MetricAnchor_Total_Score"].extend(object_metrics[obj_f]["metric_anchor_total_score"])
+        all_frame_data["BestNonMetric_Total_Score"].extend(object_metrics[obj_f]["best_non_metric_total_score"])
+        all_frame_data["MetricAnchor_L_Depth"].extend(object_metrics[obj_f]["metric_anchor_l_depth"])
+        all_frame_data["MetricAnchor_L_Mask"].extend(object_metrics[obj_f]["metric_anchor_l_mask"])
+        all_frame_data["MetricAnchor_L_Geom"].extend(object_metrics[obj_f]["metric_anchor_l_geom"])
+        all_frame_data["BestNonMetric_L_Depth"].extend(object_metrics[obj_f]["best_non_metric_l_depth"])
+        all_frame_data["BestNonMetric_L_Mask"].extend(object_metrics[obj_f]["best_non_metric_l_mask"])
+        all_frame_data["BestNonMetric_L_Geom"].extend(object_metrics[obj_f]["best_non_metric_l_geom"])
+        all_frame_data["BestNonMetric_Anchor_Score"].extend(object_metrics[obj_f]["best_non_metric_anchor_score"])
 
     # ======================================================================
     # Overall summary
@@ -861,6 +1196,18 @@ if __name__ == "__main__":
         "R_error": f"{df_all_frames['R_error'].mean():.1f}",
         "T_error": f"{df_all_frames['T_error'].mean():.1f}",
         "Chosen_Candidate": "",
+        "Default_Candidate": "",
+        "Guard_Override": "",
+        "Guard_Reason": "",
+        "MetricAnchor_Total_Score": "",
+        "BestNonMetric_Total_Score": "",
+        "MetricAnchor_L_Depth": "",
+        "MetricAnchor_L_Mask": "",
+        "MetricAnchor_L_Geom": "",
+        "BestNonMetric_L_Depth": "",
+        "BestNonMetric_L_Mask": "",
+        "BestNonMetric_L_Geom": "",
+        "BestNonMetric_Anchor_Score": "",
     }
 
     df_all_frames = pd.concat([df_all_frames, pd.DataFrame([means_all_final])], ignore_index=True)

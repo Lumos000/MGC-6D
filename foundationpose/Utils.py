@@ -772,36 +772,16 @@ def nvdiffrast_render(K=None, H=None, W=None, ob_in_cams=None, glctx=None, conte
   pos_homo = to_homo_torch(pos)
   pos_clip = (mtx[:,None]@pos_homo[None,...,None])[...,0]
   if bbox2d is not None:
-    # bbox2d is (N,4) in (umin,vmin,umax,vmax). Bad/degenerate bboxes can create Inf/NaN
-    # in the crop transform and crash CUDA rasterization (e.g., r==l or t==b).
-    if not torch.is_tensor(bbox2d):
-      bbox2d = torch.as_tensor(bbox2d, dtype=torch.float, device=render_device)
-    else:
-      bbox2d = bbox2d.to(device=render_device, dtype=torch.float)
-
-    l = bbox2d[:, 0].clamp(min=0.0, max=float(W - 1))
-    r = bbox2d[:, 2].clamp(min=0.0, max=float(W - 1))
-    vmin = bbox2d[:, 1].clamp(min=0.0, max=float(H - 1))
-    vmax = bbox2d[:, 3].clamp(min=0.0, max=float(H - 1))
-    # Convert to raster-space y as used below.
-    t = float(H) - vmin
-    b = float(H) - vmax
-
-    denom_w = (r - l)
-    denom_h = (t - b)
-    bad = (~torch.isfinite(denom_w)) | (~torch.isfinite(denom_h)) | (denom_w.abs() < 1.0) | (denom_h.abs() < 1.0)
-    denom_w = denom_w.clamp(min=1.0)
-    denom_h = denom_h.clamp(min=1.0)
-
-    tf = torch.eye(4, dtype=torch.float, device=render_device).reshape(1, 4, 4).expand(len(ob_in_cams), 4, 4).contiguous()
-    tf[:, 0, 0] = float(W) / denom_w
-    tf[:, 1, 1] = float(H) / denom_h
-    tf[:, 3, 0] = (float(W) - r - l) / denom_w
-    tf[:, 3, 1] = (float(H) - t - b) / denom_h
-    if bad.any():
-      tf[bad] = torch.eye(4, dtype=torch.float, device=render_device)
-
-    pos_clip = pos_clip @ tf
+    l = bbox2d[:,0]
+    t = H-bbox2d[:,1]
+    r = bbox2d[:,2]
+    b = H-bbox2d[:,3]
+    tf = torch.eye(4, dtype=torch.float, device=render_device).reshape(1,4,4).expand(len(ob_in_cams),4,4).contiguous()
+    tf[:,0,0] = W/(r-l)
+    tf[:,1,1] = H/(t-b)
+    tf[:,3,0] = (W-r-l)/(r-l)
+    tf[:,3,1] = (H-t-b)/(t-b)
+    pos_clip = pos_clip@tf
   try:
     rast_out, _ = dr.rasterize(glctx, pos_clip, pos_idx, resolution=np.asarray(output_size))
   except RuntimeError as exc:

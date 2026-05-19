@@ -145,16 +145,14 @@ python anchor_paper.py \
 
 ```bash
 python query_paper.py \
-  --name ho3d_qeff_run1 \
-  --anchor_path /path/to/anchor_results/dexycb_reference_view_ours \
+  --name ho3d_mgc6d_run1 \
+  --anchor_path /path/to/paper_anchor_results/dexycb_reference_view_ours \
+  --metric_anchor_path /path/to/metric_anchor_results/dexycb_reference_view_ours \
   --hot3d_data_root /path/to/ho3d \
   --ycb_model_path /path/to/ho3d/YCB_Video_Models \
   --ycbv_modesl_info_path ./models_info.json \
   --running_stride 10 \
-  --register_iteration 5 \
-  --score_alpha 0.3 \
-  --score_beta 0.7 \
-  --per_frame_selection
+  --register_iteration 5
 ```
 
 ## Outputs
