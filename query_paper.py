@@ -322,7 +322,7 @@ def _relative_gain_is_better(candidate_value: float, reference_value: float, gai
     return candidate_value <= reference_value * (1.0 - gain)
 
 
-def _select_with_metric_anchor_default(
+def _select_with_metric_anchor_guard(
     candidate_results: list,
     metric_anchor_label: str,
     args,
@@ -383,6 +383,9 @@ def _select_with_metric_anchor_default(
         "best_non_metric_anchor_score": float(best_non_metric["s_anchor"]),
     })
 
+    if args.selection_policy == "metric_anchor_force":
+        diagnostics["guard_reason"] = "metric_anchor_force"
+        return metric_anchor, diagnostics
 
     anchor_ok = float(best_non_metric["s_anchor"]) >= args.guard_anchor_min
     total_ok = (
@@ -499,6 +502,17 @@ if __name__ == "__main__":
     parser.add_argument("--fallback_guard_margin", type=float, default=0.08,
                         help="Choose fallback when fallback_score <= best_score + margin")
     parser.add_argument(
+        "--selection_policy",
+        choices=["paper", "metric_anchor_force", "metric_anchor_guard"],
+        default="paper",
+        help=(
+            "Candidate selection policy. 'paper' keeps the original scoring; "
+            "'metric_anchor_force' always selects the metric-anchor candidate; "
+            "'metric_anchor_guard' uses metric-anchor as the default and allows "
+            "only clearly better candidates to replace it."
+        ),
+    )
+    parser.add_argument(
         "--metric_anchor_path",
         type=str,
         default=None,
@@ -572,8 +586,8 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-    if not args.metric_anchor_path:
-        raise ValueError("--metric_anchor_path is required")
+    if args.selection_policy != "paper" and not args.metric_anchor_path:
+        raise ValueError("--metric_anchor_path is required for metric-anchor selection policies")
 
     name = args.name
     hot3d_data_root = args.hot3d_data_root
@@ -805,6 +819,7 @@ if __name__ == "__main__":
         if (
             len(cand_caches) > 1
             and not args.per_frame_selection
+            and args.selection_policy == "paper"
         ):
             # Object-level selection: use anchor-phase candidate metrics as static priors.
             static_scores = {}
@@ -865,6 +880,7 @@ if __name__ == "__main__":
                 len(cand_caches) > 1
                 and not args.per_frame_selection
                 and static_object_winner is not None
+                and args.selection_policy == "paper"
             ):
                 eval_caches = [c for c in cand_caches if c.label == static_object_winner]
 
@@ -946,7 +962,7 @@ if __name__ == "__main__":
             guard_diagnostics = {
                 "default_candidate": "",
                 "guard_override": False,
-                "guard_reason": "default_selection",
+                "guard_reason": "paper_selection",
                 "metric_anchor_total_score": np.nan,
                 "best_non_metric_total_score": np.nan,
                 "metric_anchor_l_depth": np.nan,
@@ -957,11 +973,18 @@ if __name__ == "__main__":
                 "best_non_metric_l_geom": np.nan,
                 "best_non_metric_anchor_score": np.nan,
             }
-            winner, guard_diagnostics = _select_with_metric_anchor_default(
-                candidate_results,
-                metric_anchor_label,
-                args,
-            )
+            if args.selection_policy in {"metric_anchor_force", "metric_anchor_guard"}:
+                winner, guard_diagnostics = _select_with_metric_anchor_guard(
+                    candidate_results,
+                    metric_anchor_label,
+                    args,
+                )
+            else:
+                winner = candidate_results[0]
+                if args.prefer_fallback_candidate and len(candidate_results) > 1:
+                    fallback_result = next((r for r in candidate_results if r["label"] == fallback_label), None)
+                    if fallback_result is not None and fallback_result["total_score"] <= winner["total_score"] + args.fallback_guard_margin:
+                        winner = fallback_result
             best_label = winner["label"]
             best_pred_pose_q = winner["pred_pose_q"]
             pred_q = winner["pred_q"]
