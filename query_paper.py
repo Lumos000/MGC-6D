@@ -509,7 +509,7 @@ if __name__ == "__main__":
     parser.add_argument("--prefer_fallback_candidate", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Prefer fallback if its score is close to the best multi-candidate score")
-    parser.add_argument("--fallback_guard_margin", type=float, default=0.08,
+    parser.add_argument("--legacy_fallback_margin", type=float, default=0.08,
                         help="Choose fallback when fallback_score <= best_score + margin")
     parser.add_argument(
         "--selection_policy",
@@ -983,14 +983,18 @@ if __name__ == "__main__":
                 "best_non_obs_l_geom": np.nan,
                 "best_non_obs_anchor_score": np.nan,
             }
-            # Paper Eq.22: arg max_{Gi in Gv} S(Gi) = alpha*Sa + beta*Sq, with the
-            # observation-derived candidate (Gobs) as the calibration-stable default
-            # and replacement gated by tau_a / Delta / gamma_* (Eq.13-14, Sec.3.3.2).
-            winner, selection_diagnostics = _select_observation_consistent_paper(
-                candidate_results,
-                obs_label,
-                args,
-            )
+            if args.selection_policy in {"obs_force", "paper"}:
+                winner, selection_diagnostics = _select_observation_consistent_paper(
+                    candidate_results,
+                    obs_label,
+                    args,
+                )
+            else:
+                winner = candidate_results[0]
+                if args.prefer_fallback_candidate and len(candidate_results) > 1:
+                    fallback_result = next((r for r in candidate_results if r["label"] == fallback_label), None)
+                    if fallback_result is not None and fallback_result["total_score"] <= winner["total_score"] + args.legacy_fallback_margin:
+                        winner = fallback_result
             best_label = winner["label"]
             best_pred_pose_q = winner["pred_pose_q"]
             pred_q = winner["pred_q"]
