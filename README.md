@@ -17,7 +17,7 @@ matching the protocol used in the paper's main table:
 
 | Metric | ADD-S | ADD  | AR   | MSSD | MSPD | VSD  |
 |--------|-------|------|------|------|------|------|
-| Ours   | 98.4  | 40.7 | 44.8 | 50.5 | 33.8 | 50.1 |
+| Ours   | 98.3  | 40.9 | 44.9 | 50.7 | 34   | 50   |
 
 Per-sequence numbers and the candidate-selection breakdown are written to
 `results/ho3d_results/<name>/*.xlsx` after `query_paper.py` finishes.
