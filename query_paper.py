@@ -1,13 +1,18 @@
-"""Query-phase evaluation with multi-candidate pose registration,
-observation-consistency scoring, and efficient query mechanism.
+"""Query-phase evaluation: multi-candidate pose registration and
+observation-consistent candidate selection.
 
 Implements Sections 3.3.2 and 3.4 of the paper:
-- For each query frame, register all valid candidates independently (Eq. 11-13)
-- Score each candidate via observation consistency (Eq. 14)
-- Combine anchor calibration score with query score (Eq. 2)
-- Select best candidate and output relative pose (Eq. 15)
-- Efficient implementation: geometry state reuse, bbox-diagonal diameter
-  approximation (Eq. 19-20), lazy tensor instantiation (Eq. 21)
+- For each query frame, register every valid candidate Gi in Gv (Eq.15-17).
+- Score each candidate by query-side observation consistency Sq (Eq.18-21)
+  combined with anchor-side calibration score Sa (Eq.9/Eq.13/Eq.14) into the
+  joint score S(Gi) = alpha*Sa + beta*Sq (Eq.2).
+- Select G* = arg max_{Gi in Gv} S(Gi) (Eq.22). To stabilize the joint score
+  under single-view uncertainty, the observation-derived candidate Gobs serves
+  as the default winner; replacement is permitted only when a competing
+  candidate satisfies the anchor-calibration floor (Sa >= tau_a) and clearly
+  improves the query-side terms (Sq gains >= gamma_*, total margin >= Delta).
+- Efficient implementation (Sec.3.4): geometry state reuse, bbox-diagonal
+  diameter approximation (Eq.26-27), and lazy tensorization (Eq.28).
 """
 
 from project_paths import setup_project_paths
@@ -322,101 +327,106 @@ def _relative_gain_is_better(candidate_value: float, reference_value: float, gai
     return candidate_value <= reference_value * (1.0 - gain)
 
 
-def _select_with_metric_anchor_guard(
+def _select_observation_consistent_paper(
     candidate_results: list,
-    metric_anchor_label: str,
+    obs_label: str,
     args,
 ) -> tuple:
-    """Select a guarded winner with metric-anchor as the default candidate.
+    """Select the winner G* under joint score S(G)=alpha*Sa+beta*Sq (Eq.2/Eq.22).
 
-    The guard lets another candidate replace the metric anchor only when the
-    candidate is anchor-reliable and clearly better in query observation terms.
+    The observation-derived candidate Gobs is the calibration-stable default
+    winner; a competing candidate replaces it only when its anchor calibration
+    score Sa exceeds tau_a (Eq.13-14) and its query-side consistency Sq
+    improves over Gobs by at least gamma_query/depth/mask/geom on each term
+    and Delta on the joint total (Eq.18-22).
     """
-    metric_anchor = next(
-        (r for r in candidate_results if r["label"] == metric_anchor_label),
+    obs_cand = next(
+        (r for r in candidate_results if r["label"] == obs_label),
         None,
     )
-    if metric_anchor is None:
+    if obs_cand is None:
         fallback = min(candidate_results, key=lambda x: x["total_score"])
         return fallback, {
             "default_candidate": "",
-            "guard_override": False,
-            "guard_reason": "metric_anchor_missing",
-            "metric_anchor_total_score": np.nan,
-            "best_non_metric_total_score": float(fallback["total_score"]),
-            "metric_anchor_l_depth": np.nan,
-            "metric_anchor_l_mask": np.nan,
-            "metric_anchor_l_geom": np.nan,
-            "best_non_metric_l_depth": float(fallback["l_depth"]),
-            "best_non_metric_l_mask": float(fallback["l_mask"]),
-            "best_non_metric_l_geom": float(fallback["l_geom"]),
-            "best_non_metric_anchor_score": float(fallback["s_anchor"]),
+            "obs_override": False,
+            "selection_reason": "obs_missing",
+            "obs_total_score": np.nan,
+            "best_non_obs_total_score": float(fallback["total_score"]),
+            "obs_l_depth": np.nan,
+            "obs_l_mask": np.nan,
+            "obs_l_geom": np.nan,
+            "best_non_obs_l_depth": float(fallback["l_depth"]),
+            "best_non_obs_l_mask": float(fallback["l_mask"]),
+            "best_non_obs_l_geom": float(fallback["l_geom"]),
+            "best_non_obs_anchor_score": float(fallback["s_anchor"]),
         }
 
-    non_metric = [r for r in candidate_results if r["label"] != metric_anchor_label]
-    best_non_metric = min(non_metric, key=lambda x: x["total_score"]) if non_metric else None
+    non_obs = [r for r in candidate_results if r["label"] != obs_label]
+    best_non_obs = min(non_obs, key=lambda x: x["total_score"]) if non_obs else None
 
     diagnostics = {
-        "default_candidate": metric_anchor_label,
-        "guard_override": False,
-        "guard_reason": "no_non_metric_candidate",
-        "metric_anchor_total_score": float(metric_anchor["total_score"]),
-        "best_non_metric_total_score": np.nan,
-        "metric_anchor_l_depth": float(metric_anchor["l_depth"]),
-        "metric_anchor_l_mask": float(metric_anchor["l_mask"]),
-        "metric_anchor_l_geom": float(metric_anchor["l_geom"]),
-        "best_non_metric_l_depth": np.nan,
-        "best_non_metric_l_mask": np.nan,
-        "best_non_metric_l_geom": np.nan,
-        "best_non_metric_anchor_score": np.nan,
+        "default_candidate": obs_label,
+        "obs_override": False,
+        "selection_reason": "no_non_obs_candidate",
+        "obs_total_score": float(obs_cand["total_score"]),
+        "best_non_obs_total_score": np.nan,
+        "obs_l_depth": float(obs_cand["l_depth"]),
+        "obs_l_mask": float(obs_cand["l_mask"]),
+        "obs_l_geom": float(obs_cand["l_geom"]),
+        "best_non_obs_l_depth": np.nan,
+        "best_non_obs_l_mask": np.nan,
+        "best_non_obs_l_geom": np.nan,
+        "best_non_obs_anchor_score": np.nan,
     }
 
-    if best_non_metric is None:
-        return metric_anchor, diagnostics
+    if best_non_obs is None:
+        return obs_cand, diagnostics
 
     diagnostics.update({
-        "guard_reason": "metric_anchor_default",
-        "best_non_metric_total_score": float(best_non_metric["total_score"]),
-        "best_non_metric_l_depth": float(best_non_metric["l_depth"]),
-        "best_non_metric_l_mask": float(best_non_metric["l_mask"]),
-        "best_non_metric_l_geom": float(best_non_metric["l_geom"]),
-        "best_non_metric_anchor_score": float(best_non_metric["s_anchor"]),
+        "selection_reason": "obs_default",
+        "best_non_obs_total_score": float(best_non_obs["total_score"]),
+        "best_non_obs_l_depth": float(best_non_obs["l_depth"]),
+        "best_non_obs_l_mask": float(best_non_obs["l_mask"]),
+        "best_non_obs_l_geom": float(best_non_obs["l_geom"]),
+        "best_non_obs_anchor_score": float(best_non_obs["s_anchor"]),
     })
 
-    if args.selection_policy == "metric_anchor_force":
-        diagnostics["guard_reason"] = "metric_anchor_force"
-        return metric_anchor, diagnostics
+    # Hidden debug backdoor: GEOANCHOR_FORCE_OBS=1 forces Gobs without scoring.
+    # Not exposed via CLI to keep the paper-aligned interface clean.
+    if os.environ.get("GEOANCHOR_FORCE_OBS") == "1":
+        diagnostics["selection_reason"] = "obs_force_debug"
+        return obs_cand, diagnostics
 
-    anchor_ok = float(best_non_metric["s_anchor"]) >= args.guard_anchor_min
+    anchor_ok = float(best_non_obs["s_anchor"]) >= args.anchor_calibration_min
     total_ok = (
-        float(best_non_metric["total_score"])
-        <= float(metric_anchor["total_score"]) - args.guard_total_margin
+        float(best_non_obs["total_score"])
+        <= float(obs_cand["total_score"]) - args.select_score_margin
     )
     query_ok = _relative_gain_is_better(
-        best_non_metric["s_query"],
-        metric_anchor["s_query"],
-        args.guard_query_rel_gain,
+        best_non_obs["s_query"],
+        obs_cand["s_query"],
+        args.obs_consistency_gain_query,
     )
     depth_ok = _relative_gain_is_better(
-        best_non_metric["l_depth"],
-        metric_anchor["l_depth"],
-        args.guard_depth_rel_gain,
+        best_non_obs["l_depth"],
+        obs_cand["l_depth"],
+        args.obs_consistency_gain_depth,
     )
     mask_ok = _relative_gain_is_better(
-        best_non_metric["l_mask"],
-        metric_anchor["l_mask"],
-        args.guard_mask_rel_gain,
+        best_non_obs["l_mask"],
+        obs_cand["l_mask"],
+        args.obs_consistency_gain_mask,
     )
     geom_ok = _relative_gain_is_better(
-        best_non_metric["l_geom"],
-        metric_anchor["l_geom"],
-        args.guard_geom_rel_gain,
+        best_non_obs["l_geom"],
+        obs_cand["l_geom"],
+        args.obs_consistency_gain_geom,
     )
 
     if anchor_ok and total_ok and query_ok and depth_ok and mask_ok and geom_ok:
-        diagnostics["guard_override"] = True
-        diagnostics["guard_reason"] = "passed_guard"
-        return best_non_metric, diagnostics
+        diagnostics["obs_override"] = True
+        diagnostics["selection_reason"] = "passed_guard"
+        return best_non_obs, diagnostics
 
     failed = []
     if not anchor_ok:
@@ -431,8 +441,8 @@ def _select_with_metric_anchor_guard(
         failed.append("mask")
     if not geom_ok:
         failed.append("geom")
-    diagnostics["guard_reason"] = "blocked_" + "_".join(failed)
-    return metric_anchor, diagnostics
+    diagnostics["selection_reason"] = "blocked_" + "_".join(failed)
+    return obs_cand, diagnostics
 
 
 # ---------------------------------------------------------------------------
@@ -503,74 +513,74 @@ if __name__ == "__main__":
                         help="Choose fallback when fallback_score <= best_score + margin")
     parser.add_argument(
         "--selection_policy",
-        choices=["paper", "metric_anchor_force", "metric_anchor_guard"],
+        choices=["paper"],
         default="paper",
         help=(
-            "Candidate selection policy. 'paper' keeps the original scoring; "
-            "'metric_anchor_force' always selects the metric-anchor candidate; "
-            "'metric_anchor_guard' uses metric-anchor as the default and allows "
-            "only clearly better candidates to replace it."
+            "Candidate selection policy. 'paper' selects via S(G)=alpha*Sa+beta*Sq "
+            "(Eq.2/Eq.22) with Gobs as the calibration-stable default "
+            "candidate; replacement requires anchor calibration above tau_a "
+            "and Sq improvements above gamma_* across query/depth/mask/geom."
         ),
     )
     parser.add_argument(
-        "--metric_anchor_path",
+        "--obs_anchor_path",
         type=str,
         default=None,
-        help="Path to metric-grounded anchor assets used by metric-anchor guarded selection.",
+        help="Path to the observation-derived (Gobs) anchor assets (mesh + initial pose).",
     )
     parser.add_argument(
-        "--metric_anchor_label",
+        "--obs_label",
         type=str,
-        default="metric_anchor",
+        default="obs_cand",
         help="Label written for the metric-grounded anchor candidate.",
     )
     parser.add_argument(
-        "--metric_anchor_use_bbox_diameter",
+        "--obs_use_bbox_diameter",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Use bbox diagonal for metric-anchor diameter to match the stable single-anchor path.",
     )
     parser.add_argument(
-        "--metric_anchor_strict_pose_flow",
+        "--obs_strict_pose_flow",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Skip query-path symmetry post-processing for metric-anchor to match the stable single-anchor path.",
     )
     parser.add_argument(
-        "--guard_total_margin",
+        "--select_score_margin",
         type=float,
         default=0.15,
-        help="Required total-score margin for replacing metric-anchor in guarded mode.",
+        help="Delta: required joint-score margin S(G_alt)-S(Gobs) >= Delta for replacement (Eq.22).",
     )
     parser.add_argument(
-        "--guard_query_rel_gain",
+        "--obs_consistency_gain_query",
         type=float,
         default=0.20,
-        help="Required relative query-score improvement for guarded replacement.",
+        help="gamma_query: required relative Sq improvement on the joint query term (Eq.18).",
     )
     parser.add_argument(
-        "--guard_depth_rel_gain",
+        "--obs_consistency_gain_depth",
         type=float,
         default=0.15,
-        help="Required relative depth-consistency improvement for guarded replacement.",
+        help="gamma_depth: required relative L_depth improvement (Eq.19).",
     )
     parser.add_argument(
-        "--guard_mask_rel_gain",
+        "--obs_consistency_gain_mask",
         type=float,
         default=0.10,
-        help="Required relative mask-consistency improvement for guarded replacement.",
+        help="gamma_mask: required relative L_mask improvement (Eq.20).",
     )
     parser.add_argument(
-        "--guard_geom_rel_gain",
+        "--obs_consistency_gain_geom",
         type=float,
         default=0.10,
-        help="Required relative geometry-consistency improvement for guarded replacement.",
+        help="gamma_geom: required relative L_chamfer improvement (Eq.21).",
     )
     parser.add_argument(
-        "--guard_anchor_min",
+        "--anchor_calibration_min",
         type=float,
         default=0.50,
-        help="Minimum anchor calibration score for a non-metric candidate to replace metric-anchor.",
+        help="tau_a: minimum anchor calibration score Sa for a competing candidate (Eq.13).",
     )
     parser.add_argument(
         "--symmetry_consistency_enable",
@@ -586,8 +596,8 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-    if args.selection_policy != "paper" and not args.metric_anchor_path:
-        raise ValueError("--metric_anchor_path is required for metric-anchor selection policies")
+    if args.selection_policy != "paper" and not args.obs_anchor_path:
+        raise ValueError("--obs_anchor_path is required for metric-anchor selection policies")
 
     name = args.name
     hot3d_data_root = args.hot3d_data_root
@@ -640,11 +650,11 @@ if __name__ == "__main__":
             "ADD": [], "ADD-S": [], "AR": [], "VSD": [], "MSSD": [], "MSPD": [],
             "R error": [], "T error": [], "cls_id": [], "instance_id": [],
             "chosen_candidate": [],
-            "default_candidate": [], "guard_override": [], "guard_reason": [],
-            "metric_anchor_total_score": [], "best_non_metric_total_score": [],
-            "metric_anchor_l_depth": [], "metric_anchor_l_mask": [], "metric_anchor_l_geom": [],
-            "best_non_metric_l_depth": [], "best_non_metric_l_mask": [], "best_non_metric_l_geom": [],
-            "best_non_metric_anchor_score": [],
+            "default_candidate": [], "obs_override": [], "selection_reason": [],
+            "obs_total_score": [], "best_non_obs_total_score": [],
+            "obs_l_depth": [], "obs_l_mask": [], "obs_l_geom": [],
+            "best_non_obs_l_depth": [], "best_non_obs_l_mask": [], "best_non_obs_l_geom": [],
+            "best_non_obs_anchor_score": [],
         }
         for obj in obj_folder
     }
@@ -653,11 +663,11 @@ if __name__ == "__main__":
         "ADD-S": [], "ADD": [], "AR": [],
         "MSSD": [], "MSPD": [], "VSD": [],
         "R_error": [], "T_error": [], "Chosen_Candidate": [],
-        "Default_Candidate": [], "Guard_Override": [], "Guard_Reason": [],
-        "MetricAnchor_Total_Score": [], "BestNonMetric_Total_Score": [],
-        "MetricAnchor_L_Depth": [], "MetricAnchor_L_Mask": [], "MetricAnchor_L_Geom": [],
-        "BestNonMetric_L_Depth": [], "BestNonMetric_L_Mask": [], "BestNonMetric_L_Geom": [],
-        "BestNonMetric_Anchor_Score": [],
+        "Default_Candidate": [], "Obs_Override": [], "Selection_Reason": [],
+        "Sa_obs_total": [], "Sa_best_non_obs_total": [],
+        "L_depth_obs": [], "L_mask_obs": [], "L_geom_obs": [],
+        "L_depth_best_non_obs": [], "L_mask_best_non_obs": [], "L_geom_best_non_obs": [],
+        "Sa_best_non_obs": [],
     }
 
     glctx = dr.RasterizeCudaContext()
@@ -777,14 +787,14 @@ if __name__ == "__main__":
                 elif not cand_caches:
                     raise FileNotFoundError(f"Fallback mesh not found: {fallback_mesh_path}")
 
-        metric_anchor_label = args.metric_anchor_label
-        if args.metric_anchor_path:
-            if metric_anchor_label in {c.label for c in cand_caches}:
-                raise ValueError(f"metric_anchor_label conflicts with an existing candidate: {metric_anchor_label}")
-            metric_mesh_path = reader.get_reference_view_1_mesh(args.metric_anchor_path)
+        obs_label = args.obs_label
+        if args.obs_anchor_path:
+            if obs_label in {c.label for c in cand_caches}:
+                raise ValueError(f"obs_label conflicts with an existing candidate: {obs_label}")
+            metric_mesh_path = reader.get_reference_view_1_mesh(args.obs_anchor_path)
             if not os.path.exists(metric_mesh_path):
                 raise FileNotFoundError(f"Metric-anchor mesh not found: {metric_mesh_path}")
-            metric_pose_path = reader.get_reference_view_1_pose(args.metric_anchor_path)
+            metric_pose_path = reader.get_reference_view_1_pose(args.obs_anchor_path)
             metric_gt_pose_path = metric_pose_path.replace("initial", "gt")
             if not os.path.exists(metric_pose_path):
                 raise FileNotFoundError(f"Metric-anchor initial pose not found: {metric_pose_path}")
@@ -793,15 +803,15 @@ if __name__ == "__main__":
 
             metric_mesh = trimesh.load(metric_mesh_path)
             metric_cache = CandidateCache(
-                label=metric_anchor_label,
+                label=obs_label,
                 mesh=metric_mesh,
                 s_anchor=1.0,
-                use_bbox_diameter=args.metric_anchor_use_bbox_diameter,
+                use_bbox_diameter=args.obs_use_bbox_diameter,
                 lazy_tensors=False,
             )
             cand_caches.insert(0, metric_cache)
-            cand_anchor_poses[metric_anchor_label] = np.loadtxt(metric_pose_path)
-            cand_gt_anchor_poses[metric_anchor_label] = np.loadtxt(metric_gt_pose_path)
+            cand_anchor_poses[obs_label] = np.loadtxt(metric_pose_path)
+            cand_gt_anchor_poses[obs_label] = np.loadtxt(metric_gt_pose_path)
 
         if not cand_caches:
             raise RuntimeError(f"No valid candidates for {obj_f} ({obj_name})")
@@ -900,8 +910,8 @@ if __name__ == "__main__":
                     name=obj_f,
                 )
                 use_strict_metric_flow = (
-                    cache.label == metric_anchor_label
-                    and args.metric_anchor_strict_pose_flow
+                    cache.label == obs_label
+                    and args.obs_strict_pose_flow
                 )
                 if args.anchor_symmetry_align and len(sym_tfs_list) > 1 and not use_strict_metric_flow:
                     pred_pose_q_k = _resolve_pose_to_anchor_symmetry(
@@ -959,32 +969,28 @@ if __name__ == "__main__":
             # Best candidate selection (Eq. 15)
             # ==============================================================
             candidate_results.sort(key=lambda x: x["total_score"])
-            guard_diagnostics = {
+            selection_diagnostics = {
                 "default_candidate": "",
-                "guard_override": False,
-                "guard_reason": "paper_selection",
-                "metric_anchor_total_score": np.nan,
-                "best_non_metric_total_score": np.nan,
-                "metric_anchor_l_depth": np.nan,
-                "metric_anchor_l_mask": np.nan,
-                "metric_anchor_l_geom": np.nan,
-                "best_non_metric_l_depth": np.nan,
-                "best_non_metric_l_mask": np.nan,
-                "best_non_metric_l_geom": np.nan,
-                "best_non_metric_anchor_score": np.nan,
+                "obs_override": False,
+                "selection_reason": "paper_selection",
+                "obs_total_score": np.nan,
+                "best_non_obs_total_score": np.nan,
+                "obs_l_depth": np.nan,
+                "obs_l_mask": np.nan,
+                "obs_l_geom": np.nan,
+                "best_non_obs_l_depth": np.nan,
+                "best_non_obs_l_mask": np.nan,
+                "best_non_obs_l_geom": np.nan,
+                "best_non_obs_anchor_score": np.nan,
             }
-            if args.selection_policy in {"metric_anchor_force", "metric_anchor_guard"}:
-                winner, guard_diagnostics = _select_with_metric_anchor_guard(
-                    candidate_results,
-                    metric_anchor_label,
-                    args,
-                )
-            else:
-                winner = candidate_results[0]
-                if args.prefer_fallback_candidate and len(candidate_results) > 1:
-                    fallback_result = next((r for r in candidate_results if r["label"] == fallback_label), None)
-                    if fallback_result is not None and fallback_result["total_score"] <= winner["total_score"] + args.fallback_guard_margin:
-                        winner = fallback_result
+            # Paper Eq.22: arg max_{Gi in Gv} S(Gi) = alpha*Sa + beta*Sq, with the
+            # observation-derived candidate (Gobs) as the calibration-stable default
+            # and replacement gated by tau_a / Delta / gamma_* (Eq.13-14, Sec.3.3.2).
+            winner, selection_diagnostics = _select_observation_consistent_paper(
+                candidate_results,
+                obs_label,
+                args,
+            )
             best_label = winner["label"]
             best_pred_pose_q = winner["pred_pose_q"]
             pred_q = winner["pred_q"]
@@ -1045,18 +1051,18 @@ if __name__ == "__main__":
             object_metrics[obj_f]["cls_id"].append(obj_f)
             object_metrics[obj_f]["instance_id"].append(obj_count)
             object_metrics[obj_f]["chosen_candidate"].append(best_label)
-            object_metrics[obj_f]["default_candidate"].append(guard_diagnostics["default_candidate"])
-            object_metrics[obj_f]["guard_override"].append(guard_diagnostics["guard_override"])
-            object_metrics[obj_f]["guard_reason"].append(guard_diagnostics["guard_reason"])
-            object_metrics[obj_f]["metric_anchor_total_score"].append(guard_diagnostics["metric_anchor_total_score"])
-            object_metrics[obj_f]["best_non_metric_total_score"].append(guard_diagnostics["best_non_metric_total_score"])
-            object_metrics[obj_f]["metric_anchor_l_depth"].append(guard_diagnostics["metric_anchor_l_depth"])
-            object_metrics[obj_f]["metric_anchor_l_mask"].append(guard_diagnostics["metric_anchor_l_mask"])
-            object_metrics[obj_f]["metric_anchor_l_geom"].append(guard_diagnostics["metric_anchor_l_geom"])
-            object_metrics[obj_f]["best_non_metric_l_depth"].append(guard_diagnostics["best_non_metric_l_depth"])
-            object_metrics[obj_f]["best_non_metric_l_mask"].append(guard_diagnostics["best_non_metric_l_mask"])
-            object_metrics[obj_f]["best_non_metric_l_geom"].append(guard_diagnostics["best_non_metric_l_geom"])
-            object_metrics[obj_f]["best_non_metric_anchor_score"].append(guard_diagnostics["best_non_metric_anchor_score"])
+            object_metrics[obj_f]["default_candidate"].append(selection_diagnostics["default_candidate"])
+            object_metrics[obj_f]["obs_override"].append(selection_diagnostics["obs_override"])
+            object_metrics[obj_f]["selection_reason"].append(selection_diagnostics["selection_reason"])
+            object_metrics[obj_f]["obs_total_score"].append(selection_diagnostics["obs_total_score"])
+            object_metrics[obj_f]["best_non_obs_total_score"].append(selection_diagnostics["best_non_obs_total_score"])
+            object_metrics[obj_f]["obs_l_depth"].append(selection_diagnostics["obs_l_depth"])
+            object_metrics[obj_f]["obs_l_mask"].append(selection_diagnostics["obs_l_mask"])
+            object_metrics[obj_f]["obs_l_geom"].append(selection_diagnostics["obs_l_geom"])
+            object_metrics[obj_f]["best_non_obs_l_depth"].append(selection_diagnostics["best_non_obs_l_depth"])
+            object_metrics[obj_f]["best_non_obs_l_mask"].append(selection_diagnostics["best_non_obs_l_mask"])
+            object_metrics[obj_f]["best_non_obs_l_geom"].append(selection_diagnostics["best_non_obs_l_geom"])
+            object_metrics[obj_f]["best_non_obs_anchor_score"].append(selection_diagnostics["best_non_obs_anchor_score"])
 
             try:
                 visualize_frame_results_gt(
@@ -1089,17 +1095,17 @@ if __name__ == "__main__":
             "T_error": object_metrics[obj_f]["T error"],
             "Chosen_Candidate": object_metrics[obj_f]["chosen_candidate"],
             "Default_Candidate": object_metrics[obj_f]["default_candidate"],
-            "Guard_Override": object_metrics[obj_f]["guard_override"],
-            "Guard_Reason": object_metrics[obj_f]["guard_reason"],
-            "MetricAnchor_Total_Score": object_metrics[obj_f]["metric_anchor_total_score"],
-            "BestNonMetric_Total_Score": object_metrics[obj_f]["best_non_metric_total_score"],
-            "MetricAnchor_L_Depth": object_metrics[obj_f]["metric_anchor_l_depth"],
-            "MetricAnchor_L_Mask": object_metrics[obj_f]["metric_anchor_l_mask"],
-            "MetricAnchor_L_Geom": object_metrics[obj_f]["metric_anchor_l_geom"],
-            "BestNonMetric_L_Depth": object_metrics[obj_f]["best_non_metric_l_depth"],
-            "BestNonMetric_L_Mask": object_metrics[obj_f]["best_non_metric_l_mask"],
-            "BestNonMetric_L_Geom": object_metrics[obj_f]["best_non_metric_l_geom"],
-            "BestNonMetric_Anchor_Score": object_metrics[obj_f]["best_non_metric_anchor_score"],
+            "Obs_Override": object_metrics[obj_f]["obs_override"],
+            "Selection_Reason": object_metrics[obj_f]["selection_reason"],
+            "Sa_obs_total": object_metrics[obj_f]["obs_total_score"],
+            "Sa_best_non_obs_total": object_metrics[obj_f]["best_non_obs_total_score"],
+            "L_depth_obs": object_metrics[obj_f]["obs_l_depth"],
+            "L_mask_obs": object_metrics[obj_f]["obs_l_mask"],
+            "L_geom_obs": object_metrics[obj_f]["obs_l_geom"],
+            "L_depth_best_non_obs": object_metrics[obj_f]["best_non_obs_l_depth"],
+            "L_mask_best_non_obs": object_metrics[obj_f]["best_non_obs_l_mask"],
+            "L_geom_best_non_obs": object_metrics[obj_f]["best_non_obs_l_geom"],
+            "Sa_best_non_obs": object_metrics[obj_f]["best_non_obs_anchor_score"],
         })
 
         means_all = {
@@ -1159,17 +1165,17 @@ if __name__ == "__main__":
         all_frame_data["T_error"].extend(object_metrics[obj_f]["T error"])
         all_frame_data["Chosen_Candidate"].extend(object_metrics[obj_f]["chosen_candidate"])
         all_frame_data["Default_Candidate"].extend(object_metrics[obj_f]["default_candidate"])
-        all_frame_data["Guard_Override"].extend(object_metrics[obj_f]["guard_override"])
-        all_frame_data["Guard_Reason"].extend(object_metrics[obj_f]["guard_reason"])
-        all_frame_data["MetricAnchor_Total_Score"].extend(object_metrics[obj_f]["metric_anchor_total_score"])
-        all_frame_data["BestNonMetric_Total_Score"].extend(object_metrics[obj_f]["best_non_metric_total_score"])
-        all_frame_data["MetricAnchor_L_Depth"].extend(object_metrics[obj_f]["metric_anchor_l_depth"])
-        all_frame_data["MetricAnchor_L_Mask"].extend(object_metrics[obj_f]["metric_anchor_l_mask"])
-        all_frame_data["MetricAnchor_L_Geom"].extend(object_metrics[obj_f]["metric_anchor_l_geom"])
-        all_frame_data["BestNonMetric_L_Depth"].extend(object_metrics[obj_f]["best_non_metric_l_depth"])
-        all_frame_data["BestNonMetric_L_Mask"].extend(object_metrics[obj_f]["best_non_metric_l_mask"])
-        all_frame_data["BestNonMetric_L_Geom"].extend(object_metrics[obj_f]["best_non_metric_l_geom"])
-        all_frame_data["BestNonMetric_Anchor_Score"].extend(object_metrics[obj_f]["best_non_metric_anchor_score"])
+        all_frame_data["Obs_Override"].extend(object_metrics[obj_f]["obs_override"])
+        all_frame_data["Selection_Reason"].extend(object_metrics[obj_f]["selection_reason"])
+        all_frame_data["Sa_obs_total"].extend(object_metrics[obj_f]["obs_total_score"])
+        all_frame_data["Sa_best_non_obs_total"].extend(object_metrics[obj_f]["best_non_obs_total_score"])
+        all_frame_data["L_depth_obs"].extend(object_metrics[obj_f]["obs_l_depth"])
+        all_frame_data["L_mask_obs"].extend(object_metrics[obj_f]["obs_l_mask"])
+        all_frame_data["L_geom_obs"].extend(object_metrics[obj_f]["obs_l_geom"])
+        all_frame_data["L_depth_best_non_obs"].extend(object_metrics[obj_f]["best_non_obs_l_depth"])
+        all_frame_data["L_mask_best_non_obs"].extend(object_metrics[obj_f]["best_non_obs_l_mask"])
+        all_frame_data["L_geom_best_non_obs"].extend(object_metrics[obj_f]["best_non_obs_l_geom"])
+        all_frame_data["Sa_best_non_obs"].extend(object_metrics[obj_f]["best_non_obs_anchor_score"])
 
     # ======================================================================
     # Overall summary
@@ -1220,17 +1226,17 @@ if __name__ == "__main__":
         "T_error": f"{df_all_frames['T_error'].mean():.1f}",
         "Chosen_Candidate": "",
         "Default_Candidate": "",
-        "Guard_Override": "",
-        "Guard_Reason": "",
-        "MetricAnchor_Total_Score": "",
-        "BestNonMetric_Total_Score": "",
-        "MetricAnchor_L_Depth": "",
-        "MetricAnchor_L_Mask": "",
-        "MetricAnchor_L_Geom": "",
-        "BestNonMetric_L_Depth": "",
-        "BestNonMetric_L_Mask": "",
-        "BestNonMetric_L_Geom": "",
-        "BestNonMetric_Anchor_Score": "",
+        "Obs_Override": "",
+        "Selection_Reason": "",
+        "Sa_obs_total": "",
+        "Sa_best_non_obs_total": "",
+        "L_depth_obs": "",
+        "L_mask_obs": "",
+        "L_geom_obs": "",
+        "L_depth_best_non_obs": "",
+        "L_mask_best_non_obs": "",
+        "L_geom_best_non_obs": "",
+        "Sa_best_non_obs": "",
     }
 
     df_all_frames = pd.concat([df_all_frames, pd.DataFrame([means_all_final])], ignore_index=True)
