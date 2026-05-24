@@ -169,6 +169,15 @@ python query_paper.py \
   --register_iteration 5
 ```
 
+For HO3D, the same command is wrapped in a one-line launcher that pins the
+GPU and result folder name:
+
+```bash
+bash scripts/run_ho3d_full.sh 0 ho3d_mgc6d_run1
+# arg 1: CUDA_VISIBLE_DEVICES (default 0)
+# arg 2: run name (default ho3d_mgc6d_full_<timestamp>)
+```
+
 Auxiliary Toyota-Light and REAL275 evaluations can be launched with `scripts/run_toyl_full.sh` and `scripts/run_real275_full.sh`.
 
 ## Outputs
