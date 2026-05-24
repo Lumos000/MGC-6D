@@ -531,8 +531,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--obs_label",
         type=str,
-        default="obs_cand",
-        help="Label written for the metric-grounded anchor candidate.",
+        default="obs",
+        help="Label written for the observation-derived (Gobs) candidate.",
     )
     parser.add_argument(
         "--obs_use_bbox_diameter",
