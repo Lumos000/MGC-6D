@@ -9,7 +9,7 @@ export YCB_MODEL_PATH=/data/gst/any6d/Any6D/data/ho3d/YCB_Video_Models
 exec /data/gst/envs/rayst3r/bin/python -u query_paper.py \
   --name "$NAME" \
   --anchor_path /data/gst/Any6D/Any6D/results/anchor_results/paper/dexycb_reference_view_ours \
-  --metric_anchor_path /data/gst/any6d/Any6D/results/anchor_results/dexycb_reference_view_ours \
+  --obs_anchor_path /data/gst/any6d/Any6D/results/anchor_results/dexycb_reference_view_ours \
   --hot3d_data_root /data/gst/any6d/Any6D/data/ho3d \
   --ycb_model_path /data/gst/any6d/Any6D/data/ho3d/YCB_Video_Models \
   --ycbv_modesl_info_path ./models_info.json \

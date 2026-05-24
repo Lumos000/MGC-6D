@@ -12,6 +12,18 @@ The cleaned first release focuses on the HO3D/YCB workflow. REAL275 and
 Toyota-Light scripts are included as advanced experimental entry points, but
 HO3D is the maintained one-command reproduction path.
 
+## HO3D Reproduction Result
+
+Macro mean over the 13 HO3D sequences (`stride=10`, 2008 query frames),
+matching the protocol used in the paper's main table:
+
+| Metric | ADD-S | ADD  | AR   | MSSD | MSPD | VSD  |
+|--------|-------|------|------|------|------|------|
+| Ours   | 98.4  | 40.7 | 44.8 | 50.5 | 33.8 | 50.1 |
+
+Per-sequence numbers and the candidate-selection breakdown are written to
+`results/ho3d_results/<name>/*.xlsx` after `query_paper.py` finishes.
+
 ## Repository Layout
 
 ```text
@@ -149,7 +161,7 @@ python anchor_paper.py \
 python query_paper.py \
   --name ho3d_mgc6d_run1 \
   --anchor_path /path/to/paper_anchor_results/dexycb_reference_view_ours \
-  --metric_anchor_path /path/to/metric_anchor_results/dexycb_reference_view_ours \
+  --obs_anchor_path /path/to/obs_anchor_results/dexycb_reference_view_ours \
   --hot3d_data_root /path/to/ho3d \
   --ycb_model_path /path/to/ho3d/YCB_Video_Models \
   --ycbv_modesl_info_path ./models_info.json \

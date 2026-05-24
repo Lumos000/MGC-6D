@@ -36,7 +36,7 @@ python anchor_paper.py \
 python query_paper.py \
   --name ho3d_mgc6d_run1 \
   --anchor_path /path/to/paper_anchor_results/dexycb_reference_view_ours \
-  --metric_anchor_path /path/to/metric_anchor_results/dexycb_reference_view_ours \
+  --obs_anchor_path /path/to/obs_anchor_results/dexycb_reference_view_ours \
   --hot3d_data_root /path/to/ho3d \
   --ycb_model_path /path/to/ho3d/YCB_Video_Models \
   --ycbv_modesl_info_path ./models_info.json \
