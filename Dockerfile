@@ -41,8 +41,8 @@ COPY environment.yml requirements.txt ./
 RUN conda env create -f environment.yml \
     && conda clean -afy
 
-ENV PATH=${CONDA_DIR}/envs/geoanchor/bin:${PATH}
-ENV CONDA_DEFAULT_ENV=geoanchor
+ENV PATH=${CONDA_DIR}/envs/mgc6d/bin:${PATH}
+ENV CONDA_DEFAULT_ENV=mgc6d
 
 COPY . .
 

@@ -1,8 +1,5 @@
 # Installation
 
-
-> Compatibility note: older internal checkouts may still use the former project name, and the existing conda environment may still be named `geoanchor`. These names do not change the public project name, **MGC-6D**.
-
 MGC-6D was validated on Python 3.11.14, CUDA 12.1, PyTorch 2.5.1+cu121,
 TorchVision 0.20.1+cu121, and NVIDIA driver 565.57.01. The development
 server used four RTX 3090 24GB GPUs.
@@ -12,7 +9,7 @@ git clone <your-mgc-6d-repo-url>
 cd MGC-6D
 
 conda env create -f environment.yml
-conda activate geoanchor
+conda activate mgc6d
 ```
 
 If you install with pip instead, install the CUDA-enabled PyTorch wheel first,
@@ -113,7 +110,7 @@ may stall while Python reads cached bytecode from the environment
 Python bytecode caches to a local temporary directory:
 
 ```bash
-export PYTHONPYCACHEPREFIX=/tmp/$USER/geoanchor_pycache
+export PYTHONPYCACHEPREFIX=/tmp/$USER/mgc6d_pycache
 mkdir -p "$PYTHONPYCACHEPREFIX"
 
 CUDA_VISIBLE_DEVICES=0 \

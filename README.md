@@ -6,8 +6,6 @@ geometry candidates from a single anchor observation, calibrates their anchor
 reliability, and selects or reuses the best candidate during query-frame pose
 estimation.
 
-> Project rename note: earlier internal handoff notes and server paths may still use `GeoAnchor`. The public project name is **MGC-6D**; the server checkout path and existing conda environment can remain unchanged for compatibility.
-
 The cleaned first release focuses on the HO3D/YCB workflow. REAL275 and
 Toyota-Light scripts are included as advanced experimental entry points, but
 HO3D is the maintained one-command reproduction path.
@@ -49,7 +47,7 @@ TorchVision 0.20.1+cu121, CUDA 12.1, and driver 565.57.01 on RTX 3090 GPUs.
 
 ```bash
 conda env create -f environment.yml
-conda activate geoanchor
+conda activate mgc6d
 
 # FoundationPose pose refinement requires a local C++ extension.
 # If pybind11 is not visible to CMake, install it first:
@@ -122,7 +120,7 @@ If PyOpenGL or VisPy import stalls before any MGC-6D output appears on a
 shared server, redirect Python bytecode caches to a local temporary directory:
 
 ```bash
-export PYTHONPYCACHEPREFIX=/tmp/$USER/geoanchor_pycache
+export PYTHONPYCACHEPREFIX=/tmp/$USER/mgc6d_pycache
 mkdir -p "$PYTHONPYCACHEPREFIX"
 ```
 

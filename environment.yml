@@ -1,4 +1,4 @@
-name: geoanchor
+name: mgc6d
 channels:
   - pytorch
   - nvidia
