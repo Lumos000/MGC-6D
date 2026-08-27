@@ -49,6 +49,25 @@ TorchVision 0.20.1+cu121, CUDA 12.1, and driver 565.57.01 on RTX 3090 GPUs.
 conda env create -f environment.yml
 conda activate mgc6d
 
+### nvdiffrast (build from source)
+
+`nvdiffrast` is **not published on PyPI** (the PyPI project page exists but
+contains no releases). It is therefore installed separately from source after
+the environment is created, pinned to the exact `v0.4.0` tag used for the
+paper's experiments:
+
+```bash
+# The source build compiles CUDA kernels; nvcc and CUDA_HOME are required:
+export PATH=/usr/local/cuda-12.1/bin:$PATH   # adapt to your CUDA install
+export CUDA_HOME=/usr/local/cuda-12.1
+
+pip install --no-build-isolation \
+  "git+https://github.com/NVlabs/nvdiffrast@253ac4fcea7de5f396371124af597e6cc957bfae"
+```
+
+`--no-build-isolation` is required: the build imports PyTorch, which is not
+visible inside pip's default isolated build environment.
+
 # FoundationPose pose refinement requires a local C++ extension.
 # If pybind11 is not visible to CMake, install it first:
 python -m pip install pybind11

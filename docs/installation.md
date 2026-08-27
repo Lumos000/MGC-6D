@@ -82,25 +82,29 @@ export RAYST3R_ROOT=$(realpath ../rayst3r)
 If your RaySt3R checkout does not propagate the selected device into
 `eval_model`, apply `third_party/rayst3r_patches/device_eval.patch`.
 
-### nvdiffrast (must be installed from source)
+### nvdiffrast (build from source)
 
 `nvdiffrast` is **not published on PyPI**: the PyPI project page exists but
 contains no releases, so any `nvdiffrast==X.Y.Z` pin fails with
-"No matching distribution found". The pinned entry in `environment.yml` and
-`requirements.txt` therefore installs it directly from the NVlabs GitHub
-repository at the `v0.4.0` tag (commit `253ac4f`), which is exactly the build
-used for the paper's experiments.
-
-Building nvdiffrast from source compiles CUDA kernels, so an `nvcc` matching
-the PyTorch CUDA version must be on `PATH`:
+"No matching distribution found". Install it from the NVlabs GitHub repository
+at the `v0.4.0` tag (commit `253ac4f`) -- exactly the build used for the
+paper's experiments. It is installed **after** the environment is created,
+because pip's default isolated build environment does not contain PyTorch
+(which nvdiffrast's `setup.py` imports at build time):
 
 ```bash
+# The source build compiles CUDA kernels; nvcc and CUDA_HOME are required:
 export PATH=/usr/local/cuda-12.1/bin:$PATH   # adapt to your CUDA install
-conda env create -f environment.yml
+export CUDA_HOME=/usr/local/cuda-12.1
+
+pip install --no-build-isolation \
+  "git+https://github.com/NVlabs/nvdiffrast@253ac4fcea7de5f396371124af597e6cc957bfae"
 ```
 
-If you use pip only, install the CUDA-enabled PyTorch wheel first (see above)
-and make sure `nvcc` is on `PATH` before `pip install -r requirements.txt`.
+Run `pip install --no-build-isolation` (not the environment-variable form):
+pip 25.2 and newer ignore `PIP_NO_BUILD_ISOLATION`, and conda's pip section
+cannot pass CLI flags, so nvdiffrast is deliberately kept out of
+`environment.yml`.
 
 ## Troubleshooting
 
