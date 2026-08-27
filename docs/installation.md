@@ -82,6 +82,26 @@ export RAYST3R_ROOT=$(realpath ../rayst3r)
 If your RaySt3R checkout does not propagate the selected device into
 `eval_model`, apply `third_party/rayst3r_patches/device_eval.patch`.
 
+### nvdiffrast (must be installed from source)
+
+`nvdiffrast` is **not published on PyPI**: the PyPI project page exists but
+contains no releases, so any `nvdiffrast==X.Y.Z` pin fails with
+"No matching distribution found". The pinned entry in `environment.yml` and
+`requirements.txt` therefore installs it directly from the NVlabs GitHub
+repository at the `v0.4.0` tag (commit `253ac4f`), which is exactly the build
+used for the paper's experiments.
+
+Building nvdiffrast from source compiles CUDA kernels, so an `nvcc` matching
+the PyTorch CUDA version must be on `PATH`:
+
+```bash
+export PATH=/usr/local/cuda-12.1/bin:$PATH   # adapt to your CUDA install
+conda env create -f environment.yml
+```
+
+If you use pip only, install the CUDA-enabled PyTorch wheel first (see above)
+and make sure `nvcc` is on `PATH` before `pip install -r requirements.txt`.
+
 ## Troubleshooting
 
 ### CMake Cannot Find `pybind11`
