@@ -48,7 +48,7 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
   B = len(ob_in_cams)
   poseA = torch.as_tensor(ob_in_cams, dtype=torch.float, device=work_device)
 
-  bs = 512
+  bs = max(1, int(cfg.get('batch_size', 64)))
   rgb_rs = []
   depth_rs = []
   normal_rs = []
@@ -181,7 +181,7 @@ class PoseRefinePredictor:
 
     crop_ratio = self.cfg['crop_ratio']
     # logging.info(f"trans_normalizer:{self.cfg['trans_normalizer']}, rot_normalizer:{self.cfg['rot_normalizer']}")
-    bs = 1024
+    bs = max(1, int(self.cfg.get('batch_size', 64)))
 
     work_device = self.device
     if work_device.type == "cuda" and work_device.index is not None:
@@ -321,4 +321,3 @@ class PoseRefinePredictor:
 
     torch.backends.cudnn.enabled = prev_cudnn
     return B_in_cams_out, None
-

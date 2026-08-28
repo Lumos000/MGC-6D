@@ -2,6 +2,7 @@
 from project_paths import setup_project_paths
 setup_project_paths()
 import argparse
+import gc
 import glob
 import json
 import os
@@ -35,6 +36,16 @@ OBJ_NUM_MAP = {
     "005_tomato_soup_can": 4,
     "010_potted_meat_can": 9,
 }
+
+
+def _release_cuda_memory():
+    """Release cyclic model references and unused CUDA allocations between stages."""
+    gc.collect()
+    if not torch.cuda.is_available():
+        return
+    for device_idx in range(torch.cuda.device_count()):
+        with torch.cuda.device(device_idx):
+            torch.cuda.empty_cache()
 
 
 def _find_file(search_dirs, preferred_names, suffix=None):
@@ -678,6 +689,7 @@ def main():
     # Step 1: Anchor-phase candidate geometry construction (Section 3.2)
     # ====================================================================
     recon_results = run_construction(cfg)
+    _release_cuda_memory()
     model_info = _load_model_info(args.ycb_model_path)
 
     run_meta = {
@@ -833,13 +845,16 @@ def main():
                     )
                 except Exception:
                     pass
-            return {
+            result_local = {
                 "mesh": mesh_local,
                 "pred_pose": pred_pose_local,
                 "l_depth": float(l_depth),
                 "l_mask": float(l_mask),
                 "l_geom": float(l_geom),
             }
+            del est_local
+            _release_cuda_memory()
+            return result_local
 
         results_pose = {}
         for label, path in candidates.items():
@@ -989,6 +1004,9 @@ def main():
             "final_pose_path": os.path.abspath(os.path.join(obj_dir, f"{obj}_initial_pose.txt")),
             "K_path": os.path.abspath(os.path.join(obj_dir, "K.txt")),
         }
+
+        del est_final, results_pose
+        _release_cuda_memory()
 
     # ====================================================================
     # Save candidate registry JSON for query phase
