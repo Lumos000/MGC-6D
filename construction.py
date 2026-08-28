@@ -559,11 +559,45 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
                 init_center = guess_translation(depth_m, mask, intrinsic)
 
             work_dir = os.path.join(out_dir, "rayst3r_input")
-            points, mesh_ray = _rayst3r_reconstruct(runner, color, depth_m, mask, intrinsic, obj_cfg, work_dir)
+            try:
+                points, mesh_ray = _rayst3r_reconstruct(
+                    runner, color, depth_m, mask, intrinsic, obj_cfg, work_dir
+                )
+            except Exception as exc:
+                candidate_scores[depth_unit] = {
+                    "fitness": -1.0,
+                    "rmse": float("inf"),
+                    "decision_score": -1e9,
+                    "fitness_raw": -1.0,
+                    "rmse_raw": float("inf"),
+                    "decision_score_raw": -1e9,
+                    "align": "rayst3r_failed",
+                    "range_ratio": float(range_ratio),
+                    "range_ok": bool(range_ok),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                print(
+                    f"[WARN] {obj_name}: RaySt3R failed for depth_unit={depth_unit}: "
+                    f"{type(exc).__name__}: {exc}; trying the next depth candidate."
+                )
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            if mesh_ray is None:
+            if mesh_ray is None or points is None or len(points) == 0:
+                candidate_scores[depth_unit] = {
+                    "fitness": -1.0,
+                    "rmse": float("inf"),
+                    "decision_score": -1e9,
+                    "fitness_raw": -1.0,
+                    "rmse_raw": float("inf"),
+                    "decision_score_raw": -1e9,
+                    "align": "rayst3r_empty",
+                    "range_ratio": float(range_ratio),
+                    "range_ok": bool(range_ok),
+                }
                 continue
 
             if (valid_ratio_score is not None) and (valid_ratio_score < obj_cfg.valid_ratio_threshold):
@@ -737,7 +771,30 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
             )
             best = best_any
         if best is None:
-            raise RuntimeError(f"Reconstruction failed for {obj_name}")
+            print(
+                f"[WARN] {obj_name}: all RaySt3R candidates failed; "
+                "using instantmesh_only_fallback."
+            )
+            try:
+                fallback_points, _ = trimesh.sample.sample_surface(
+                    mesh_inst, min(max(int(cfg.sample_points), 10000), 50000)
+                )
+            except Exception:
+                fallback_points = np.asarray(mesh_inst.vertices, dtype=np.float64)
+            best = {
+                "depth_unit": str(depth_candidates[0]) if depth_candidates else str(obj_cfg.depth_unit),
+                "points": np.asarray(fallback_points, dtype=np.float64),
+                "mesh_ray": mesh_inst.copy(),
+                "mesh_inst": mesh_inst.copy(),
+                "mesh_fused": mesh_inst.copy(),
+                "align_direction": "instantmesh_only_fallback",
+                "fitness": -1.0,
+                "rmse": float("inf"),
+                "transform": None,
+                "range_ratio": 0.0,
+                "range_ok": False,
+                "decision_score": -1e9,
+            }
 
         points = best["points"]
         mesh_ray = best["mesh_ray"]
