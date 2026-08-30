@@ -4,9 +4,11 @@ setup_project_paths()
 import argparse
 import gc
 import glob
+import hashlib
 import json
 import os
 import random
+import shutil
 import warnings
 
 import cv2
@@ -25,6 +27,7 @@ from foundationpose.Utils import (
     align_mesh_to_coordinate,
 )
 from sam2_rayst3r import running_sam_box
+from candidate_selection import derive_anchor_reliability_scores, score_candidates
 
 
 OBJ_NUM_MAP = {
@@ -46,6 +49,18 @@ def _release_cuda_memory():
     for device_idx in range(torch.cuda.device_count()):
         with torch.cuda.device(device_idx):
             torch.cuda.empty_cache()
+
+
+def _stable_trial_seed(
+    global_seed: int,
+    obj: str,
+    label: str,
+    strategy: str,
+    seed_index: int,
+) -> int:
+    key = f"{obj}|{label}|{strategy}|{seed_index}".encode("utf-8")
+    offset = int.from_bytes(hashlib.sha256(key).digest()[:4], "little")
+    return int((int(global_seed) + offset) % (2**31 - 1))
 
 
 def _find_file(search_dirs, preferred_names, suffix=None):
@@ -268,21 +283,44 @@ def _compute_anchor_calibration_score(
     tau_inlier: float,
     tau_rmse: float,
 ) -> float:
-    """Compute anchor-phase geometric credibility score s_anchor (Eq. 9, 10).
+    """Compute a bounded geometric-compatibility prior in ``[0, 1]``.
 
-    For base candidates (obs/prior): s_anchor = c_base.
-    For fused candidate satisfying consistency: s_anchor = c_base + w_inlier*fitness + w_rmse*(1-rmse).
+    Base candidates receive the neutral bounded prior ``c_base``.  A fused
+    candidate receives a weighted mean of ICP coverage and an exponential RMSE
+    quality.  Fusion is never rewarded merely for existing.
     """
     if label in ("rayst3r", "instantmesh"):
-        return c_base
+        return float(np.clip(c_base, 0.0, 1.0))
 
     fitness = meta.get("align_fitness", -1.0)
     rmse = meta.get("align_rmse", float("inf"))
     consistency_ok = (fitness >= tau_inlier) and (rmse <= tau_rmse)
 
-    if label == "fused" and consistency_ok:
-        return c_base + w_inlier * fitness + w_rmse * max(0.0, 1.0 - rmse)
-    return c_base
+    if label != "fused" or not consistency_ok:
+        return 0.0
+    weights = np.asarray(
+        [max(float(w_inlier), 0.0), max(float(w_rmse), 0.0)], dtype=np.float64
+    )
+    if weights.sum() <= 0.0:
+        return 0.0
+    inlier_quality = float(np.clip(fitness, 0.0, 1.0))
+    rmse_quality = float(
+        np.exp(-max(float(rmse), 0.0) / max(float(tau_rmse), 1e-8))
+    )
+    alignment_quality = float(
+        np.clip(
+            np.dot(weights, [inlier_quality, rmse_quality]) / weights.sum(),
+            0.0,
+            1.0,
+        )
+    )
+    # construction.py already folds bidirectional cycle confidence into this
+    # Phi reliability.  Keeping it bounded prevents a fused candidate from
+    # winning merely because one ICP direction happens to pass.
+    fusion_quality = float(
+        meta.get("fusion_diagnostics", {}).get("reliability", alignment_quality)
+    )
+    return float(np.clip(0.5 * alignment_quality + 0.5 * fusion_quality, 0.0, 1.0))
 
 
 def main():
@@ -392,6 +430,17 @@ def main():
         help="Run bidirectional ICP and choose best alignment",
     )
     parser.add_argument(
+        "--align_strict_both",
+        action="store_true",
+        help="Ablation: require both ICP directions to pass Fitness/RMSE thresholds",
+    )
+    parser.add_argument(
+        "--align_relaxed_rescue",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Optional rescue ablation; disabled for the paper main method.",
+    )
+    parser.add_argument(
         "--icp_max_iter",
         type=int,
         default=50,
@@ -491,8 +540,9 @@ def main():
     )
     parser.add_argument(
         "--instantmesh_flip",
-        action="store_true",
-        help="Flip input image horizontally for InstantMesh",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Flip the anchor crop horizontally for InstantMesh (default: enabled)",
     )
     parser.add_argument(
         "--instantmesh_no_remove_bg",
@@ -517,6 +567,17 @@ def main():
         default=50000,
         help="Number of points to sample from InstantMesh for ICP",
     )
+    parser.add_argument("--rayst3r_crop_margin_ratio", type=float, default=0.05)
+    parser.add_argument("--rayst3r_min_component_area_ratio", type=float, default=0.005)
+    parser.add_argument("--rayst3r_target_faces", type=int, default=100000)
+    parser.add_argument("--fusion_voxel_size", type=float, default=0.003)
+    parser.add_argument("--fusion_sample_points", type=int, default=15000)
+    parser.add_argument("--fusion_poisson_depth", type=int, default=6)
+    parser.add_argument("--fusion_target_faces", type=int, default=20000)
+    parser.add_argument("--fusion_density_quantile", type=float, default=0.02)
+    parser.add_argument("--fusion_visible_depth_tolerance", type=float, default=0.015)
+    parser.add_argument("--fusion_observed_support_ratio", type=float, default=0.08)
+    parser.add_argument("--fusion_agreement_ratio", type=float, default=0.025)
     # --- Observation consistency weights (Eq. 14): s_query ---
     parser.add_argument(
         "--select_depth_weight",
@@ -535,12 +596,6 @@ def main():
         type=float,
         default=0.25,
         help="w3: weight for L_geom (Chamfer) in observation consistency (Eq. 14)",
-    )
-    parser.add_argument(
-        "--select_chamfer_force_ratio",
-        type=float,
-        default=0.2,
-        help="If selected L_geom > best*(1+ratio), force best-L_geom candidate",
     )
     # --- Anchor calibration score parameters (Eq. 9, 10) ---
     parser.add_argument(
@@ -573,17 +628,26 @@ def main():
         default=0.02,
         help="tau_rmse: maximum allowed RMSE for consistency (Eq. 7)",
     )
+    parser.add_argument("--anchor_depth_scale", type=float, default=0.05)
+    parser.add_argument("--anchor_mask_scale", type=float, default=0.50)
+    parser.add_argument("--anchor_geom_scale", type=float, default=0.05)
+    parser.add_argument(
+        "--anchor_calibration_weight",
+        type=float,
+        default=0.15,
+        help="Bounded contribution of ICP compatibility to effective anchor reliability",
+    )
     # --- Total score balance (Eq. 2): S(k) = alpha*s_anchor + beta*s_query ---
     parser.add_argument(
         "--score_alpha",
         type=float,
-        default=0.3,
+        default=0.4,
         help="alpha: weight for anchor calibration score in total score (Eq. 2)",
     )
     parser.add_argument(
         "--score_beta",
         type=float,
-        default=0.7,
+        default=0.6,
         help="beta: weight for query observation consistency in total score (Eq. 2)",
     )
     # Legacy selection weights kept for CLI backward compatibility.
@@ -611,7 +675,49 @@ def main():
         default=0,
         help="Global random seed for reproducible anchor reconstruction/evaluation",
     )
+    parser.add_argument(
+        "--objects",
+        type=str,
+        default="",
+        help="Comma-separated HO3D object names to process; empty processes all.",
+    )
+    parser.add_argument(
+        "--anchor_pose_trials",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Evaluate axis-aligned and non-axis-aligned anchor pose hypotheses "
+            "inside each geometry candidate, retaining only one pose per label."
+        ),
+    )
+    parser.add_argument(
+        "--anchor_trials_per_strategy",
+        type=int,
+        default=1,
+        help="Fixed-seed trials per anchor pose strategy.",
+    )
     args = parser.parse_args()
+    if not 0.0 <= args.anchor_calibration_weight <= 1.0:
+        raise ValueError("--anchor_calibration_weight must lie in [0, 1]")
+    for name in ("anchor_depth_scale", "anchor_mask_scale", "anchor_geom_scale"):
+        if not np.isfinite(getattr(args, name)) or getattr(args, name) <= 0.0:
+            raise ValueError(f"--{name} must be finite and positive")
+    if args.icp_max_corr_ratio <= 0.0:
+        raise ValueError("--icp_max_corr_ratio must be positive")
+    if args.rayst3r_crop_margin_ratio < 0.0:
+        raise ValueError("--rayst3r_crop_margin_ratio must be non-negative")
+    if not 0.0 <= args.rayst3r_min_component_area_ratio < 1.0:
+        raise ValueError("--rayst3r_min_component_area_ratio must lie in [0, 1)")
+    if args.anchor_trials_per_strategy < 1:
+        raise ValueError("--anchor_trials_per_strategy must be at least 1")
+    for name in (
+        "fusion_voxel_size",
+        "fusion_visible_depth_tolerance",
+        "fusion_observed_support_ratio",
+        "fusion_agreement_ratio",
+    ):
+        if not np.isfinite(getattr(args, name)) or getattr(args, name) <= 0.0:
+            raise ValueError(f"--{name} must be finite and positive")
     if any(
         v is not None
         for v in [
@@ -643,9 +749,21 @@ def main():
         torch.cuda.manual_seed_all(args.seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    input_root = os.path.realpath(args.anchor_folder)
+    result_root = os.path.realpath(args.output_root or args.anchor_folder)
+    os.makedirs(result_root, exist_ok=True)
+    obj_list = sorted(
+        d for d in os.listdir(input_root) if os.path.isdir(os.path.join(input_root, d))
+    )
+    if args.objects.strip():
+        requested = {name.strip() for name in args.objects.split(",") if name.strip()}
+        obj_list = [obj for obj in obj_list if obj in requested]
+    if not obj_list:
+        raise RuntimeError(f"No requested object folders found in {input_root}")
     cfg = ReconstructionConfig(
-        anchor_root=args.anchor_folder,
-        output_root=args.output_root,
+        anchor_root=input_root,
+        output_root=result_root,
+        object_names=tuple(obj_list),
         depth_unit=args.depth_unit,
         depth_unit_try_both=args.depth_unit_try_both,
         depth_preprocess=args.depth_preprocess,
@@ -676,6 +794,8 @@ def main():
         instantmesh_remove_bg=not args.instantmesh_no_remove_bg,
         align_use_guess_translation=args.align_use_guess_translation,
         align_bidirectional_icp=args.align_bidirectional_icp,
+        align_strict_both=args.align_strict_both,
+        align_relaxed_rescue=args.align_relaxed_rescue,
         icp_max_iter=args.icp_max_iter,
         icp_fitness_threshold=args.icp_fitness_threshold,
         icp_multi_hypo=args.icp_multi_hypo,
@@ -683,6 +803,18 @@ def main():
         icp_max_corr_ratio=args.icp_max_corr_ratio,
         icp_voxel_size=args.icp_voxel_size,
         sample_points=args.sample_points,
+        rayst3r_crop_margin_ratio=args.rayst3r_crop_margin_ratio,
+        rayst3r_min_component_area_ratio=args.rayst3r_min_component_area_ratio,
+        rayst3r_target_faces=args.rayst3r_target_faces,
+        fusion_voxel_size=args.fusion_voxel_size,
+        fusion_sample_points=args.fusion_sample_points,
+        fusion_poisson_depth=args.fusion_poisson_depth,
+        fusion_target_faces=args.fusion_target_faces,
+        fusion_density_quantile=args.fusion_density_quantile,
+        fusion_visible_depth_tolerance=args.fusion_visible_depth_tolerance,
+        fusion_observed_support_ratio=args.fusion_observed_support_ratio,
+        fusion_agreement_ratio=args.fusion_agreement_ratio,
+        seed=args.seed,
     )
 
     # ====================================================================
@@ -693,14 +825,17 @@ def main():
     model_info = _load_model_info(args.ycb_model_path)
 
     run_meta = {
-        "anchor_folder": args.anchor_folder,
-        "output_root": args.output_root,
+        "anchor_folder": input_root,
+        "output_root": result_root,
         "ycb_model_path": args.ycb_model_path,
+        "mask_source": "dataset_gt" if not args.refine_mask else "sam2_refined",
+        "geometry_units": "meters_after_construction",
+        "candidate_canonicalization_scale": 1.0,
+        "reconstruction_method": "current_metric_scale_visible_prior_poisson_phi",
         "selection": {
             "select_depth_weight": args.select_depth_weight,
             "select_mask_weight": args.select_mask_weight,
             "select_geom_weight": args.select_geom_weight,
-            "select_chamfer_force_ratio": args.select_chamfer_force_ratio,
         },
         "calibration": {
             "anchor_c_base": args.anchor_c_base,
@@ -708,26 +843,42 @@ def main():
             "anchor_w_rmse": args.anchor_w_rmse,
             "anchor_tau_inlier": args.anchor_tau_inlier,
             "anchor_tau_rmse": args.anchor_tau_rmse,
+            "anchor_depth_scale": args.anchor_depth_scale,
+            "anchor_mask_scale": args.anchor_mask_scale,
+            "anchor_geom_scale": args.anchor_geom_scale,
+            "anchor_calibration_weight": args.anchor_calibration_weight,
             "score_alpha": args.score_alpha,
             "score_beta": args.score_beta,
         },
         "args": vars(args),
     }
-    with open(os.path.join(args.anchor_folder, "anchor_run_meta.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(result_root, "anchor_run_meta.json"), "w", encoding="utf-8") as f:
         json.dump(run_meta, f, indent=2)
 
     results = []
     pose_rows = []
     pose_rows_all = []
     candidate_registry = {}
-    obj_list = [d for d in os.listdir(args.anchor_folder) if os.path.isdir(os.path.join(args.anchor_folder, d))]
-
     glctx = dr.RasterizeCudaContext()
 
     for obj in tqdm(obj_list, desc="Object"):
         obj_num = OBJ_NUM_MAP.get(obj, -1)
         symmetry_tfs = _build_symmetry_tfs_for_object(obj, model_info)
-        obj_dir = os.path.join(args.anchor_folder, obj)
+        input_obj_dir = os.path.join(input_root, obj)
+        obj_dir = os.path.join(result_root, obj)
+        os.makedirs(obj_dir, exist_ok=True)
+        for input_name in (
+            "color.png",
+            "depth.png",
+            "mask.png",
+            "K.txt",
+            f"{obj}_gt_pose.txt",
+            "source_frame.txt",
+        ):
+            src = os.path.join(input_obj_dir, input_name)
+            dst = os.path.join(obj_dir, input_name)
+            if os.path.isfile(src) and os.path.realpath(src) != os.path.realpath(dst):
+                shutil.copy2(src, dst)
 
         if obj not in recon_results:
             raise RuntimeError(f"Missing reconstruction outputs for {obj}")
@@ -757,17 +908,24 @@ def main():
             candidates["rayst3r"] = ray_path
         if inst_path and os.path.exists(inst_path):
             candidates["instantmesh"] = inst_path
-        if fused_path and os.path.exists(fused_path):
+        align_valid = (
+            align_direction is not None
+            and not str(align_direction).startswith("none")
+            and align_direction != "instantmesh_only_fallback"
+        )
+        if align_valid and fused_path and os.path.exists(fused_path):
+            fusion_diagnostics = recon_meta.get("fusion_diagnostics", {})
             fused_consistency_ok = (
                 recon_meta.get("align_fitness", -1.0) >= args.anchor_tau_inlier
                 and recon_meta.get("align_rmse", float("inf")) <= args.anchor_tau_rmse
+                and not bool(fusion_diagnostics.get("fallback_used", False))
             )
             if fused_consistency_ok:
                 candidates["fused"] = fused_path
 
-        s_anchor_scores = {}
+        calibration_scores = {}
         for label in candidates:
-            s_anchor_scores[label] = _compute_anchor_calibration_score(
+            calibration_scores[label] = _compute_anchor_calibration_score(
                 meta=recon_meta,
                 label=label,
                 c_base=args.anchor_c_base,
@@ -781,85 +939,185 @@ def main():
         # Step 3: For each candidate, run Any6D pose registration on anchor
         # image and compute observation consistency score (Eq. 14)
         # ====================================================================
-        def _evaluate_mesh_pose(mesh_path: str, label: str, visualize: bool = False):
+        trial_strategies = [{"name": "any6d_coarse_aa", "axis_align": True}]
+        if args.anchor_pose_trials:
+            trial_strategies.append(
+                {"name": "any6d_coarse_noaa", "axis_align": False}
+            )
+
+        def _evaluate_mesh_pose(mesh_path: str, label: str):
             mesh_local = trimesh.load(mesh_path)
-            mesh_local = align_mesh_to_coordinate(mesh_local)
+            if isinstance(mesh_local, trimesh.Scene):
+                mesh_local = trimesh.util.concatenate(
+                    [
+                        geometry
+                        for geometry in mesh_local.geometry.values()
+                        if isinstance(geometry, trimesh.Trimesh)
+                    ]
+                )
+            # Construction outputs are already metric.  Applying the former
+            # x0.1 here would silently undo the recovered scale.
+            mesh_local = align_mesh_to_coordinate(mesh_local, scale=1.0)
             mesh_local.export(os.path.join(obj_dir, f"center_mesh_{obj}_{label}.obj"))
-            est_local = Any6D(symmetry_tfs=symmetry_tfs, mesh=mesh_local, debug_dir=obj_dir, debug=0)
-            pred_pose_local = est_local.register_any6d(
-                K=intrinsic,
-                rgb=color,
-                depth=depth,
-                ob_mask=mask,
-                iteration=args.any6d_iter,
-                refinement=bool(args.any6d_refine),
-                name="demo",
-            )
-            l_depth, l_mask, l_geom = _compute_self_supervised_losses(
-                est=est_local,
-                depth=depth,
-                mask=mask,
-                K=intrinsic,
-                pred_pose=pred_pose_local,
-                glctx=glctx,
-            )
-            np.savetxt(os.path.join(obj_dir, f"{obj}_initial_pose_{label}.txt"), pred_pose_local)
-            est_local.mesh.export(os.path.join(obj_dir, f"final_mesh_{obj}_{label}.obj"))
-            np.savetxt(os.path.join(obj_dir, f"{obj}_ldepth_{label}.txt"), [l_depth])
-            np.savetxt(os.path.join(obj_dir, f"{obj}_lmask_{label}.txt"), [l_mask])
-            np.savetxt(os.path.join(obj_dir, f"{obj}_cd_{label}.txt"), [l_geom])
-            if visualize:
-                try:
-                    gt_pose = np.loadtxt(os.path.join(obj_dir, f"{obj}_gt_pose.txt"))
-                    gt_mesh = trimesh.load(f"{args.ycb_model_path}/models/{obj}/textured_simple.obj")
-                    visualize_frame_results(
-                        color=color,
-                        gt_mesh=gt_mesh,
-                        est=est_local,
-                        K=intrinsic,
-                        gt_pose=gt_pose,
-                        pred_pose=pred_pose_local,
-                        metric=None,
-                        obj_f=obj,
-                        frame_idx=0,
-                        save_path=obj_dir,
-                        glctx=glctx,
-                        name=f"demo_data_{label}",
-                        mesh_index=0,
-                        init=False,
-                        save_on_folder=True,
+
+            best_trial = None
+            trial_records = []
+            for strategy in trial_strategies:
+                for seed_index in range(args.anchor_trials_per_strategy):
+                    trial_seed = _stable_trial_seed(
+                        args.seed, obj, label, strategy["name"], seed_index
                     )
-                    visualize_frame_results_gt(
-                        color=color,
-                        gt_mesh=gt_mesh,
-                        K=intrinsic,
-                        gt_pose=gt_pose,
-                        pred_pose=pred_pose_local,
-                        obj_f=obj,
-                        frame_idx=0,
-                        save_path=obj_dir,
-                        glctx=glctx,
-                        name=f"anchor_con_{label}",
-                        est_mesh=est_local.mesh,
-                        save_on_folder=False,
+                    random.seed(trial_seed)
+                    np.random.seed(trial_seed)
+                    torch.manual_seed(trial_seed)
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(trial_seed)
+                    est_local = Any6D(
+                        symmetry_tfs=symmetry_tfs,
+                        mesh=mesh_local.copy(),
+                        debug_dir=obj_dir,
+                        debug=0,
                     )
-                except Exception:
-                    pass
-            result_local = {
-                "mesh": mesh_local,
+                    try:
+                        pred_pose_local = est_local.register_any6d(
+                            K=intrinsic,
+                            rgb=color,
+                            depth=depth,
+                            ob_mask=mask,
+                            iteration=args.any6d_iter,
+                            refinement=bool(args.any6d_refine),
+                            axis_align=bool(strategy["axis_align"]),
+                            coarse_est=True,
+                            random_seed=trial_seed,
+                            name=f"anchor_{label}_{strategy['name']}_s{seed_index}",
+                        )
+                        l_depth, l_mask, l_geom = _compute_self_supervised_losses(
+                            est=est_local,
+                            depth=depth,
+                            mask=mask,
+                            K=intrinsic,
+                            pred_pose=pred_pose_local,
+                            glctx=glctx,
+                        )
+                    except Exception as exc:
+                        trial_records.append(
+                            {
+                                "strategy": strategy["name"],
+                                "seed_index": int(seed_index),
+                                "random_seed": int(trial_seed),
+                                "valid": False,
+                                "error": f"{type(exc).__name__}: {exc}",
+                            }
+                        )
+                        del est_local
+                        _release_cuda_memory()
+                        continue
+
+                    trial_score = (
+                        args.select_depth_weight
+                        * np.clip(float(l_depth) / args.anchor_depth_scale, 0.0, 1.0)
+                        + args.select_mask_weight
+                        * np.clip(float(l_mask) / args.anchor_mask_scale, 0.0, 1.0)
+                        + args.select_geom_weight
+                        * np.clip(float(l_geom) / args.anchor_geom_scale, 0.0, 1.0)
+                    )
+                    record = {
+                        "strategy": strategy["name"],
+                        "seed_index": int(seed_index),
+                        "random_seed": int(trial_seed),
+                        "axis_align": bool(strategy["axis_align"]),
+                        "valid": True,
+                        "score": float(trial_score),
+                        "l_depth": float(l_depth),
+                        "l_mask": float(l_mask),
+                        "l_geom": float(l_geom),
+                    }
+                    trial_records.append(record)
+                    trial = {
+                        **record,
+                        "pred_pose": np.array(pred_pose_local, copy=True),
+                        "mesh": est_local.mesh.copy(),
+                    }
+                    if best_trial is None or trial["score"] < best_trial["score"]:
+                        best_trial = trial
+                    del est_local
+                    _release_cuda_memory()
+
+            with open(
+                os.path.join(obj_dir, f"{obj}_anchor_trials_{label}.json"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(trial_records, f, indent=2)
+            if best_trial is None:
+                raise RuntimeError(f"No valid anchor pose trial for {obj}/{label}")
+
+            pred_pose_local = best_trial["pred_pose"]
+            best_mesh = best_trial["mesh"]
+            np.savetxt(
+                os.path.join(obj_dir, f"{obj}_initial_pose_{label}.txt"),
+                pred_pose_local,
+            )
+            best_mesh.export(os.path.join(obj_dir, f"final_mesh_{obj}_{label}.obj"))
+            np.savetxt(
+                os.path.join(obj_dir, f"{obj}_ldepth_{label}.txt"),
+                [best_trial["l_depth"]],
+            )
+            np.savetxt(
+                os.path.join(obj_dir, f"{obj}_lmask_{label}.txt"),
+                [best_trial["l_mask"]],
+            )
+            np.savetxt(
+                os.path.join(obj_dir, f"{obj}_cd_{label}.txt"),
+                [best_trial["l_geom"]],
+            )
+            return {
+                "mesh": best_mesh,
                 "pred_pose": pred_pose_local,
-                "l_depth": float(l_depth),
-                "l_mask": float(l_mask),
-                "l_geom": float(l_geom),
+                "l_depth": float(best_trial["l_depth"]),
+                "l_mask": float(best_trial["l_mask"]),
+                "l_geom": float(best_trial["l_geom"]),
+                "anchor_pose_strategy": best_trial["strategy"],
+                "anchor_pose_seed_index": int(best_trial["seed_index"]),
+                "anchor_pose_random_seed": int(best_trial["random_seed"]),
+                "anchor_pose_trial_count": int(
+                    sum(bool(record.get("valid")) for record in trial_records)
+                ),
             }
-            del est_local
-            _release_cuda_memory()
-            return result_local
 
         results_pose = {}
         for label, path in candidates.items():
-            results_pose[label] = _evaluate_mesh_pose(path, label, visualize=False)
-            res = results_pose[label]
+            results_pose[label] = _evaluate_mesh_pose(path, label)
+
+        if not results_pose:
+            raise RuntimeError(f"No valid meshes for pose evaluation: {obj}")
+
+        reliability_rows = [
+            {
+                "label": label,
+                "s_anchor": float(calibration_scores[label]),
+                "l_depth": float(res["l_depth"]),
+                "l_mask": float(res["l_mask"]),
+                "l_geom": float(res["l_geom"]),
+            }
+            for label, res in results_pose.items()
+        ]
+        derive_anchor_reliability_scores(
+            reliability_rows,
+            w_depth=args.select_depth_weight,
+            w_mask=args.select_mask_weight,
+            w_geom=args.select_geom_weight,
+            depth_scale=args.anchor_depth_scale,
+            mask_scale=args.anchor_mask_scale,
+            geom_scale=args.anchor_geom_scale,
+            calibration_weight=args.anchor_calibration_weight,
+        )
+        reliability_by_label = {row["label"]: row for row in reliability_rows}
+        s_anchor_scores = {
+            label: float(row["s_anchor"]) for label, row in reliability_by_label.items()
+        }
+        for label, res in results_pose.items():
+            reliability = reliability_by_label[label]
             pose_rows_all.append(
                 {
                     "Object": obj,
@@ -868,70 +1126,72 @@ def main():
                     "L_depth": float(res["l_depth"]),
                     "L_mask": float(res["l_mask"]),
                     "L_geom": float(res["l_geom"]),
-                    "S_anchor": float(s_anchor_scores[label]),
+                    "S_anchor": float(reliability["s_anchor"]),
+                    "S_anchor_raw": float(reliability["s_anchor_raw"]),
+                    "Anchor_Observation_Quality": float(
+                        reliability["anchor_observation_quality"]
+                    ),
+                    "Anchor_Calibration_Norm": float(
+                        reliability["anchor_calibration_norm"]
+                    ),
                 }
             )
-
-        if not results_pose:
-            raise RuntimeError(f"No valid meshes for pose evaluation: {obj}")
 
         # ====================================================================
         # Step 4: Total scoring and candidate selection (Eq. 2, 3, 15)
         # S(k) = alpha * s_anchor(k) + beta * s_query(k)
-        # s_query is normalized by min values across candidates
+        # Anchor losses use disclosed fixed scales, matching the revised query
+        # scorer and avoiding candidate-set-dependent L/min(L) behavior.
         # ====================================================================
-        def _norm(v: float, min_v: float) -> float:
-            return float(v) / float(min_v + 1e-8)
-
-        min_l_depth = min(res["l_depth"] for res in results_pose.values())
-        min_l_mask = min(res["l_mask"] for res in results_pose.values())
-        min_l_geom = min(res["l_geom"] for res in results_pose.values())
-
         w_depth = args.select_depth_weight
         w_mask = args.select_mask_weight
         w_geom = args.select_geom_weight
         alpha = args.score_alpha
         beta = args.score_beta
 
-        max_s_anchor = max(s_anchor_scores.values()) if s_anchor_scores else 1.0
-
-        scored = []
-        score_breakdown = {}
+        anchor_rows = []
         for label, res in results_pose.items():
-            depth_term = w_depth * _norm(res["l_depth"], min_l_depth)
-            mask_term = w_mask * _norm(res["l_mask"], min_l_mask)
-            geom_term = w_geom * _norm(res["l_geom"], min_l_geom)
-            s_query = depth_term + mask_term + geom_term
-
-            s_anchor_norm = s_anchor_scores[label] / max(max_s_anchor, 1e-8)
-            total_score = -alpha * s_anchor_norm + beta * s_query
-
-            scored.append((label, res, float(total_score)))
-            score_breakdown[label] = {
-                "Score_L_depth": float(depth_term),
-                "Score_L_mask": float(mask_term),
-                "Score_L_geom": float(geom_term),
-                "S_query": float(s_query),
-                "S_anchor": float(s_anchor_scores[label]),
-                "S_anchor_norm": float(s_anchor_norm),
-                "Total_Score": float(total_score),
+            anchor_rows.append({
+                "label": label,
+                "s_anchor": float(s_anchor_scores[label]),
+                "anchor_score_version": "bounded_observation_calibrated_v1",
+                "l_depth": float(res["l_depth"]),
+                "l_mask": float(res["l_mask"]),
+                "l_geom": float(res["l_geom"]),
+            })
+        score_candidates(
+            anchor_rows,
+            w_depth=w_depth,
+            w_mask=w_mask,
+            w_geom=w_geom,
+            score_alpha=alpha,
+            score_beta=beta,
+            loss_normalization="fixed_scale",
+            depth_scale=args.anchor_depth_scale,
+            mask_scale=args.anchor_mask_scale,
+            geom_scale=args.anchor_geom_scale,
+        )
+        scored_rows = sorted(anchor_rows, key=lambda row: row["total_score"], reverse=True)
+        chosen_label = scored_rows[0]["label"]
+        best = results_pose[chosen_label]
+        selection_scores = {row["label"]: row["total_score"] for row in scored_rows}
+        score_breakdown = {
+            row["label"]: {
+                "Score_L_depth": float(w_depth * row["l_depth_norm"]),
+                "Score_L_mask": float(w_mask * row["l_mask_norm"]),
+                "Score_L_geom": float(w_geom * row["l_geom_norm"]),
+                "S_query": float(row["s_query"]),
+                "S_anchor": float(row["s_anchor"]),
+                "S_anchor_norm": float(row["s_anchor_norm"]),
+                "Total_Score": float(row["total_score"]),
                 "Weight_L_depth": float(w_depth),
                 "Weight_L_mask": float(w_mask),
                 "Weight_L_geom": float(w_geom),
                 "Alpha": float(alpha),
                 "Beta": float(beta),
             }
-        scored.sort(key=lambda x: x[2])
-        selection_scores = {label: score for label, _, score in scored}
-
-        chosen_label, best, _ = scored[0]
-        forced_by_chamfer = False
-        best_geom_label, best_geom = min(
-            results_pose.items(), key=lambda x: x[1]["l_geom"]
-        )
-        if best["l_geom"] > best_geom["l_geom"] * (1.0 + args.select_chamfer_force_ratio):
-            chosen_label, best = best_geom_label, best_geom
-            forced_by_chamfer = True
+            for row in scored_rows
+        }
 
         for i, row in enumerate(pose_rows_all):
             if row["Object"] == obj and row["Candidate"] in selection_scores:
@@ -944,25 +1204,14 @@ def main():
             f"L_depth={best['l_depth']:.6f} L_mask={best['l_mask']:.6f} L_geom={best['l_geom']:.6f} "
             f"S_anchor={s_anchor_scores[chosen_label]:.4f}"
         )
-        _ = _evaluate_mesh_pose(candidates[chosen_label], f"chosen_{chosen_label}", visualize=True)
         chamfer_dis = best["l_geom"]
-
-        chosen_mesh_path = candidates[chosen_label]
-        final_mesh = trimesh.load(chosen_mesh_path)
-        final_mesh = align_mesh_to_coordinate(final_mesh)
-        final_mesh.export(os.path.join(obj_dir, f"center_mesh_{obj}.obj"))
-        est_final = Any6D(symmetry_tfs=symmetry_tfs, mesh=final_mesh, debug_dir=obj_dir, debug=0)
-        pred_pose_final = est_final.register_any6d(
-            K=intrinsic,
-            rgb=color,
-            depth=depth,
-            ob_mask=mask,
-            iteration=args.any6d_iter,
-            refinement=bool(args.any6d_refine),
-            name="demo",
+        # Reuse the selected internal trial exactly.  Re-registering here used
+        # to make the registry pose/mesh differ from the values that won.
+        best["mesh"].export(os.path.join(obj_dir, f"center_mesh_{obj}.obj"))
+        best["mesh"].export(os.path.join(obj_dir, f"final_mesh_{obj}.obj"))
+        np.savetxt(
+            os.path.join(obj_dir, f"{obj}_initial_pose.txt"), best["pred_pose"]
         )
-        np.savetxt(os.path.join(obj_dir, f"{obj}_initial_pose.txt"), pred_pose_final)
-        est_final.mesh.export(os.path.join(obj_dir, f"final_mesh_{obj}.obj"))
         np.savetxt(os.path.join(obj_dir, f"{obj}_cd.txt"), [chamfer_dis])
 
         results.append(
@@ -978,7 +1227,8 @@ def main():
                 "L_geom": float(chamfer_dis),
                 "S_anchor": float(s_anchor_scores[chosen_label]),
                 "Selection_Score": float(selection_scores.get(chosen_label, float("inf"))),
-                "Forced_By_Chamfer": bool(forced_by_chamfer),
+                "Anchor_Pose_Strategy": best["anchor_pose_strategy"],
+                "Anchor_Pose_Random_Seed": best["anchor_pose_random_seed"],
             }
         )
 
@@ -993,36 +1243,73 @@ def main():
                 "raw_mesh_path": os.path.abspath(path),
                 "pose_path": os.path.abspath(os.path.join(obj_dir, f"{obj}_initial_pose_{label}.txt")),
                 "s_anchor": float(s_anchor_scores[label]),
+                "anchor_score_version": "bounded_observation_calibrated_v1",
+                "s_anchor_raw": float(reliability_by_label[label]["s_anchor_raw"]),
+                "anchor_observation_quality": float(
+                    reliability_by_label[label]["anchor_observation_quality"]
+                ),
+                "anchor_calibration_norm": float(
+                    reliability_by_label[label]["anchor_calibration_norm"]
+                ),
                 "l_depth": float(results_pose[label]["l_depth"]),
                 "l_mask": float(results_pose[label]["l_mask"]),
                 "l_geom": float(results_pose[label]["l_geom"]),
+                "anchor_pose_strategy": results_pose[label]["anchor_pose_strategy"],
+                "anchor_pose_seed_index": results_pose[label]["anchor_pose_seed_index"],
+                "anchor_pose_random_seed": results_pose[label]["anchor_pose_random_seed"],
+                "anchor_pose_trial_count": results_pose[label]["anchor_pose_trial_count"],
+                "anchor_pose_trials_path": os.path.abspath(
+                    os.path.join(obj_dir, f"{obj}_anchor_trials_{label}.json")
+                ),
             }
         candidate_registry[obj] = {
             "chosen": chosen_label,
+            "anchor_score_version": "bounded_observation_calibrated_v1",
+            "mask_source": "dataset_gt" if not args.refine_mask else "sam2_refined",
+            "geometry_units": "meters_after_construction",
+            "scale_metadata": {
+                "depth_unit": recon_meta.get("depth_unit", chosen_depth_unit),
+                "instantmesh_metric_scale": recon_meta.get(
+                    "instantmesh_metric_scale", 1.0
+                ),
+                "construction_transform": recon_meta.get("transform"),
+                "mesh_statistics": recon_meta.get("mesh_statistics", {}),
+            },
+            "fusion_metadata": recon_meta.get("fusion_diagnostics", {}),
+            "bidirectional_metadata": recon_meta.get("bidirectional", {}),
+            "alignment_metadata": {
+                "direction": recon_meta.get("align_direction"),
+                "fitness": recon_meta.get("align_fitness"),
+                "rmse": recon_meta.get("align_rmse"),
+                "decision_score": recon_meta.get("align_decision_score"),
+            },
+            "reconstruction_meta_path": (
+                os.path.abspath(meta_path) if meta_path else None
+            ),
             "candidates": obj_candidates_info,
             "final_mesh_path": os.path.abspath(os.path.join(obj_dir, f"final_mesh_{obj}.obj")),
             "final_pose_path": os.path.abspath(os.path.join(obj_dir, f"{obj}_initial_pose.txt")),
             "K_path": os.path.abspath(os.path.join(obj_dir, "K.txt")),
         }
 
-        del est_final, results_pose
+        del results_pose
         _release_cuda_memory()
 
     # ====================================================================
     # Save candidate registry JSON for query phase
     # ====================================================================
-    registry_path = os.path.join(args.anchor_folder, "candidate_registry.json")
+    registry_path = os.path.join(result_root, "candidate_registry.json")
     with open(registry_path, "w", encoding="utf-8") as f:
         json.dump(candidate_registry, f, indent=2)
     print(f"\nCandidate registry saved to: {registry_path}")
 
     df = pd.DataFrame(results).sort_values("Object")
-    excel_path = os.path.join(args.anchor_folder, "chamfer_distances.xlsx")
+    excel_path = os.path.join(result_root, "chamfer_distances.xlsx")
     df.to_excel(excel_path, index=False)
 
     pose_df = pd.DataFrame(pose_rows).sort_values("Object")
     pose_all_df = pd.DataFrame(pose_rows_all).sort_values(["Object", "Candidate"])
-    pose_excel_path = os.path.join(args.anchor_folder, "pose_metrics.xlsx")
+    pose_excel_path = os.path.join(result_root, "pose_metrics.xlsx")
     with pd.ExcelWriter(pose_excel_path) as writer:
         pose_df.to_excel(writer, index=False, sheet_name="chosen")
         pose_all_df.to_excel(writer, index=False, sheet_name="candidates")

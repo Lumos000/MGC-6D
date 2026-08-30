@@ -4,6 +4,7 @@ setup_project_paths()
 import json
 import os
 import glob
+import hashlib
 from dataclasses import dataclass, asdict, replace
 from typing import Dict, Optional, Tuple, List, Iterable
 
@@ -12,6 +13,7 @@ import numpy as np
 import open3d as o3d
 import torch
 import trimesh
+from scipy.spatial import cKDTree
 
 from sam2_instantmesh import preprocess_image, diffusion_image_generation, instant_mesh_process
 from sam2_rayst3r import (
@@ -27,6 +29,7 @@ from pose_utils import preprocess_depth, guess_translation
 class ReconstructionConfig:
     anchor_root: str
     output_root: Optional[str] = None
+    object_names: Optional[Tuple[str, ...]] = None
     depth_unit: str = "auto"  # auto|mm|rayst3r_uint16|meters
     depth_unit_try_both: bool = False
     depth_preprocess: bool = True
@@ -57,6 +60,8 @@ class ReconstructionConfig:
     instantmesh_remove_bg: bool = True
     align_use_guess_translation: bool = True
     align_bidirectional_icp: bool = True
+    align_strict_both: bool = False
+    align_relaxed_rescue: bool = False
     icp_max_iter: int = 50
     icp_fitness_threshold: float = 0.05
     icp_multi_hypo: int = 1
@@ -64,10 +69,22 @@ class ReconstructionConfig:
     icp_max_corr_ratio: float = 0.05  # fraction of rayst3r bbox diag
     icp_voxel_size: float = 0.005
     sample_points: int = 50000
+    rayst3r_crop_margin_ratio: float = 0.05
+    rayst3r_min_component_area_ratio: float = 0.005
+    rayst3r_target_faces: int = 100000
+    fusion_voxel_size: float = 0.003
+    fusion_sample_points: int = 15000
+    fusion_poisson_depth: int = 6
+    fusion_target_faces: int = 20000
+    fusion_density_quantile: float = 0.02
+    fusion_visible_depth_tolerance: float = 0.015
+    fusion_observed_support_ratio: float = 0.08
+    fusion_agreement_ratio: float = 0.025
     align_score_rmse_weight: float = 40.0
     align_low_fitness_penalty: float = 0.15
     align_high_rmse_penalty: float = 0.15
     align_rmse_penalty_threshold: float = 0.02
+    seed: int = 0
 
 
 SB_SM_OBJECTS = {
@@ -228,6 +245,21 @@ def _mesh_to_o3d(mesh: trimesh.Trimesh) -> o3d.geometry.TriangleMesh:
     return mesh_o3d
 
 
+def _stable_object_seed(global_seed: int, obj_name: str) -> int:
+    """Return an order-independent seed for one reconstruction object."""
+
+    digest = hashlib.sha256(obj_name.encode("utf-8")).digest()
+    object_offset = int.from_bytes(digest[:4], byteorder="little", signed=False)
+    return int((int(global_seed) + object_offset) % (2**31 - 1))
+
+
+def _set_object_seed(seed: int) -> None:
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def _build_icp_inits(
     source_center: np.ndarray,
     target_center: np.ndarray,
@@ -252,6 +284,7 @@ def _icp_align_prior(
     prior_mesh: trimesh.Trimesh,
     target_points: np.ndarray,
     voxel_size: float,
+    max_corr_ratio: float,
     max_iter: int,
     fitness_threshold: float,
     init_transforms: Optional[Iterable[np.ndarray]] = None,
@@ -271,6 +304,16 @@ def _icp_align_prior(
     prior_pcd.estimate_normals()
     target_pcd.estimate_normals()
 
+    target_extent = np.asarray(
+        target_pcd.get_axis_aligned_bounding_box().get_extent(), dtype=np.float64
+    )
+    target_diagonal = max(float(np.linalg.norm(target_extent)), 1e-8)
+    max_correspondence_distance = max(
+        float(voxel_size) * 2.0,
+        float(max_corr_ratio) * target_diagonal,
+        1e-6,
+    )
+
     if init_transforms is None:
         init_transforms = [np.eye(4, dtype=np.float64)]
 
@@ -279,7 +322,7 @@ def _icp_align_prior(
         reg = o3d.pipelines.registration.registration_icp(
             prior_pcd,
             target_pcd,
-            max_correspondence_distance=max(voxel_size * 5.0, 1e-6),
+            max_correspondence_distance=max_correspondence_distance,
             init=init,
             estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
             criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=max_iter),
@@ -330,7 +373,63 @@ def _rayst3r_reconstruct(
         poisson_scale=cfg.rayst3r_poisson_scale,
         density_quantile=cfg.rayst3r_density_quantile,
     )
+    mesh = _clean_rayst3r_mesh(mesh, points, cfg)
     return points, mesh
+
+
+def _clean_rayst3r_mesh(
+    mesh: Optional[trimesh.Trimesh],
+    points: np.ndarray,
+    cfg: ReconstructionConfig,
+) -> Optional[trimesh.Trimesh]:
+    """Crop Poisson spillover, remove tiny islands, and cap mesh complexity."""
+
+    if mesh is None or len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+        return mesh
+    original = mesh.copy()
+    mesh_o3d = _mesh_to_o3d(mesh)
+
+    points_np = np.asarray(points, dtype=np.float64)
+    finite_points = points_np[np.isfinite(points_np).all(axis=1)]
+    if len(finite_points) >= 4:
+        lo = finite_points.min(axis=0)
+        hi = finite_points.max(axis=0)
+        extent = np.maximum(hi - lo, 1e-8)
+        margin = float(cfg.rayst3r_crop_margin_ratio) * extent
+        bbox = o3d.geometry.AxisAlignedBoundingBox(lo - margin, hi + margin)
+        cropped = mesh_o3d.crop(bbox)
+        if len(cropped.vertices) and len(cropped.triangles):
+            mesh_o3d = cropped
+
+    if len(mesh_o3d.triangles):
+        triangle_clusters, _, cluster_areas = mesh_o3d.cluster_connected_triangles()
+        triangle_clusters = np.asarray(triangle_clusters, dtype=np.int64)
+        cluster_areas = np.asarray(cluster_areas, dtype=np.float64)
+        if cluster_areas.size:
+            min_area = float(cluster_areas.max()) * float(
+                cfg.rayst3r_min_component_area_ratio
+            )
+            remove_mask = cluster_areas[triangle_clusters] < min_area
+            if np.any(remove_mask) and not np.all(remove_mask):
+                mesh_o3d.remove_triangles_by_mask(remove_mask)
+                mesh_o3d.remove_unreferenced_vertices()
+
+    mesh_o3d.remove_degenerate_triangles()
+    mesh_o3d.remove_duplicated_triangles()
+    mesh_o3d.remove_duplicated_vertices()
+    mesh_o3d.remove_unreferenced_vertices()
+
+    target_faces = int(cfg.rayst3r_target_faces)
+    if target_faces > 0 and len(mesh_o3d.triangles) > target_faces:
+        simplified = mesh_o3d.simplify_quadric_decimation(target_faces)
+        if len(simplified.vertices) and len(simplified.triangles):
+            mesh_o3d = simplified
+
+    vertices = np.asarray(mesh_o3d.vertices)
+    faces = np.asarray(mesh_o3d.triangles)
+    if len(vertices) == 0 or len(faces) == 0:
+        return original
+    return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
 
 
 def _instantmesh_reconstruct(
@@ -339,6 +438,7 @@ def _instantmesh_reconstruct(
     obj_dir: str,
     obj_name: str,
     cfg: ReconstructionConfig,
+    object_seed: int,
 ) -> trimesh.Trimesh:
     input_image = preprocess_image(
         color,
@@ -354,6 +454,7 @@ def _instantmesh_reconstruct(
         name=obj_name,
         input_image=input_image,
         device=cfg.instantmesh_device,
+        seed=object_seed,
     )
     instant_mesh_process(images, obj_dir, name=obj_name, device=cfg.instantmesh_device)
     mesh_path = os.path.join(obj_dir, f"mesh_{obj_name}.obj")
@@ -369,34 +470,55 @@ def _mesh_to_o3d_pcd(mesh: trimesh.Trimesh, n_points: int) -> o3d.geometry.Point
     return pcd
 
 
-def _align_instantmesh_to_rayst3r(
+def _prepare_instantmesh_metric_frame(
     mesh_instant: trimesh.Trimesh,
     ray_points: np.ndarray,
-    cfg: ReconstructionConfig,
     init_center: Optional[np.ndarray] = None,
-) -> Tuple[Optional[trimesh.Trimesh], Optional[o3d.pipelines.registration.RegistrationResult]]:
+) -> trimesh.Trimesh:
+    """Put the scale-ambiguous InstantMesh output in the RaySt3R metric frame.
+
+    This single preparation is shared by both ICP directions.  Applying scale
+    before translation avoids scaling the initialized camera-frame centroid.
+    """
+
     if ray_points is None or len(ray_points) == 0:
-        return mesh_instant, None
+        return mesh_instant.copy()
 
-    ray_pcd = _points_to_o3d(ray_points)
-    ray_bbox = ray_pcd.get_axis_aligned_bounding_box()
-    ray_extent = np.array(ray_bbox.get_extent(), dtype=np.float64)
-    inst_bbox = mesh_instant.bounding_box.extents
-
-    if init_center is not None and np.any(np.isfinite(init_center)):
-        mesh_instant = mesh_instant.copy()
-        inst_centroid = mesh_instant.vertices.mean(axis=0)
-        mesh_instant.apply_translation(init_center - inst_centroid)
-
-    if np.all(inst_bbox > 0):
-        scale = float(np.mean(ray_extent) / np.mean(inst_bbox))
-        mesh_instant = mesh_instant.copy()
-        mesh_instant.apply_scale(scale)
+    prepared = mesh_instant.copy()
+    ray_np = np.asarray(ray_points, dtype=np.float64)
+    inst_np = np.asarray(prepared.vertices, dtype=np.float64)
+    ray_center = np.median(ray_np, axis=0)
+    inst_center = np.median(inst_np, axis=0)
+    ray_radius = float(np.quantile(np.linalg.norm(ray_np - ray_center, axis=1), 0.90))
+    inst_radius = float(np.quantile(np.linalg.norm(inst_np - inst_center, axis=1), 0.90))
+    if np.isfinite(ray_radius) and np.isfinite(inst_radius) and inst_radius > 1e-8:
+        scale = float(np.clip(ray_radius / inst_radius, 1e-3, 1e3))
+        prepared.apply_scale(scale)
     else:
         scale = 1.0
 
+    target_center = (
+        np.asarray(init_center, dtype=np.float64).reshape(3)
+        if init_center is not None and np.all(np.isfinite(init_center))
+        else np.asarray(ray_points, dtype=np.float64).mean(axis=0)
+    )
+    source_center = np.asarray(prepared.vertices, dtype=np.float64).mean(axis=0)
+    prepared.apply_translation(target_center - source_center)
+    prepared.metadata = dict(getattr(prepared, "metadata", {}) or {})
+    prepared.metadata["instantmesh_metric_scale"] = float(scale)
+    return prepared
+
+
+def _align_instantmesh_to_rayst3r(
+    mesh_instant_metric: trimesh.Trimesh,
+    ray_points: np.ndarray,
+    cfg: ReconstructionConfig,
+) -> Tuple[Optional[trimesh.Trimesh], Optional[o3d.pipelines.registration.RegistrationResult]]:
+    if ray_points is None or len(ray_points) == 0:
+        return mesh_instant_metric, None
+
     target_center = ray_points.mean(axis=0)
-    source_center = mesh_instant.vertices.mean(axis=0)
+    source_center = mesh_instant_metric.vertices.mean(axis=0)
     init_transforms = _build_icp_inits(
         source_center,
         target_center,
@@ -404,9 +526,10 @@ def _align_instantmesh_to_rayst3r(
         cfg.icp_init_sigma,
     )
     aligned, reg = _icp_align_prior(
-        mesh_instant,
+        mesh_instant_metric,
         ray_points,
         voxel_size=cfg.icp_voxel_size,
+        max_corr_ratio=cfg.icp_max_corr_ratio,
         max_iter=cfg.icp_max_iter,
         fitness_threshold=cfg.icp_fitness_threshold,
         init_transforms=init_transforms,
@@ -432,6 +555,7 @@ def _align_rayst3r_to_instantmesh(
         mesh_ray,
         target_points,
         voxel_size=cfg.icp_voxel_size,
+        max_corr_ratio=cfg.icp_max_corr_ratio,
         max_iter=cfg.icp_max_iter,
         fitness_threshold=cfg.icp_fitness_threshold,
         init_transforms=init_transforms,
@@ -439,7 +563,9 @@ def _align_rayst3r_to_instantmesh(
     return aligned, reg
 
 
-def _fuse_meshes(mesh_a: trimesh.Trimesh, mesh_b: trimesh.Trimesh) -> trimesh.Trimesh:
+def _concatenate_meshes(mesh_a: trimesh.Trimesh, mesh_b: trimesh.Trimesh) -> trimesh.Trimesh:
+    """Compatibility fallback used only when surface reconstruction fails."""
+
     fused = trimesh.util.concatenate([mesh_a, mesh_b])
     try:
         fused.remove_degenerate_faces()
@@ -460,13 +586,254 @@ def _fuse_meshes(mesh_a: trimesh.Trimesh, mesh_b: trimesh.Trimesh) -> trimesh.Tr
     return fused
 
 
+def _backproject_anchor_depth(
+    depth: np.ndarray,
+    mask: np.ndarray,
+    intrinsic: np.ndarray,
+    max_points: int = 30000,
+) -> np.ndarray:
+    valid = (
+        np.asarray(mask).astype(bool)
+        & np.isfinite(depth)
+        & (np.asarray(depth, dtype=np.float32) > 1e-5)
+    )
+    ys, xs = np.where(valid)
+    if len(xs) == 0:
+        return np.zeros((0, 3), dtype=np.float64)
+    if len(xs) > max_points:
+        # Deterministic uniform subsampling avoids object-order dependence.
+        ids = np.linspace(0, len(xs) - 1, max_points, dtype=np.int64)
+        ys, xs = ys[ids], xs[ids]
+    z = np.asarray(depth, dtype=np.float64)[ys, xs]
+    k = np.asarray(intrinsic, dtype=np.float64).reshape(3, 3)
+    x = (xs.astype(np.float64) - k[0, 2]) * z / max(float(k[0, 0]), 1e-8)
+    y = (ys.astype(np.float64) - k[1, 2]) * z / max(float(k[1, 1]), 1e-8)
+    return np.stack([x, y, z], axis=1)
+
+
+def _sample_mesh_with_normals(
+    mesh: trimesh.Trimesh, n_points: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    count = min(max(int(n_points), 1000), max(len(mesh.faces), 1000))
+    points, face_ids = trimesh.sample.sample_surface(mesh, count)
+    normals = np.asarray(mesh.face_normals, dtype=np.float64)[face_ids]
+    return np.asarray(points, dtype=np.float64), normals
+
+
+def _visible_depth_conflict_mask(
+    points: np.ndarray,
+    depth: np.ndarray,
+    mask: np.ndarray,
+    intrinsic: np.ndarray,
+    tolerance: float,
+) -> np.ndarray:
+    """Mark model samples that contradict the measured anchor-visible surface."""
+
+    points = np.asarray(points, dtype=np.float64)
+    z = points[:, 2]
+    k = np.asarray(intrinsic, dtype=np.float64).reshape(3, 3)
+    proj = (k @ points.T).T
+    safe_z = np.where(z > 1e-8, z, 1.0)
+    u = np.rint(proj[:, 0] / safe_z).astype(np.int64)
+    v = np.rint(proj[:, 1] / safe_z).astype(np.int64)
+    h, w = np.asarray(mask).shape[:2]
+    inside = (z > 1e-8) & (u >= 0) & (u < w) & (v >= 0) & (v < h)
+    ids = np.flatnonzero(inside)
+    conflict = np.zeros(len(points), dtype=bool)
+    if ids.size == 0:
+        return conflict
+    visible = np.asarray(mask).astype(bool)[v[ids], u[ids]]
+    observed = np.asarray(depth, dtype=np.float64)[v[ids], u[ids]]
+    valid_depth = np.isfinite(observed) & (observed > 1e-5)
+    bad = visible & valid_depth & (np.abs(z[ids] - observed) > float(tolerance))
+    conflict[ids[bad]] = True
+    return conflict
+
+
+def _fuse_meshes(
+    mesh_ray: trimesh.Trimesh,
+    mesh_instant: trimesh.Trimesh,
+    depth: np.ndarray,
+    mask: np.ndarray,
+    intrinsic: np.ndarray,
+    cfg: ReconstructionConfig,
+) -> trimesh.Trimesh:
+    """Confidence-aware implementation of the paper's fusion operator Phi.
+
+    RaySt3R supplies the anchor-visible RGB-D-conditioned surface. InstantMesh
+    supplies completion away from measured depth. Samples that contradict the
+    anchor depth are removed, overlapping surfaces are de-duplicated, and a
+    single Poisson surface is reconstructed on CPU. Point and face caps keep
+    the operation practical on a 24-GB RTX 3090 host.
+    """
+
+    fallback = _concatenate_meshes(mesh_ray, mesh_instant)
+    diagnostics: Dict[str, float | int | str | bool] = {
+        "method": "visible_prior_poisson_v1",
+        "fallback_used": False,
+    }
+    try:
+        n_samples = max(int(cfg.fusion_sample_points), 1000)
+        ray_pts, ray_normals = _sample_mesh_with_normals(mesh_ray, n_samples)
+        inst_pts, inst_normals = _sample_mesh_with_normals(mesh_instant, n_samples)
+        obs_pts = _backproject_anchor_depth(
+            depth, mask, intrinsic, max_points=min(n_samples, 30000)
+        )
+        if len(obs_pts) < 50:
+            raise RuntimeError("too few valid anchor depth points for Phi")
+
+        combined_extent = np.ptp(np.vstack([ray_pts, inst_pts]), axis=0)
+        diameter = max(float(np.linalg.norm(combined_extent)), 1e-6)
+        voxel = max(float(cfg.fusion_voxel_size), 1e-4)
+        support_distance = max(
+            float(cfg.fusion_observed_support_ratio) * diameter, 2.0 * voxel
+        )
+        agreement_distance = max(
+            float(cfg.fusion_agreement_ratio) * diameter, 2.0 * voxel
+        )
+
+        ray_obs_distance = cKDTree(obs_pts).query(ray_pts, k=1, workers=-1)[0]
+        ray_inst_distance = cKDTree(inst_pts).query(ray_pts, k=1, workers=-1)[0]
+        ray_conflict = _visible_depth_conflict_mask(
+            ray_pts,
+            depth,
+            mask,
+            intrinsic,
+            cfg.fusion_visible_depth_tolerance,
+        )
+        # Retain RGB-D-supported RaySt3R surfaces and mutually supported
+        # completion, while rejecting visible-depth contradictions.
+        ray_keep = (
+            (ray_obs_distance <= support_distance)
+            | (ray_inst_distance <= agreement_distance)
+        ) & ~ray_conflict
+        if ray_keep.sum() < 100:
+            ray_keep = ~ray_conflict
+
+        inst_conflict = _visible_depth_conflict_mask(
+            inst_pts,
+            depth,
+            mask,
+            intrinsic,
+            cfg.fusion_visible_depth_tolerance,
+        )
+        inst_keep = ~inst_conflict
+        retained_ray = ray_pts[ray_keep]
+        if len(retained_ray):
+            inst_to_ray = cKDTree(retained_ray).query(inst_pts, k=1, workers=-1)[0]
+            # RaySt3R wins in overlap; InstantMesh remains as completion.
+            inst_keep &= inst_to_ray > max(1.5 * voxel, 0.5 * agreement_distance)
+
+        points = np.vstack([retained_ray, inst_pts[inst_keep], obs_pts])
+        normals = np.vstack(
+            [
+                ray_normals[ray_keep],
+                inst_normals[inst_keep],
+                np.zeros_like(obs_pts),
+            ]
+        )
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        pcd.normals = o3d.utility.Vector3dVector(normals)
+        pcd = pcd.voxel_down_sample(voxel)
+        if len(pcd.points) < 200:
+            raise RuntimeError("too few retained points after Phi filtering")
+
+        pcd.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(
+                radius=max(3.0 * voxel, 0.01), max_nn=40
+            )
+        )
+        try:
+            pcd.orient_normals_consistent_tangent_plane(30)
+        except Exception:
+            pcd.orient_normals_towards_camera_location(np.zeros(3))
+
+        mesh_o3d, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            pcd,
+            depth=max(6, int(cfg.fusion_poisson_depth)),
+            scale=1.05,
+            linear_fit=True,
+        )
+        densities = np.asarray(densities, dtype=np.float64)
+        if densities.size and 0.0 < cfg.fusion_density_quantile < 1.0:
+            cutoff = float(np.quantile(densities, cfg.fusion_density_quantile))
+            mesh_o3d.remove_vertices_by_mask(densities < cutoff)
+
+        bbox = pcd.get_axis_aligned_bounding_box()
+        bbox = bbox.scale(1.04, bbox.get_center())
+        mesh_o3d = mesh_o3d.crop(bbox)
+        mesh_o3d.remove_degenerate_triangles()
+        mesh_o3d.remove_duplicated_triangles()
+        mesh_o3d.remove_duplicated_vertices()
+        mesh_o3d.remove_unreferenced_vertices()
+        target_faces = int(cfg.fusion_target_faces)
+        if target_faces > 0 and len(mesh_o3d.triangles) > target_faces:
+            mesh_o3d = mesh_o3d.simplify_quadric_decimation(target_faces)
+
+        vertices = np.asarray(mesh_o3d.vertices)
+        faces = np.asarray(mesh_o3d.triangles)
+        if len(vertices) == 0 or len(faces) == 0:
+            raise RuntimeError("Poisson Phi produced an empty mesh")
+        fused = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+        # Symmetric post-alignment compatibility is diagnostic and contributes
+        # continuously to anchor reliability; it is not a hidden hard gate.
+        ray_to_inst = cKDTree(inst_pts).query(ray_pts, k=1, workers=-1)[0]
+        inst_to_ray = cKDTree(ray_pts).query(inst_pts, k=1, workers=-1)[0]
+        symmetric_distance = float(0.5 * (ray_to_inst.mean() + inst_to_ray.mean()))
+        overlap = float(
+            0.5
+            * (
+                np.mean(ray_to_inst <= agreement_distance)
+                + np.mean(inst_to_ray <= agreement_distance)
+            )
+        )
+        distance_quality = float(np.exp(-symmetric_distance / agreement_distance))
+        conflict_ratio = float(
+            0.5 * (np.mean(ray_conflict) + np.mean(inst_conflict))
+        )
+        reliability = float(
+            np.clip(
+                (0.5 * overlap + 0.5 * distance_quality) * (1.0 - conflict_ratio),
+                0.0,
+                1.0,
+            )
+        )
+        diagnostics.update(
+            {
+                "ray_samples": int(len(ray_pts)),
+                "instantmesh_samples": int(len(inst_pts)),
+                "observed_samples": int(len(obs_pts)),
+                "ray_retained": int(ray_keep.sum()),
+                "instantmesh_retained": int(inst_keep.sum()),
+                "poisson_points": int(len(pcd.points)),
+                "symmetric_surface_distance": symmetric_distance,
+                "surface_overlap": overlap,
+                "visible_conflict_ratio": conflict_ratio,
+                "reliability": reliability,
+            }
+        )
+    except Exception as exc:
+        fused = fallback
+        diagnostics.update(
+            {
+                "method": "concat_fallback",
+                "fallback_used": True,
+                "error": f"{type(exc).__name__}: {exc}",
+                "reliability": 0.0,
+            }
+        )
+    fused.metadata = dict(getattr(fused, "metadata", {}) or {})
+    fused.metadata["fusion_diagnostics"] = diagnostics
+    return fused
+
+
 def _object_specific_cfg(cfg: ReconstructionConfig, obj_name: str) -> Tuple[ReconstructionConfig, Dict[str, float | bool]]:
     if obj_name not in SB_SM_OBJECTS:
         return cfg, {}
 
     overrides: Dict[str, float | bool] = {
-        "refine_mask": True,
-        "mask_stability_enabled": True,
         # Keep more thin structure for bottle-like objects.
         "rayst3r_density_quantile": min(cfg.rayst3r_density_quantile, 0.01),
         "rayst3r_poisson_depth": max(cfg.rayst3r_poisson_depth, 10),
@@ -506,6 +873,67 @@ def _is_valid_reg(reg: Optional[o3d.pipelines.registration.RegistrationResult]) 
     return True
 
 
+def _bidirectional_diagnostics(
+    reg_inst_to_ray: Optional[o3d.pipelines.registration.RegistrationResult],
+    reg_ray_to_inst: Optional[o3d.pipelines.registration.RegistrationResult],
+    mesh_ray: trimesh.Trimesh,
+    mesh_inst: trimesh.Trimesh,
+    cfg: ReconstructionConfig,
+) -> Dict[str, float | bool]:
+    """Report strict-both validity and transform cycle consistency.
+
+    The translation cycle error is normalized by the larger candidate bbox
+    diagonal. These diagnostics never affect best-of-two selection unless the
+    explicit ``align_strict_both`` ablation is enabled.
+    """
+
+    def _values(reg):
+        if reg is None:
+            return -1.0, float("inf")
+        return float(reg.fitness), float(reg.inlier_rmse)
+
+    inst_fitness, inst_rmse = _values(reg_inst_to_ray)
+    ray_fitness, ray_rmse = _values(reg_ray_to_inst)
+    inst_pass = (
+        np.isfinite(inst_fitness)
+        and np.isfinite(inst_rmse)
+        and inst_fitness >= cfg.icp_fitness_threshold
+        and inst_rmse <= cfg.align_rmse_penalty_threshold
+    )
+    ray_pass = (
+        np.isfinite(ray_fitness)
+        and np.isfinite(ray_rmse)
+        and ray_fitness >= cfg.icp_fitness_threshold
+        and ray_rmse <= cfg.align_rmse_penalty_threshold
+    )
+    rotation_deg = float("nan")
+    translation_norm = float("nan")
+    if reg_inst_to_ray is not None and reg_ray_to_inst is not None:
+        cycle = (
+            np.asarray(reg_inst_to_ray.transformation, dtype=np.float64)
+            @ np.asarray(reg_ray_to_inst.transformation, dtype=np.float64)
+        )
+        cos_angle = np.clip((np.trace(cycle[:3, :3]) - 1.0) * 0.5, -1.0, 1.0)
+        rotation_deg = float(np.degrees(np.arccos(cos_angle)))
+        diameter = max(
+            float(np.linalg.norm(np.asarray(mesh_ray.extents, dtype=np.float64))),
+            float(np.linalg.norm(np.asarray(mesh_inst.extents, dtype=np.float64))),
+            1e-8,
+        )
+        translation_norm = float(np.linalg.norm(cycle[:3, 3]) / diameter)
+    return {
+        "inst_to_ray_fitness": inst_fitness,
+        "inst_to_ray_rmse": inst_rmse,
+        "inst_to_ray_pass": bool(inst_pass),
+        "ray_to_inst_fitness": ray_fitness,
+        "ray_to_inst_rmse": ray_rmse,
+        "ray_to_inst_pass": bool(ray_pass),
+        "strict_both_pass": bool(inst_pass and ray_pass),
+        "cycle_rotation_deg": rotation_deg,
+        "cycle_translation_normalized": translation_norm,
+    }
+
+
 def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
     anchor_root = os.path.realpath(cfg.anchor_root)
     output_root = os.path.realpath(cfg.output_root or cfg.anchor_root)
@@ -516,9 +944,16 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
     runner = Rayst3RRunner(checkpoint_path=checkpoint_path, device=cfg.rayst3r_device)
 
     results: Dict[str, Dict[str, str]] = {}
-    obj_list = [d for d in os.listdir(anchor_root) if os.path.isdir(os.path.join(anchor_root, d))]
+    obj_list = sorted(
+        d for d in os.listdir(anchor_root) if os.path.isdir(os.path.join(anchor_root, d))
+    )
+    if cfg.object_names:
+        requested = set(cfg.object_names)
+        obj_list = [obj_name for obj_name in obj_list if obj_name in requested]
 
     for obj_name in obj_list:
+        object_seed = _stable_object_seed(cfg.seed, obj_name)
+        _set_object_seed(object_seed)
         obj_dir = os.path.join(anchor_root, obj_name)
         out_dir = os.path.join(output_root, obj_name)
         os.makedirs(out_dir, exist_ok=True)
@@ -527,7 +962,9 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
 
         color, depth_raw, mask, intrinsic = _load_object_inputs_raw(obj_dir)
         mask = _refine_mask_if_needed(color, mask, obj_cfg)
-        mesh_inst = _instantmesh_reconstruct(color, mask, out_dir, obj_name, obj_cfg)
+        mesh_inst_raw = _instantmesh_reconstruct(
+            color, mask, out_dir, obj_name, obj_cfg, object_seed
+        )
 
         depth_candidates = [obj_cfg.depth_unit]
         if obj_cfg.depth_unit_try_both or obj_cfg.depth_unit == "auto":
@@ -537,6 +974,8 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
         best_any = None
         candidate_scores: Dict[str, Dict[str, float | str]] = {}
         valid_ratio_score = None
+        mesh_inst_metric_fallback = None
+        metric_fallback_points = None
         for depth_unit in depth_candidates:
             depth_m = _convert_depth(depth_raw, depth_unit)
             if obj_cfg.depth_preprocess:
@@ -557,6 +996,17 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
             init_center = None
             if obj_cfg.align_use_guess_translation:
                 init_center = guess_translation(depth_m, mask, intrinsic)
+
+            observed_points = _backproject_anchor_depth(
+                depth_m, mask, intrinsic, max_points=min(obj_cfg.sample_points, 30000)
+            )
+            if len(observed_points) >= 50 and (
+                mesh_inst_metric_fallback is None or range_ok
+            ):
+                mesh_inst_metric_fallback = _prepare_instantmesh_metric_frame(
+                    mesh_inst_raw, observed_points, init_center=init_center
+                )
+                metric_fallback_points = observed_points
 
             work_dir = os.path.join(out_dir, "rayst3r_input")
             try:
@@ -600,6 +1050,15 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
                 }
                 continue
 
+            mesh_inst = _prepare_instantmesh_metric_frame(
+                mesh_inst_raw, points, init_center=init_center
+            )
+
+            reg_inst_initial = None
+            reg_ray_initial = None
+            bidirectional_diag = _bidirectional_diagnostics(
+                None, None, mesh_ray, mesh_inst, obj_cfg
+            )
             if (valid_ratio_score is not None) and (valid_ratio_score < obj_cfg.valid_ratio_threshold):
                 chosen = "none"
                 chosen_reg = None
@@ -608,26 +1067,35 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
                 mesh_fused = mesh_ray
             elif obj_cfg.align_bidirectional_icp:
                 mesh_inst_aligned, reg_inst = _align_instantmesh_to_rayst3r(
-                    mesh_inst, points, obj_cfg, init_center=init_center
+                    mesh_inst, points, obj_cfg
                 )
                 mesh_ray_aligned, reg_ray = _align_rayst3r_to_instantmesh(mesh_ray, mesh_inst, obj_cfg)
+                reg_inst_initial = reg_inst
+                reg_ray_initial = reg_ray
+                bidirectional_diag = _bidirectional_diagnostics(
+                    reg_inst_initial, reg_ray_initial, mesh_ray, mesh_inst, obj_cfg
+                )
 
                 score_inst = _align_decision_score(reg_inst, obj_cfg)
                 score_ray = _align_decision_score(reg_ray, obj_cfg)
 
                 if score_inst >= score_ray and reg_inst is not None:
-                    mesh_fused = _fuse_meshes(mesh_ray, mesh_inst_aligned)
+                    mesh_fused = _fuse_meshes(
+                        mesh_ray, mesh_inst_aligned, depth_m, mask, intrinsic, obj_cfg
+                    )
                     chosen = "inst_to_ray"
                     chosen_reg = reg_inst
                     chosen_mesh_ray = mesh_ray
                     chosen_mesh_inst = mesh_inst_aligned
                 elif reg_ray is not None:
-                    mesh_fused = _fuse_meshes(mesh_ray_aligned, mesh_inst)
+                    mesh_fused = _fuse_meshes(
+                        mesh_ray_aligned, mesh_inst, depth_m, mask, intrinsic, obj_cfg
+                    )
                     chosen = "ray_to_inst"
                     chosen_reg = reg_ray
                     chosen_mesh_ray = mesh_ray_aligned
                     chosen_mesh_inst = mesh_inst
-                else:
+                elif obj_cfg.align_relaxed_rescue:
                     # Retry once with relaxed ICP settings for hard failure cases.
                     relaxed_cfg = replace(
                         obj_cfg,
@@ -639,7 +1107,7 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
                         icp_voxel_size=max(float(obj_cfg.icp_voxel_size), 0.0075),
                     )
                     mesh_inst_relaxed, reg_inst_relaxed = _align_instantmesh_to_rayst3r(
-                        mesh_inst, points, relaxed_cfg, init_center=init_center
+                        mesh_inst, points, relaxed_cfg
                     )
                     mesh_ray_relaxed, reg_ray_relaxed = _align_rayst3r_to_instantmesh(
                         mesh_ray, mesh_inst, relaxed_cfg
@@ -647,13 +1115,17 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
                     score_inst_relaxed = _align_decision_score(reg_inst_relaxed, relaxed_cfg)
                     score_ray_relaxed = _align_decision_score(reg_ray_relaxed, relaxed_cfg)
                     if score_inst_relaxed >= score_ray_relaxed and reg_inst_relaxed is not None:
-                        mesh_fused = _fuse_meshes(mesh_ray, mesh_inst_relaxed)
+                        mesh_fused = _fuse_meshes(
+                            mesh_ray, mesh_inst_relaxed, depth_m, mask, intrinsic, relaxed_cfg
+                        )
                         chosen = "inst_to_ray_relaxed"
                         chosen_reg = reg_inst_relaxed
                         chosen_mesh_ray = mesh_ray
                         chosen_mesh_inst = mesh_inst_relaxed
                     elif reg_ray_relaxed is not None:
-                        mesh_fused = _fuse_meshes(mesh_ray_relaxed, mesh_inst)
+                        mesh_fused = _fuse_meshes(
+                            mesh_ray_relaxed, mesh_inst, depth_m, mask, intrinsic, relaxed_cfg
+                        )
                         chosen = "ray_to_inst_relaxed"
                         chosen_reg = reg_ray_relaxed
                         chosen_mesh_ray = mesh_ray_relaxed
@@ -671,7 +1143,7 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
                             icp_voxel_size=max(float(obj_cfg.icp_voxel_size), 0.012),
                         )
                         mesh_inst_super, reg_inst_super = _align_instantmesh_to_rayst3r(
-                            mesh_inst, points, super_relaxed_cfg, init_center=init_center
+                            mesh_inst, points, super_relaxed_cfg
                         )
                         mesh_ray_super, reg_ray_super = _align_rayst3r_to_instantmesh(
                             mesh_ray, mesh_inst, super_relaxed_cfg
@@ -679,13 +1151,17 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
                         score_inst_super = _align_decision_score(reg_inst_super, super_relaxed_cfg)
                         score_ray_super = _align_decision_score(reg_ray_super, super_relaxed_cfg)
                         if score_inst_super >= score_ray_super and reg_inst_super is not None:
-                            mesh_fused = _fuse_meshes(mesh_ray, mesh_inst_super)
+                            mesh_fused = _fuse_meshes(
+                                mesh_ray, mesh_inst_super, depth_m, mask, intrinsic, super_relaxed_cfg
+                            )
                             chosen = "inst_to_ray_super_relaxed"
                             chosen_reg = reg_inst_super
                             chosen_mesh_ray = mesh_ray
                             chosen_mesh_inst = mesh_inst_super
                         elif reg_ray_super is not None:
-                            mesh_fused = _fuse_meshes(mesh_ray_super, mesh_inst)
+                            mesh_fused = _fuse_meshes(
+                                mesh_ray_super, mesh_inst, depth_m, mask, intrinsic, super_relaxed_cfg
+                            )
                             chosen = "ray_to_inst_super_relaxed"
                             chosen_reg = reg_ray_super
                             chosen_mesh_ray = mesh_ray_super
@@ -696,9 +1172,15 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
                             chosen_mesh_ray = mesh_ray
                             chosen_mesh_inst = mesh_inst
                             mesh_fused = mesh_ray
+                else:
+                    chosen = "none"
+                    chosen_reg = None
+                    chosen_mesh_ray = mesh_ray
+                    chosen_mesh_inst = mesh_inst
+                    mesh_fused = mesh_ray
             else:
                 mesh_inst_aligned, chosen_reg = _align_instantmesh_to_rayst3r(
-                    mesh_inst, points, obj_cfg, init_center=init_center
+                    mesh_inst, points, obj_cfg
                 )
                 if chosen_reg is None:
                     chosen = "none"
@@ -706,10 +1188,41 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
                     chosen_mesh_inst = mesh_inst
                     mesh_fused = mesh_ray
                 else:
-                    mesh_fused = _fuse_meshes(mesh_ray, mesh_inst_aligned)
+                    mesh_fused = _fuse_meshes(
+                        mesh_ray, mesh_inst_aligned, depth_m, mask, intrinsic, obj_cfg
+                    )
                     chosen = "inst_to_ray"
                     chosen_mesh_ray = mesh_ray
                     chosen_mesh_inst = mesh_inst_aligned
+
+            if obj_cfg.align_strict_both and not bidirectional_diag["strict_both_pass"]:
+                chosen = "none_strict_both"
+                chosen_reg = None
+                chosen_mesh_ray = mesh_ray
+                chosen_mesh_inst = mesh_inst
+                mesh_fused = mesh_ray
+
+            fusion_diagnostics = dict(
+                (getattr(mesh_fused, "metadata", {}) or {}).get(
+                    "fusion_diagnostics", {}
+                )
+            )
+            fusion_reliability = float(fusion_diagnostics.get("reliability", 0.0))
+            cycle_rotation = bidirectional_diag.get("cycle_rotation_deg")
+            cycle_translation = bidirectional_diag.get("cycle_translation_normalized")
+            if np.isfinite(cycle_rotation) and np.isfinite(cycle_translation):
+                cycle_confidence = float(
+                    np.exp(-float(cycle_rotation) / 90.0 - float(cycle_translation))
+                )
+                # Cycle agreement is a continuous confidence term, not the
+                # strict-both gate requested only for reviewer ablation.
+                fusion_reliability *= 0.5 + 0.5 * cycle_confidence
+            else:
+                cycle_confidence = float("nan")
+            fusion_diagnostics["cycle_confidence"] = cycle_confidence
+            fusion_diagnostics["reliability"] = float(
+                np.clip(fusion_reliability, 0.0, 1.0)
+            )
 
             candidate = {
                 "depth_unit": depth_unit,
@@ -725,6 +1238,13 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
                 "range_ok": bool(range_ok),
                 "decision_score": (
                     _align_decision_score(chosen_reg, obj_cfg) if chosen_reg is not None else -1e9
+                ),
+                "bidirectional": bidirectional_diag,
+                "fusion_diagnostics": fusion_diagnostics,
+                "instantmesh_metric_scale": float(
+                    (getattr(mesh_inst, "metadata", {}) or {}).get(
+                        "instantmesh_metric_scale", 1.0
+                    )
                 ),
             }
             fitness_raw = candidate["fitness"]
@@ -747,13 +1267,16 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
                 "align": chosen,
                 "range_ratio": float(range_ratio),
                 "range_ok": bool(range_ok),
+                "fusion_method": fusion_diagnostics.get("method", "none"),
+                "fusion_reliability": fusion_diagnostics.get("reliability", 0.0),
+                **bidirectional_diag,
             }
             if best_any is None or (decision_score_raw > best_any["decision_score"]) or (
                 decision_score_raw == best_any["decision_score"] and rmse_raw < best_any["rmse"]
             ):
                 best_any = candidate
             candidate_is_valid = (
-                candidate["align_direction"] != "none"
+                not str(candidate["align_direction"]).startswith("none")
                 and _is_valid_reg(chosen_reg)
                 and np.isfinite(candidate["rmse"])
                 and np.isfinite(candidate["fitness"])
@@ -775,18 +1298,28 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
                 f"[WARN] {obj_name}: all RaySt3R candidates failed; "
                 "using instantmesh_only_fallback."
             )
+            mesh_inst_fallback = (
+                mesh_inst_metric_fallback.copy()
+                if mesh_inst_metric_fallback is not None
+                else mesh_inst_raw.copy()
+            )
             try:
-                fallback_points, _ = trimesh.sample.sample_surface(
-                    mesh_inst, min(max(int(cfg.sample_points), 10000), 50000)
+                fallback_points = (
+                    np.asarray(metric_fallback_points, dtype=np.float64)
+                    if metric_fallback_points is not None
+                    else trimesh.sample.sample_surface(
+                        mesh_inst_fallback,
+                        min(max(int(cfg.sample_points), 10000), 50000),
+                    )[0]
                 )
             except Exception:
-                fallback_points = np.asarray(mesh_inst.vertices, dtype=np.float64)
+                fallback_points = np.asarray(mesh_inst_fallback.vertices, dtype=np.float64)
             best = {
                 "depth_unit": str(depth_candidates[0]) if depth_candidates else str(obj_cfg.depth_unit),
                 "points": np.asarray(fallback_points, dtype=np.float64),
-                "mesh_ray": mesh_inst.copy(),
-                "mesh_inst": mesh_inst.copy(),
-                "mesh_fused": mesh_inst.copy(),
+                "mesh_ray": mesh_inst_fallback.copy(),
+                "mesh_inst": mesh_inst_fallback.copy(),
+                "mesh_fused": mesh_inst_fallback.copy(),
                 "align_direction": "instantmesh_only_fallback",
                 "fitness": -1.0,
                 "rmse": float("inf"),
@@ -794,6 +1327,16 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
                 "range_ratio": 0.0,
                 "range_ok": False,
                 "decision_score": -1e9,
+                "fusion_diagnostics": {
+                    "method": "instantmesh_metric_fallback",
+                    "fallback_used": True,
+                    "reliability": 0.0,
+                },
+                "instantmesh_metric_scale": float(
+                    (getattr(mesh_inst_fallback, "metadata", {}) or {}).get(
+                        "instantmesh_metric_scale", 1.0
+                    )
+                ),
             }
 
         points = best["points"]
@@ -815,6 +1358,9 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
 
         meta = {
             "object": obj_name,
+            "object_seed": object_seed,
+            "mask_source": "dataset_gt" if not obj_cfg.refine_mask else "sam2_refined",
+            "icp_correspondence_rule": "max(2*voxel_size, max_corr_ratio*target_bbox_diagonal)",
             "depth_unit": depth_unit,
             "depth_unit_candidates": candidate_scores,
             "valid_ratio": valid_ratio_score,
@@ -829,12 +1375,32 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
             "align_fitness": best["fitness"],
             "align_rmse": best["rmse"],
             "align_decision_score": best["decision_score"],
+            "instantmesh_metric_scale": best.get("instantmesh_metric_scale", 1.0),
+            "fusion_diagnostics": best.get("fusion_diagnostics", {}),
+            "bidirectional": best.get(
+                "bidirectional",
+                _bidirectional_diagnostics(None, None, mesh_ray, mesh_inst_aligned, obj_cfg),
+            ),
             "object_overrides": obj_overrides,
             "outputs": {
                 "pointcloud": pointcloud_path,
                 "mesh_rayst3r": mesh_ray_path,
                 "mesh_instant": mesh_inst_path,
                 "mesh_fused": mesh_fused_path,
+            },
+            "mesh_statistics": {
+                "rayst3r": {
+                    "vertices": int(len(mesh_ray.vertices)),
+                    "faces": int(len(mesh_ray.faces)),
+                },
+                "instantmesh": {
+                    "vertices": int(len(mesh_inst_aligned.vertices)),
+                    "faces": int(len(mesh_inst_aligned.faces)),
+                },
+                "fused": {
+                    "vertices": int(len(mesh_fused.vertices)),
+                    "faces": int(len(mesh_fused.faces)),
+                },
             },
             "transform": transform.tolist() if transform is not None else None,
             "config": asdict(obj_cfg),

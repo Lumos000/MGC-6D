@@ -411,11 +411,13 @@ class Any6D:
         return pcd_clean
 
     def register_any6d(self, K, rgb, depth, ob_mask, ob_id=None, glctx=None, iteration=5, name=None, refinement=True, axis_align=True, coarse_est=True, init_pose=None,
-                       scale_range=(0.85, 1.15), scale_volume_tol=0.3):
+                       scale_range=(0.85, 1.15), scale_volume_tol=0.3, random_seed=0):
         '''Copmute pose from given pts to self.pcd
         @pts: (N,3) np array, downsampled scene points
         '''
-        set_seed(0)
+        # Preserve the historical behavior by default, while allowing the
+        # anchor stage to test a small reproducible set of pose hypotheses.
+        set_seed(int(random_seed))
 
         if self.glctx is None:
             if glctx is None:

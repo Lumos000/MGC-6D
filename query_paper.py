@@ -1,16 +1,15 @@
-"""Query-phase evaluation: multi-candidate pose registration and
-observation-consistent candidate selection.
+"""HO3D query evaluation with paper-aligned weighted candidate selection.
 
-Implements Sections 3.3.2 and 3.4 of the paper:
-- For each query frame, register every valid candidate Gi in Gv (Eq.15-17).
-- Score each candidate by query-side observation consistency Sq (Eq.18-21)
-  combined with anchor-side calibration score Sa (Eq.9/Eq.13/Eq.14) into the
-  joint score S(Gi) = alpha*Sa + beta*Sq (Eq.2).
-- Select G* = arg max_{Gi in Gv} S(Gi) (Eq.22). To stabilize the joint score
-  under single-view uncertainty, the observation-derived candidate Gobs serves
-  as the default winner; replacement is permitted only when a competing
-  candidate satisfies the anchor-calibration floor (Sa >= tau_a) and clearly
-  improves the query-side terms (Sq gains >= gamma_*, total margin >= Delta).
+For every query frame, each valid geometry candidate is independently
+registered and scored by
+
+    S(G_i) = alpha * S_a_norm(G_i) + beta * S_q(G_i),
+    S_q(G_i) = -(w_d*L_depth_norm + w_m*L_mask_norm + w_c*L_geom_norm).
+
+The final candidate is the direct argmax of this scalar score.  No candidate
+is privileged as a default and no undisclosed hard replacement gate is used.
+The disclosed fixed-scale normalization is recorded in the run manifest and
+in the per-candidate score table so the implementation is reproducible.
 - Efficient implementation (Sec.3.4): geometry state reuse, bbox-diagonal
   diameter approximation (Eq.26-27), and lazy tensorization (Eq.28).
 """
@@ -38,11 +37,19 @@ from bop_toolkit_lib.renderer_vispy import RendererVispy
 from estimater import Any6D, ScorePredictor, PoseRefinePredictor
 from foundationpose.datareader import Ho3dReader
 from foundationpose.Utils import (
+    compute_mesh_diameter,
     make_mesh_tensors,
     nvdiffrast_render,
     visualize_frame_results_gt,
 )
 from metrics import compute_add, compute_adds, compute_RT_distances
+from candidate_selection import (
+    PAPER_CANDIDATE_LABELS,
+    apply_candidate_appearance,
+    derive_anchor_reliability_scores,
+    parse_candidate_labels,
+    score_candidates,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -316,133 +323,31 @@ def _resolve_pose_with_symmetry(
     return best_pose
 
 
-def _relative_gain_is_better(candidate_value: float, reference_value: float, gain: float) -> bool:
-    """Return whether a lower-is-better score improves by at least a relative gain."""
-    reference_value = float(reference_value)
-    candidate_value = float(candidate_value)
-    if not np.isfinite(candidate_value) or not np.isfinite(reference_value):
-        return False
-    if reference_value <= 1e-8:
-        return candidate_value < reference_value
-    return candidate_value <= reference_value * (1.0 - gain)
-
-
-def _select_observation_consistent_paper(
+def _select_weighted_candidate(
     candidate_results: list,
-    obs_label: str,
-    args,
 ) -> tuple:
-    """Select the winner G* under joint score S(G)=alpha*Sa+beta*Sq (Eq.2/Eq.22).
+    """Return the direct argmax of the paper's weighted score (Eq. 22)."""
+    if not candidate_results:
+        raise ValueError("candidate_results must not be empty")
 
-    The observation-derived candidate Gobs is the calibration-stable default
-    winner; a competing candidate replaces it only when its anchor calibration
-    score Sa exceeds tau_a (Eq.13-14) and its query-side consistency Sq
-    improves over Gobs by at least gamma_query/depth/mask/geom on each term
-    and Delta on the joint total (Eq.18-22).
-    """
-    obs_cand = next(
-        (r for r in candidate_results if r["label"] == obs_label),
-        None,
+    ranked = sorted(
+        candidate_results,
+        key=lambda item: float(item["selection_score"]),
+        reverse=True,
     )
-    if obs_cand is None:
-        fallback = min(candidate_results, key=lambda x: x["total_score"])
-        return fallback, {
-            "default_candidate": "",
-            "obs_override": False,
-            "selection_reason": "obs_missing",
-            "obs_total_score": np.nan,
-            "best_non_obs_total_score": float(fallback["total_score"]),
-            "obs_l_depth": np.nan,
-            "obs_l_mask": np.nan,
-            "obs_l_geom": np.nan,
-            "best_non_obs_l_depth": float(fallback["l_depth"]),
-            "best_non_obs_l_mask": float(fallback["l_mask"]),
-            "best_non_obs_l_geom": float(fallback["l_geom"]),
-            "best_non_obs_anchor_score": float(fallback["s_anchor"]),
-        }
-
-    non_obs = [r for r in candidate_results if r["label"] != obs_label]
-    best_non_obs = min(non_obs, key=lambda x: x["total_score"]) if non_obs else None
-
+    winner = ranked[0]
+    runner_up = ranked[1] if len(ranked) > 1 else None
     diagnostics = {
-        "default_candidate": obs_label,
-        "obs_override": False,
-        "selection_reason": "no_non_obs_candidate",
-        "obs_total_score": float(obs_cand["total_score"]),
-        "best_non_obs_total_score": np.nan,
-        "obs_l_depth": float(obs_cand["l_depth"]),
-        "obs_l_mask": float(obs_cand["l_mask"]),
-        "obs_l_geom": float(obs_cand["l_geom"]),
-        "best_non_obs_l_depth": np.nan,
-        "best_non_obs_l_mask": np.nan,
-        "best_non_obs_l_geom": np.nan,
-        "best_non_obs_anchor_score": np.nan,
+        "selection_reason": "weighted_argmax",
+        "winning_score": float(winner["selection_score"]),
+        "runner_up_candidate": runner_up["label"] if runner_up else "",
+        "runner_up_score": float(runner_up["selection_score"]) if runner_up else np.nan,
+        "score_margin": (
+            float(winner["selection_score"] - runner_up["selection_score"])
+            if runner_up else np.nan
+        ),
     }
-
-    if best_non_obs is None:
-        return obs_cand, diagnostics
-
-    diagnostics.update({
-        "selection_reason": "obs_default",
-        "best_non_obs_total_score": float(best_non_obs["total_score"]),
-        "best_non_obs_l_depth": float(best_non_obs["l_depth"]),
-        "best_non_obs_l_mask": float(best_non_obs["l_mask"]),
-        "best_non_obs_l_geom": float(best_non_obs["l_geom"]),
-        "best_non_obs_anchor_score": float(best_non_obs["s_anchor"]),
-    })
-
-    # Hidden debug backdoor: GEOANCHOR_FORCE_OBS=1 forces Gobs without scoring.
-    # Not exposed via CLI to keep the paper-aligned interface clean.
-    if os.environ.get("GEOANCHOR_FORCE_OBS") == "1":
-        diagnostics["selection_reason"] = "obs_force_debug"
-        return obs_cand, diagnostics
-
-    anchor_ok = float(best_non_obs["s_anchor"]) >= args.anchor_calibration_min
-    total_ok = (
-        float(best_non_obs["total_score"])
-        <= float(obs_cand["total_score"]) - args.select_score_margin
-    )
-    query_ok = _relative_gain_is_better(
-        best_non_obs["s_query"],
-        obs_cand["s_query"],
-        args.obs_consistency_gain_query,
-    )
-    depth_ok = _relative_gain_is_better(
-        best_non_obs["l_depth"],
-        obs_cand["l_depth"],
-        args.obs_consistency_gain_depth,
-    )
-    mask_ok = _relative_gain_is_better(
-        best_non_obs["l_mask"],
-        obs_cand["l_mask"],
-        args.obs_consistency_gain_mask,
-    )
-    geom_ok = _relative_gain_is_better(
-        best_non_obs["l_geom"],
-        obs_cand["l_geom"],
-        args.obs_consistency_gain_geom,
-    )
-
-    if anchor_ok and total_ok and query_ok and depth_ok and mask_ok and geom_ok:
-        diagnostics["obs_override"] = True
-        diagnostics["selection_reason"] = "passed_guard"
-        return best_non_obs, diagnostics
-
-    failed = []
-    if not anchor_ok:
-        failed.append("anchor")
-    if not total_ok:
-        failed.append("total")
-    if not query_ok:
-        failed.append("query")
-    if not depth_ok:
-        failed.append("depth")
-    if not mask_ok:
-        failed.append("mask")
-    if not geom_ok:
-        failed.append("geom")
-    diagnostics["selection_reason"] = "blocked_" + "_".join(failed)
-    return obs_cand, diagnostics
+    return winner, diagnostics
 
 
 # ---------------------------------------------------------------------------
@@ -450,11 +355,11 @@ def _select_observation_consistent_paper(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    seed_everything(0)
-
     parser = argparse.ArgumentParser(description="Query-phase multi-candidate evaluation")
     parser.add_argument("--name", type=str, default="any6d_multicand",
                         help="Experiment name")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Random seed recorded with the evaluation run")
     parser.add_argument("--anchor_path", type=str,
                         required=True,
                         help="Path to anchor results (must contain candidate_registry.json)")
@@ -476,11 +381,44 @@ if __name__ == "__main__":
                         help="w2: weight for L_mask in s_query (Eq. 14)")
     parser.add_argument("--w_geom", type=float, default=0.25,
                         help="w3: weight for L_geom (Chamfer) in s_query (Eq. 14)")
+    parser.add_argument(
+        "--w_pose",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for normalized FoundationPose confidence. The revised main "
+            "protocol uses 0; non-zero values are pose-confidence ablations."
+        ),
+    )
     # --- Total score balance (Eq. 2) ---
     parser.add_argument("--score_alpha", type=float, default=0.3,
                         help="alpha: weight for s_anchor in total score (Eq. 2)")
     parser.add_argument("--score_beta", type=float, default=0.7,
                         help="beta: weight for s_query in total score (Eq. 2)")
+    parser.add_argument(
+        "--query_loss_normalization",
+        choices=["fixed_scale", "minmax"],
+        default="fixed_scale",
+        help="Normalize query losses using disclosed fixed scales or candidate-set min-max.",
+    )
+    parser.add_argument("--query_depth_scale", type=float, default=0.10)
+    parser.add_argument("--query_mask_scale", type=float, default=1.00)
+    parser.add_argument("--query_geom_scale", type=float, default=0.10)
+    parser.add_argument(
+        "--anchor_score_mode",
+        choices=["observation_calibrated", "registry_raw"],
+        default="observation_calibrated",
+        help="Use anchor RGB-D consistency plus bounded ICP calibration, or raw registry Sa.",
+    )
+    parser.add_argument("--anchor_depth_scale", type=float, default=0.05)
+    parser.add_argument("--anchor_mask_scale", type=float, default=0.50)
+    parser.add_argument("--anchor_geom_scale", type=float, default=0.05)
+    parser.add_argument(
+        "--anchor_calibration_weight",
+        type=float,
+        default=0.15,
+        help="Bounded contribution of the registry ICP calibration term to effective Sa.",
+    )
     # --- Pose registration ---
     parser.add_argument("--register_iteration", type=int, default=5,
                         help="Number of pose refinement iterations per candidate")
@@ -503,84 +441,47 @@ if __name__ == "__main__":
                         help="Use registry-only multi-candidate mode for these HO3D folders; force fallback-only for all others")
     parser.add_argument("--obj_folders", nargs="+", default=None,
                         help="HO3D evaluation sequence folders to run (default: all 13)")
+    parser.add_argument(
+        "--candidate_labels",
+        type=str,
+        default=",".join(PAPER_CANDIDATE_LABELS),
+        help="Comma-separated registry labels used in the formal candidate pool.",
+    )
+    parser.add_argument(
+        "--candidate_color_mode",
+        choices=["native", "prior_transfer", "anchor_projected", "uniform_gray"],
+        default="prior_transfer",
+        help="Use a common disclosed appearance treatment for candidate registration.",
+    )
     parser.add_argument("--include_fallback_candidate", action=argparse.BooleanOptionalAction,
-                        default=True,
-                        help="Include the legacy single-candidate mesh alongside registry candidates")
-    parser.add_argument("--prefer_fallback_candidate", action=argparse.BooleanOptionalAction,
-                        default=True,
-                        help="Prefer fallback if its score is close to the best multi-candidate score")
-    parser.add_argument("--legacy_fallback_margin", type=float, default=0.08,
-                        help="Choose fallback when fallback_score <= best_score + margin")
+                        default=False,
+                        help=(
+                            "Include the legacy single-candidate mesh as an explicitly labeled "
+                            "ablation candidate (disabled in the paper-aligned candidate pool)"
+                        ))
     parser.add_argument(
         "--selection_policy",
-        choices=["paper"],
-        default="paper",
+        choices=["weighted"],
+        default="weighted",
         help=(
-            "Candidate selection policy. 'paper' selects via S(G)=alpha*Sa+beta*Sq "
-            "(Eq.2/Eq.22) with Gobs as the calibration-stable default "
-            "candidate; replacement requires anchor calibration above tau_a "
-            "and Sq improvements above gamma_* across query/depth/mask/geom."
+            "Directly maximize S(G)=alpha*S_a_norm+beta*S_q (Eq.2/Eq.22); "
+            "no default candidate, score margin, or component-wise hard gate"
         ),
     )
     parser.add_argument(
         "--obs_anchor_path",
         type=str,
         default=None,
-        help="Path to the observation-derived (Gobs) anchor assets (mesh + initial pose).",
+        help=(
+            "Optional external observation-anchor candidate for a separately labeled ablation; "
+            "omit it for the paper-aligned RaySt3R/InstantMesh/fused candidate pool"
+        ),
     )
     parser.add_argument(
         "--obs_label",
         type=str,
         default="obs",
-        help="Label written for the observation-derived (Gobs) candidate.",
-    )
-    parser.add_argument(
-        "--obs_use_bbox_diameter",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use bbox diagonal for metric-anchor diameter to match the stable single-anchor path.",
-    )
-    parser.add_argument(
-        "--obs_strict_pose_flow",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Skip query-path symmetry post-processing for metric-anchor to match the stable single-anchor path.",
-    )
-    parser.add_argument(
-        "--select_score_margin",
-        type=float,
-        default=0.15,
-        help="Delta: required joint-score margin S(G_alt)-S(Gobs) >= Delta for replacement (Eq.22).",
-    )
-    parser.add_argument(
-        "--obs_consistency_gain_query",
-        type=float,
-        default=0.20,
-        help="gamma_query: required relative Sq improvement on the joint query term (Eq.18).",
-    )
-    parser.add_argument(
-        "--obs_consistency_gain_depth",
-        type=float,
-        default=0.15,
-        help="gamma_depth: required relative L_depth improvement (Eq.19).",
-    )
-    parser.add_argument(
-        "--obs_consistency_gain_mask",
-        type=float,
-        default=0.10,
-        help="gamma_mask: required relative L_mask improvement (Eq.20).",
-    )
-    parser.add_argument(
-        "--obs_consistency_gain_geom",
-        type=float,
-        default=0.10,
-        help="gamma_geom: required relative L_chamfer improvement (Eq.21).",
-    )
-    parser.add_argument(
-        "--anchor_calibration_min",
-        type=float,
-        default=0.50,
-        help="tau_a: minimum anchor calibration score Sa for a competing candidate (Eq.13).",
+        help="Label assigned to the optional external observation-anchor candidate.",
     )
     parser.add_argument(
         "--symmetry_consistency_enable",
@@ -596,8 +497,34 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-    if args.selection_policy != "paper" and not args.obs_anchor_path:
-        raise ValueError("--obs_anchor_path is required for metric-anchor selection policies")
+    seed_everything(args.seed)
+    selected_candidate_labels = parse_candidate_labels(args.candidate_labels)
+    score_weights = {
+        "w_depth": args.w_depth,
+        "w_mask": args.w_mask,
+        "w_geom": args.w_geom,
+        "w_pose": args.w_pose,
+        "score_alpha": args.score_alpha,
+        "score_beta": args.score_beta,
+    }
+    if any((not np.isfinite(value)) or value < 0.0 for value in score_weights.values()):
+        raise ValueError(f"All scoring weights must be finite and non-negative: {score_weights}")
+    if args.score_alpha + args.score_beta <= 0.0:
+        raise ValueError("At least one of --score_alpha and --score_beta must be positive")
+    if args.w_depth + args.w_mask + args.w_geom + args.w_pose <= 0.0:
+        raise ValueError("At least one query-consistency weight must be positive")
+    positive_scales = {
+        "query_depth_scale": args.query_depth_scale,
+        "query_mask_scale": args.query_mask_scale,
+        "query_geom_scale": args.query_geom_scale,
+        "anchor_depth_scale": args.anchor_depth_scale,
+        "anchor_mask_scale": args.anchor_mask_scale,
+        "anchor_geom_scale": args.anchor_geom_scale,
+    }
+    if any((not np.isfinite(value)) or value <= 0.0 for value in positive_scales.values()):
+        raise ValueError(f"All loss scales must be finite and positive: {positive_scales}")
+    if not 0.0 <= args.anchor_calibration_weight <= 1.0:
+        raise ValueError("--anchor_calibration_weight must lie in [0, 1]")
 
     name = args.name
     hot3d_data_root = args.hot3d_data_root
@@ -610,6 +537,50 @@ if __name__ == "__main__":
     save_root = f"./results/ho3d_results/{name}/{date_str}"
     save_results_est_path = save_root
     os.makedirs(save_results_est_path, exist_ok=True)
+
+    run_manifest = {
+        "dataset": "HO3D",
+        "mask_source": "precomputed_XMem_query_masks",
+        "selection_policy": args.selection_policy,
+        "selection_formula": (
+            "argmax_i alpha*S_anchor_norm(i) + beta*S_query(i), where "
+            "S_query=-(w_depth*L_depth_norm+w_mask*L_mask_norm+w_geom*L_geom_norm)"
+            "+w_pose*S_pose_norm"
+        ),
+        "pose_confidence_role": (
+            "diagnostic_only" if float(args.w_pose) == 0.0 else "selection_ablation"
+        ),
+        "normalization": {
+            "anchor": "S_anchor / max_j(S_anchor_j) per query frame",
+            "query_losses": args.query_loss_normalization,
+            "query_fixed_scales": {
+                "depth": args.query_depth_scale,
+                "mask": args.query_mask_scale,
+                "geom": args.query_geom_scale,
+            },
+            "anchor_score_mode": args.anchor_score_mode,
+            "anchor_fixed_scales": {
+                "depth": args.anchor_depth_scale,
+                "mask": args.anchor_mask_scale,
+                "geom": args.anchor_geom_scale,
+            },
+            "anchor_calibration_weight": args.anchor_calibration_weight,
+        },
+        "candidate_pool": {
+            "registry_candidates": True,
+            "registry_labels": sorted(selected_candidate_labels or []),
+            "candidate_color_mode": args.candidate_color_mode,
+            "external_obs_candidate": bool(args.obs_anchor_path),
+            "legacy_fallback_candidate": bool(args.include_fallback_candidate),
+        },
+        "args": vars(args),
+    }
+    with open(
+        os.path.join(save_results_est_path, "query_run_manifest.json"),
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(run_manifest, f, indent=2)
 
     # ====================================================================
     # Load candidate registry from anchor phase
@@ -650,24 +621,19 @@ if __name__ == "__main__":
             "ADD": [], "ADD-S": [], "AR": [], "VSD": [], "MSSD": [], "MSPD": [],
             "R error": [], "T error": [], "cls_id": [], "instance_id": [],
             "chosen_candidate": [],
-            "default_candidate": [], "obs_override": [], "selection_reason": [],
-            "obs_total_score": [], "best_non_obs_total_score": [],
-            "obs_l_depth": [], "obs_l_mask": [], "obs_l_geom": [],
-            "best_non_obs_l_depth": [], "best_non_obs_l_mask": [], "best_non_obs_l_geom": [],
-            "best_non_obs_anchor_score": [],
+            "selection_reason": [], "winning_score": [],
+            "runner_up_candidate": [], "runner_up_score": [], "score_margin": [],
         }
         for obj in obj_folder
     }
+    candidate_score_rows = []
     all_frame_data = {
         "Frame_ID": [], "Class": [],
         "ADD-S": [], "ADD": [], "AR": [],
         "MSSD": [], "MSPD": [], "VSD": [],
         "R_error": [], "T_error": [], "Chosen_Candidate": [],
-        "Default_Candidate": [], "Obs_Override": [], "Selection_Reason": [],
-        "Sa_obs_total": [], "Sa_best_non_obs_total": [],
-        "L_depth_obs": [], "L_mask_obs": [], "L_geom_obs": [],
-        "L_depth_best_non_obs": [], "L_mask_best_non_obs": [], "L_geom_best_non_obs": [],
-        "Sa_best_non_obs": [],
+        "Selection_Reason": [], "Winning_Score": [],
+        "Runner_Up_Candidate": [], "Runner_Up_Score": [], "Score_Margin": [],
     }
 
     glctx = dr.RasterizeCudaContext()
@@ -707,7 +673,9 @@ if __name__ == "__main__":
 
         K_anchor = np.loadtxt(reader.get_reference_K(anchor_path))
         gt_mesh = reader.get_gt_mesh(ycb_model_path)
-        gt_diameter = reader.get_gt_mesh_diamter()
+        gt_diameter = compute_mesh_diameter(
+            model_pts=np.asarray(gt_mesh.vertices), n_sample=10000
+        )
 
         gt_mesh_dict = {
             "pts": np.asarray(gt_mesh.vertices) * 1e3,
@@ -729,8 +697,11 @@ if __name__ == "__main__":
         obj_candidates = {} if force_fallback_only else obj_registry.get("candidates", {})
 
         obj_candidate_info_by_label = {}
+        registry_meshes = {}
         if obj_candidates:
             for label, info in obj_candidates.items():
+                if selected_candidate_labels is not None and label not in selected_candidate_labels:
+                    continue
                 mesh_p = info["mesh_path"]
                 mesh_dir = os.path.dirname(mesh_p)
                 final_mesh_p = os.path.join(
@@ -740,17 +711,8 @@ if __name__ == "__main__":
                     mesh_p = final_mesh_p
                 elif not os.path.exists(mesh_p):
                     continue
-                cand_mesh = trimesh.load(mesh_p)
-                s_anchor = info.get("s_anchor", 1.0)
-                cache = CandidateCache(
-                    label=label,
-                    mesh=cand_mesh,
-                    s_anchor=s_anchor,
-                    use_bbox_diameter=args.use_bbox_diameter,
-                    lazy_tensors=args.lazy_tensors,
-                )
-                cand_caches.append(cache)
-                obj_candidate_info_by_label[label] = info
+                registry_meshes[label] = trimesh.load(mesh_p)
+                obj_candidate_info_by_label[label] = dict(info)
 
                 pose_path = info.get("pose_path", "")
                 if os.path.exists(pose_path):
@@ -758,6 +720,90 @@ if __name__ == "__main__":
                     gt_pose_path = pose_path.replace("initial", "gt")
                     if os.path.exists(gt_pose_path):
                         cand_gt_anchor_poses[label] = np.loadtxt(gt_pose_path)
+
+        anchor_score_rows = []
+        registry_has_bounded_anchor_scores = bool(registry_meshes)
+        for label in registry_meshes:
+            info = obj_candidate_info_by_label[label]
+            is_bounded = (
+                info.get("anchor_score_version") == "bounded_observation_calibrated_v1"
+                and "s_anchor_raw" in info
+                and "anchor_observation_quality" in info
+                and "anchor_calibration_norm" in info
+            )
+            registry_has_bounded_anchor_scores &= is_bounded
+            anchor_score_rows.append(
+                {
+                    "label": label,
+                    "s_anchor": float(info.get("s_anchor", 1.0)),
+                    "s_anchor_raw": float(info.get("s_anchor_raw", info.get("s_anchor", 1.0))),
+                    "anchor_observation_quality": float(
+                        info.get("anchor_observation_quality", info.get("s_anchor", 1.0))
+                    ),
+                    "anchor_calibration_norm": float(
+                        info.get("anchor_calibration_norm", 1.0)
+                    ),
+                    "l_depth": float(info.get("l_depth", args.anchor_depth_scale)),
+                    "l_mask": float(info.get("l_mask", args.anchor_mask_scale)),
+                    "l_geom": float(info.get("l_geom", args.anchor_geom_scale)),
+                }
+            )
+        if (
+            args.anchor_score_mode == "observation_calibrated"
+            and not registry_has_bounded_anchor_scores
+        ):
+            derive_anchor_reliability_scores(
+                anchor_score_rows,
+                w_depth=args.w_depth,
+                w_mask=args.w_mask,
+                w_geom=args.w_geom,
+                depth_scale=args.anchor_depth_scale,
+                mask_scale=args.anchor_mask_scale,
+                geom_scale=args.anchor_geom_scale,
+                calibration_weight=args.anchor_calibration_weight,
+            )
+        anchor_score_by_label = {row["label"]: row for row in anchor_score_rows}
+
+        if registry_meshes:
+            anchor_rgb = None
+            anchor_mask = None
+            if args.candidate_color_mode == "anchor_projected":
+                obj_anchor_dir = os.path.join(anchor_path, obj_name)
+                anchor_bgr = cv2.imread(os.path.join(obj_anchor_dir, "color.png"))
+                anchor_mask = cv2.imread(
+                    os.path.join(obj_anchor_dir, "mask.png"), cv2.IMREAD_GRAYSCALE
+                )
+                if anchor_bgr is None or anchor_mask is None:
+                    raise FileNotFoundError(
+                        f"anchor_projected requires color.png and mask.png in {obj_anchor_dir}"
+                    )
+                anchor_rgb = cv2.cvtColor(anchor_bgr, cv2.COLOR_BGR2RGB)
+            registry_meshes, appearance_summary = apply_candidate_appearance(
+                registry_meshes,
+                cand_anchor_poses,
+                args.candidate_color_mode,
+                anchor_rgb=anchor_rgb,
+                anchor_mask=anchor_mask,
+                anchor_k=K_anchor if anchor_rgb is not None else None,
+            )
+            print(
+                f"{obj_f}: appearance={appearance_summary.mode}, "
+                f"source={appearance_summary.source_label}, "
+                f"transferred={list(appearance_summary.transferred_labels)}"
+            )
+            for label, cand_mesh in registry_meshes.items():
+                score_row = anchor_score_by_label[label]
+                info = obj_candidate_info_by_label[label]
+                info.update({key: value for key, value in score_row.items() if key != "label"})
+                cand_caches.append(
+                    CandidateCache(
+                        label=label,
+                        mesh=cand_mesh,
+                        s_anchor=float(score_row["s_anchor"]),
+                        use_bbox_diameter=args.use_bbox_diameter,
+                        lazy_tensors=args.lazy_tensors,
+                    )
+                )
 
         fallback_label = "fallback"
         include_fallback_for_obj = (
@@ -806,7 +852,7 @@ if __name__ == "__main__":
                 label=obs_label,
                 mesh=metric_mesh,
                 s_anchor=1.0,
-                use_bbox_diameter=args.obs_use_bbox_diameter,
+                use_bbox_diameter=args.use_bbox_diameter,
                 lazy_tensors=False,
             )
             cand_caches.insert(0, metric_cache)
@@ -825,45 +871,38 @@ if __name__ == "__main__":
               f"{[c.label for c in cand_caches]}")
 
         static_object_winner = None
-        prev_pred_pose_q = None
+        prev_pred_pose_by_label = {}
         if (
             len(cand_caches) > 1
             and not args.per_frame_selection
-            and args.selection_policy == "paper"
+            and args.selection_policy == "weighted"
         ):
             # Object-level selection: use anchor-phase candidate metrics as static priors.
-            static_scores = {}
-            valid_l_depth = [
-                float(obj_candidate_info_by_label[c.label].get("l_depth", 1.0))
-                for c in cand_caches if c.label in obj_candidate_info_by_label
-            ]
-            valid_l_mask = [
-                float(obj_candidate_info_by_label[c.label].get("l_mask", 1.0))
-                for c in cand_caches if c.label in obj_candidate_info_by_label
-            ]
-            valid_l_geom = [
-                float(obj_candidate_info_by_label[c.label].get("l_geom", 1.0))
-                for c in cand_caches if c.label in obj_candidate_info_by_label
-            ]
-            min_l_depth = min(valid_l_depth) if valid_l_depth else 1.0
-            min_l_mask = min(valid_l_mask) if valid_l_mask else 1.0
-            min_l_geom = min(valid_l_geom) if valid_l_geom else 1.0
-            max_s_anchor = max(float(c.s_anchor) for c in cand_caches)
-
+            static_rows = []
             for c in cand_caches:
                 info = obj_candidate_info_by_label.get(c.label, {})
-                l_depth = float(info.get("l_depth", min_l_depth))
-                l_mask = float(info.get("l_mask", min_l_mask))
-                l_geom = float(info.get("l_geom", min_l_geom))
-                s_query = (
-                    args.w_depth * (l_depth / max(min_l_depth, 1e-8))
-                    + args.w_mask * (l_mask / max(min_l_mask, 1e-8))
-                    + args.w_geom * (l_geom / max(min_l_geom, 1e-8))
-                )
-                s_anchor_norm = float(c.s_anchor) / max(max_s_anchor, 1e-8)
-                static_scores[c.label] = -args.score_alpha * s_anchor_norm + args.score_beta * s_query
-
-            static_object_winner = min(static_scores.items(), key=lambda kv: kv[1])[0]
+                static_rows.append({
+                    "label": c.label,
+                    "s_anchor": float(c.s_anchor),
+                    "l_depth": float(info.get("l_depth", 1.0)),
+                    "l_mask": float(info.get("l_mask", 1.0)),
+                    "l_geom": float(info.get("l_geom", 1.0)),
+                })
+            score_candidates(
+                static_rows,
+                w_depth=args.w_depth,
+                w_mask=args.w_mask,
+                w_geom=args.w_geom,
+                score_alpha=args.score_alpha,
+                score_beta=args.score_beta,
+                loss_normalization=args.query_loss_normalization,
+                depth_scale=args.query_depth_scale,
+                mask_scale=args.query_mask_scale,
+                geom_scale=args.query_geom_scale,
+            )
+            static_object_winner = max(
+                static_rows, key=lambda row: row["total_score"]
+            )["label"]
             print(f"{obj_f}: object-level winner = {static_object_winner}")
 
         for i in tqdm(range(len(reader.color_files)), desc=f"{obj_f} - Frames"):
@@ -879,7 +918,6 @@ if __name__ == "__main__":
             # ==============================================================
             # Multi-candidate pose registration (Eq. 11-13)
             # ==============================================================
-            best_total_score = float("inf")
             best_label = None
             best_pred_pose_q = None
             best_pred_q = None
@@ -890,7 +928,7 @@ if __name__ == "__main__":
                 len(cand_caches) > 1
                 and not args.per_frame_selection
                 and static_object_winner is not None
-                and args.selection_policy == "paper"
+                and args.selection_policy == "weighted"
             ):
                 eval_caches = [c for c in cand_caches if c.label == static_object_winner]
 
@@ -909,18 +947,25 @@ if __name__ == "__main__":
                     iteration=args.register_iteration,
                     name=obj_f,
                 )
-                use_strict_metric_flow = (
-                    cache.label == obs_label
-                    and args.obs_strict_pose_flow
-                )
-                if args.anchor_symmetry_align and len(sym_tfs_list) > 1 and not use_strict_metric_flow:
+                pose_scores = getattr(est, "scores", None)
+                if pose_scores is None or len(pose_scores) == 0:
+                    pose_score = 0.0
+                else:
+                    pose_score_value = pose_scores[0]
+                    if torch.is_tensor(pose_score_value):
+                        pose_score_value = pose_score_value.detach().cpu().item()
+                    pose_score = float(pose_score_value)
+                if args.anchor_symmetry_align and len(sym_tfs_list) > 1:
                     pred_pose_q_k = _resolve_pose_to_anchor_symmetry(
                         pred_pose_q_k, pred_pose_a, sym_tfs_list
                     )
-                if args.symmetry_consistency_enable and len(sym_tfs_list) > 1 and not use_strict_metric_flow:
+                if args.symmetry_consistency_enable and len(sym_tfs_list) > 1:
                     pred_pose_q_k = _resolve_pose_with_symmetry(
-                        pred_pose_q_k, sym_tfs_list, prev_pred_pose_q
+                        pred_pose_q_k,
+                        sym_tfs_list,
+                        prev_pred_pose_by_label.get(cache.label),
                     )
+                prev_pred_pose_by_label[cache.label] = pred_pose_q_k.copy()
 
                 pose_aq = pred_pose_q_k @ np.linalg.inv(pred_pose_a)
                 pred_q_k = pose_aq @ gt_pose_a_for_candidate
@@ -936,69 +981,119 @@ if __name__ == "__main__":
                     )
                 else:
                     l_depth, l_mask, l_geom = 1.0, 1.0, 1.0
-                total_score = 0.0
+
+                cand_err_r, cand_err_t = compute_RT_distances(pred_q_k, gt_pose_q)
+                cand_add = compute_add(gt_mesh.vertices, pred_q_k, gt_pose_q)
+                cand_adds = compute_adds(gt_mesh.vertices, pred_q_k, gt_pose_q)
+                anchor_info = obj_candidate_info_by_label.get(cache.label, {})
 
                 candidate_results.append({
                     "label": cache.label,
                     "pred_pose_q": pred_pose_q_k,
                     "pred_q": pred_q_k,
-                    "total_score": total_score,
+                    "selection_score": 0.0,
                     "s_query": s_query,
+                    "pose_score": pose_score,
                     "s_anchor": cache.s_anchor,
+                    "s_anchor_raw": float(
+                        anchor_info.get("s_anchor_raw", anchor_info.get("s_anchor", cache.s_anchor))
+                    ),
+                    "anchor_observation_quality": float(
+                        anchor_info.get("anchor_observation_quality", cache.s_anchor)
+                    ),
+                    "anchor_calibration_norm": float(
+                        anchor_info.get("anchor_calibration_norm", 1.0)
+                    ),
+                    "s_anchor_norm": 1.0,
                     "l_depth": float(l_depth),
                     "l_mask": float(l_mask),
                     "l_geom": float(l_geom),
+                    "l_depth_norm": 1.0,
+                    "l_mask_norm": 1.0,
+                    "l_geom_norm": 1.0,
+                    "audit_add": float(cand_add <= gt_diameter * 0.1),
+                    "audit_adds": float(cand_adds <= gt_diameter * 0.1),
+                    "audit_r_error": float(np.asarray(cand_err_r).reshape(-1)[0]),
+                    "audit_t_error": float(np.asarray(cand_err_t).reshape(-1)[0]),
                 })
 
             if len(eval_caches) > 1 and args.per_frame_selection:
-                min_l_depth = min(r["l_depth"] for r in candidate_results)
-                min_l_mask = min(r["l_mask"] for r in candidate_results)
-                min_l_geom = min(r["l_geom"] for r in candidate_results)
-                max_s_anchor = max(float(r["s_anchor"]) for r in candidate_results)
-
-                for r in candidate_results:
-                    depth_term = args.w_depth * (r["l_depth"] / max(min_l_depth, 1e-8))
-                    mask_term = args.w_mask * (r["l_mask"] / max(min_l_mask, 1e-8))
-                    geom_term = args.w_geom * (r["l_geom"] / max(min_l_geom, 1e-8))
-                    s_query = depth_term + mask_term + geom_term
-                    s_anchor_norm = float(r["s_anchor"]) / max(max_s_anchor, 1e-8)
-                    r["s_query"] = float(s_query)
-                    r["total_score"] = float(-args.score_alpha * s_anchor_norm + args.score_beta * s_query)
-
-            # ==============================================================
-            # Best candidate selection (Eq. 15)
-            # ==============================================================
-            candidate_results.sort(key=lambda x: x["total_score"])
-            selection_diagnostics = {
-                "default_candidate": "",
-                "obs_override": False,
-                "selection_reason": "paper_selection",
-                "obs_total_score": np.nan,
-                "best_non_obs_total_score": np.nan,
-                "obs_l_depth": np.nan,
-                "obs_l_mask": np.nan,
-                "obs_l_geom": np.nan,
-                "best_non_obs_l_depth": np.nan,
-                "best_non_obs_l_mask": np.nan,
-                "best_non_obs_l_geom": np.nan,
-                "best_non_obs_anchor_score": np.nan,
-            }
-            if args.selection_policy in {"obs_force", "paper"}:
-                winner, selection_diagnostics = _select_observation_consistent_paper(
+                score_candidates(
                     candidate_results,
-                    obs_label,
-                    args,
+                    w_depth=args.w_depth,
+                    w_mask=args.w_mask,
+                    w_geom=args.w_geom,
+                    score_alpha=args.score_alpha,
+                    score_beta=args.score_beta,
+                    w_pose=args.w_pose,
+                    loss_normalization=args.query_loss_normalization,
+                    depth_scale=args.query_depth_scale,
+                    mask_scale=args.query_mask_scale,
+                    geom_scale=args.query_geom_scale,
                 )
+                for r in candidate_results:
+                    r["selection_score"] = r["total_score"]
             else:
-                winner = candidate_results[0]
-                if args.prefer_fallback_candidate and len(candidate_results) > 1:
-                    fallback_result = next((r for r in candidate_results if r["label"] == fallback_label), None)
-                    if fallback_result is not None and fallback_result["total_score"] <= winner["total_score"] + args.legacy_fallback_margin:
-                        winner = fallback_result
+                # With a single candidate the score does not affect selection, but
+                # recording the same formula keeps result files self-consistent.
+                r = candidate_results[0]
+                score_candidates(
+                    candidate_results,
+                    w_depth=args.w_depth,
+                    w_mask=args.w_mask,
+                    w_geom=args.w_geom,
+                    score_alpha=args.score_alpha,
+                    score_beta=args.score_beta,
+                    w_pose=args.w_pose,
+                    loss_normalization=args.query_loss_normalization,
+                    depth_scale=args.query_depth_scale,
+                    mask_scale=args.query_mask_scale,
+                    geom_scale=args.query_geom_scale,
+                )
+                r["selection_score"] = r["total_score"]
+
+            # ==============================================================
+            # Direct weighted candidate selection (Eq. 22)
+            # ==============================================================
+            candidate_results.sort(
+                key=lambda item: float(item["selection_score"]),
+                reverse=True,
+            )
+            winner, selection_diagnostics = _select_weighted_candidate(
+                candidate_results,
+            )
             best_label = winner["label"]
             best_pred_pose_q = winner["pred_pose_q"]
             pred_q = winner["pred_q"]
-            prev_pred_pose_q = best_pred_pose_q
+
+            for rank, result in enumerate(candidate_results, start=1):
+                candidate_score_rows.append({
+                    "Frame_ID": obj_count,
+                    "Query_Frame_Index": i,
+                    "Class": obj_f,
+                    "Candidate": result["label"],
+                    "Rank": rank,
+                    "Selected": result["label"] == best_label,
+                    "S_anchor": float(result["s_anchor"]),
+                    "S_anchor_raw": float(result["s_anchor_raw"]),
+                    "Anchor_Observation_Quality": float(result["anchor_observation_quality"]),
+                    "Anchor_Calibration_Norm": float(result["anchor_calibration_norm"]),
+                    "S_anchor_norm": float(result["s_anchor_norm"]),
+                    "L_depth": float(result["l_depth"]),
+                    "L_mask": float(result["l_mask"]),
+                    "L_geom": float(result["l_geom"]),
+                    "L_depth_norm": float(result["l_depth_norm"]),
+                    "L_mask_norm": float(result["l_mask_norm"]),
+                    "L_geom_norm": float(result["l_geom_norm"]),
+                    "S_query": float(result["s_query"]),
+                    "Pose_Score_Raw": float(result["pose_score"]),
+                    "Pose_Score_Norm": float(result["pose_score_norm"]),
+                    "Selection_Score": float(result["selection_score"]),
+                    "Audit_ADD-S": float(result["audit_adds"]),
+                    "Audit_ADD": float(result["audit_add"]),
+                    "Audit_R_Error": float(result["audit_r_error"]),
+                    "Audit_T_Error": float(result["audit_t_error"]),
+                })
 
             # Swap the winning candidate back for visualization
             winning_cache = next(c for c in cand_caches if c.label == best_label)
@@ -1055,18 +1150,11 @@ if __name__ == "__main__":
             object_metrics[obj_f]["cls_id"].append(obj_f)
             object_metrics[obj_f]["instance_id"].append(obj_count)
             object_metrics[obj_f]["chosen_candidate"].append(best_label)
-            object_metrics[obj_f]["default_candidate"].append(selection_diagnostics["default_candidate"])
-            object_metrics[obj_f]["obs_override"].append(selection_diagnostics["obs_override"])
             object_metrics[obj_f]["selection_reason"].append(selection_diagnostics["selection_reason"])
-            object_metrics[obj_f]["obs_total_score"].append(selection_diagnostics["obs_total_score"])
-            object_metrics[obj_f]["best_non_obs_total_score"].append(selection_diagnostics["best_non_obs_total_score"])
-            object_metrics[obj_f]["obs_l_depth"].append(selection_diagnostics["obs_l_depth"])
-            object_metrics[obj_f]["obs_l_mask"].append(selection_diagnostics["obs_l_mask"])
-            object_metrics[obj_f]["obs_l_geom"].append(selection_diagnostics["obs_l_geom"])
-            object_metrics[obj_f]["best_non_obs_l_depth"].append(selection_diagnostics["best_non_obs_l_depth"])
-            object_metrics[obj_f]["best_non_obs_l_mask"].append(selection_diagnostics["best_non_obs_l_mask"])
-            object_metrics[obj_f]["best_non_obs_l_geom"].append(selection_diagnostics["best_non_obs_l_geom"])
-            object_metrics[obj_f]["best_non_obs_anchor_score"].append(selection_diagnostics["best_non_obs_anchor_score"])
+            object_metrics[obj_f]["winning_score"].append(selection_diagnostics["winning_score"])
+            object_metrics[obj_f]["runner_up_candidate"].append(selection_diagnostics["runner_up_candidate"])
+            object_metrics[obj_f]["runner_up_score"].append(selection_diagnostics["runner_up_score"])
+            object_metrics[obj_f]["score_margin"].append(selection_diagnostics["score_margin"])
 
             try:
                 visualize_frame_results_gt(
@@ -1098,18 +1186,11 @@ if __name__ == "__main__":
             "R_error": object_metrics[obj_f]["R error"],
             "T_error": object_metrics[obj_f]["T error"],
             "Chosen_Candidate": object_metrics[obj_f]["chosen_candidate"],
-            "Default_Candidate": object_metrics[obj_f]["default_candidate"],
-            "Obs_Override": object_metrics[obj_f]["obs_override"],
             "Selection_Reason": object_metrics[obj_f]["selection_reason"],
-            "Sa_obs_total": object_metrics[obj_f]["obs_total_score"],
-            "Sa_best_non_obs_total": object_metrics[obj_f]["best_non_obs_total_score"],
-            "L_depth_obs": object_metrics[obj_f]["obs_l_depth"],
-            "L_mask_obs": object_metrics[obj_f]["obs_l_mask"],
-            "L_geom_obs": object_metrics[obj_f]["obs_l_geom"],
-            "L_depth_best_non_obs": object_metrics[obj_f]["best_non_obs_l_depth"],
-            "L_mask_best_non_obs": object_metrics[obj_f]["best_non_obs_l_mask"],
-            "L_geom_best_non_obs": object_metrics[obj_f]["best_non_obs_l_geom"],
-            "Sa_best_non_obs": object_metrics[obj_f]["best_non_obs_anchor_score"],
+            "Winning_Score": object_metrics[obj_f]["winning_score"],
+            "Runner_Up_Candidate": object_metrics[obj_f]["runner_up_candidate"],
+            "Runner_Up_Score": object_metrics[obj_f]["runner_up_score"],
+            "Score_Margin": object_metrics[obj_f]["score_margin"],
         })
 
         means_all = {
@@ -1168,18 +1249,11 @@ if __name__ == "__main__":
         all_frame_data["R_error"].extend(object_metrics[obj_f]["R error"])
         all_frame_data["T_error"].extend(object_metrics[obj_f]["T error"])
         all_frame_data["Chosen_Candidate"].extend(object_metrics[obj_f]["chosen_candidate"])
-        all_frame_data["Default_Candidate"].extend(object_metrics[obj_f]["default_candidate"])
-        all_frame_data["Obs_Override"].extend(object_metrics[obj_f]["obs_override"])
         all_frame_data["Selection_Reason"].extend(object_metrics[obj_f]["selection_reason"])
-        all_frame_data["Sa_obs_total"].extend(object_metrics[obj_f]["obs_total_score"])
-        all_frame_data["Sa_best_non_obs_total"].extend(object_metrics[obj_f]["best_non_obs_total_score"])
-        all_frame_data["L_depth_obs"].extend(object_metrics[obj_f]["obs_l_depth"])
-        all_frame_data["L_mask_obs"].extend(object_metrics[obj_f]["obs_l_mask"])
-        all_frame_data["L_geom_obs"].extend(object_metrics[obj_f]["obs_l_geom"])
-        all_frame_data["L_depth_best_non_obs"].extend(object_metrics[obj_f]["best_non_obs_l_depth"])
-        all_frame_data["L_mask_best_non_obs"].extend(object_metrics[obj_f]["best_non_obs_l_mask"])
-        all_frame_data["L_geom_best_non_obs"].extend(object_metrics[obj_f]["best_non_obs_l_geom"])
-        all_frame_data["Sa_best_non_obs"].extend(object_metrics[obj_f]["best_non_obs_anchor_score"])
+        all_frame_data["Winning_Score"].extend(object_metrics[obj_f]["winning_score"])
+        all_frame_data["Runner_Up_Candidate"].extend(object_metrics[obj_f]["runner_up_candidate"])
+        all_frame_data["Runner_Up_Score"].extend(object_metrics[obj_f]["runner_up_score"])
+        all_frame_data["Score_Margin"].extend(object_metrics[obj_f]["score_margin"])
 
     # ======================================================================
     # Overall summary
@@ -1229,24 +1303,20 @@ if __name__ == "__main__":
         "R_error": f"{df_all_frames['R_error'].mean():.1f}",
         "T_error": f"{df_all_frames['T_error'].mean():.1f}",
         "Chosen_Candidate": "",
-        "Default_Candidate": "",
-        "Obs_Override": "",
         "Selection_Reason": "",
-        "Sa_obs_total": "",
-        "Sa_best_non_obs_total": "",
-        "L_depth_obs": "",
-        "L_mask_obs": "",
-        "L_geom_obs": "",
-        "L_depth_best_non_obs": "",
-        "L_mask_best_non_obs": "",
-        "L_geom_best_non_obs": "",
-        "Sa_best_non_obs": "",
+        "Winning_Score": "",
+        "Runner_Up_Candidate": "",
+        "Runner_Up_Score": "",
+        "Score_Margin": "",
     }
 
     df_all_frames = pd.concat([df_all_frames, pd.DataFrame([means_all_final])], ignore_index=True)
 
     output_path = f"{save_results_est_path}/0_all_frames_metrics_results.xlsx"
     df_all_frames.to_excel(output_path, index=False)
+    candidate_scores_path = f"{save_results_est_path}/0_all_candidate_scores.xlsx"
+    pd.DataFrame(candidate_score_rows).to_excel(candidate_scores_path, index=False)
     print(f"\nAll frames metrics saved to {output_path}")
+    print(f"Per-candidate weighted scores saved to {candidate_scores_path}")
     print("\nSaved data preview:")
     print(df_all_frames)

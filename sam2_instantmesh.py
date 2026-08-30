@@ -144,6 +144,7 @@ def diffusion_image_generation(
     input_image=None,
     config_path="./instantmesh/configs/instant-mesh-large.yaml",
     device="cuda",
+    seed=None,
 ):
     if input_image == None:
         input_image = Image.open(os.path.join(debug_input_dir, f'input_{name}.png'))
@@ -170,7 +171,14 @@ def diffusion_image_generation(
     multiview_diffusion_model.unet.load_state_dict(state_dict, strict=True)
     multiview_diffusion_model = multiview_diffusion_model.to(device)
 
-    output_image = multiview_diffusion_model(input_image, num_inference_steps=75, ).images[0]
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device=device).manual_seed(int(seed))
+    output_image = multiview_diffusion_model(
+        input_image,
+        num_inference_steps=75,
+        generator=generator,
+    ).images[0]
     output_image.save(os.path.join(debug_dir, f'6_views_{name}.png'))
     print(f"Image saved to {os.path.join(debug_dir, f'6_views_{name}.png')}")
 
