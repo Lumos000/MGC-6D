@@ -315,6 +315,7 @@ class AppearanceSummary:
     source_label: str | None
     transferred_labels: tuple[str, ...]
     projected_labels: tuple[str, ...] = ()
+    projected_vertex_counts: tuple[tuple[str, int], ...] = ()
 
 
 def project_anchor_vertex_colors(
@@ -397,14 +398,20 @@ def apply_candidate_appearance(
     """Apply the selected, explicitly reportable candidate appearance mode."""
 
     mode = str(mode)
-    if mode not in {"native", "prior_transfer", "anchor_projected", "uniform_gray"}:
+    if mode not in {
+        "native",
+        "prior_transfer",
+        "anchor_projected",
+        "anchor_prior_hybrid",
+        "uniform_gray",
+    }:
         raise ValueError(f"Unsupported candidate appearance mode: {mode}")
     output = {label: mesh.copy() for label, mesh in meshes.items()}
     if mode == "uniform_gray":
         output = {label: uniform_gray_mesh(mesh) for label, mesh in output.items()}
-        return output, AppearanceSummary(mode, None, tuple(sorted(output)), ())
+        return output, AppearanceSummary(mode, None, tuple(sorted(output)), (), ())
     if mode == "native":
-        return output, AppearanceSummary(mode, None, (), ())
+        return output, AppearanceSummary(mode, None, (), (), ())
 
     source_label = "instantmesh" if "instantmesh" in output else None
     transferred = []
@@ -422,10 +429,11 @@ def apply_candidate_appearance(
                 )
                 transferred.append(label)
     projected = []
-    if mode == "anchor_projected":
+    projected_counts = []
+    if mode in {"anchor_projected", "anchor_prior_hybrid"}:
         if anchor_rgb is None or anchor_mask is None or anchor_k is None:
             raise ValueError(
-                "anchor_projected appearance requires anchor_rgb, anchor_mask, and anchor_k"
+                f"{mode} appearance requires anchor_rgb, anchor_mask, and anchor_k"
             )
         for label in sorted(output):
             if label not in anchor_poses:
@@ -440,6 +448,11 @@ def apply_candidate_appearance(
             )
             if count > 0:
                 projected.append(label)
+            projected_counts.append((label, int(count)))
     return output, AppearanceSummary(
-        mode, source_label, tuple(transferred), tuple(projected)
+        mode,
+        source_label,
+        tuple(transferred),
+        tuple(projected),
+        tuple(projected_counts),
     )
