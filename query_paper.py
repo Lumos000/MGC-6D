@@ -50,6 +50,7 @@ from candidate_selection import (
     parse_candidate_labels,
     score_candidates,
 )
+from run_metadata import collect_source_revision
 
 
 def _load_anchor_depth_meters(path: str, depth_unit: str) -> np.ndarray:
@@ -579,6 +580,7 @@ if __name__ == "__main__":
     os.makedirs(save_results_est_path, exist_ok=True)
 
     run_manifest = {
+        "source_revision": collect_source_revision(),
         "dataset": "HO3D",
         "mask_source": "precomputed_XMem_query_masks",
         "selection_policy": args.selection_policy,
@@ -698,6 +700,8 @@ if __name__ == "__main__":
         for obj in obj_folder
     }
     candidate_score_rows = []
+    skipped_frame_rows = []
+    planned_frame_count = 0
     all_frame_data = {
         "Frame_ID": [], "Class": [],
         "ADD-S": [], "ADD": [], "AR": [],
@@ -727,6 +731,7 @@ if __name__ == "__main__":
         video_dir = os.path.join(f"{hot3d_data_root}/evaluation", obj_f)
         reader = Ho3dReader(video_dir, hot3d_data_root)
         reader.color_files = reader.color_files[::running_stride]
+        planned_frame_count += len(reader.color_files)
 
         ob_id = reader.get_obj_id()
         obj_name = reader.get_video_name_full()
@@ -760,7 +765,7 @@ if __name__ == "__main__":
         # ==================================================================
         cand_caches = []
         cand_anchor_poses = {}
-        cand_gt_anchor_poses = {}
+        cand_gt_anchor_pose_paths = {}
         obj_registry = candidate_registry.get(obj_name, {})
         hybrid_enabled = bool(hybrid_registry_folders)
         use_hybrid_registry = obj_f in hybrid_registry_folders
@@ -790,7 +795,7 @@ if __name__ == "__main__":
                     cand_anchor_poses[label] = np.loadtxt(pose_path)
                     gt_pose_path = pose_path.replace("initial", "gt")
                     if os.path.exists(gt_pose_path):
-                        cand_gt_anchor_poses[label] = np.loadtxt(gt_pose_path)
+                        cand_gt_anchor_pose_paths[label] = gt_pose_path
 
         anchor_score_rows = []
         registry_has_bounded_anchor_scores = bool(registry_meshes)
@@ -909,7 +914,7 @@ if __name__ == "__main__":
                         cand_anchor_poses[fallback_label] = np.loadtxt(fallback_pose_path)
                         fallback_gt_pose_path = fallback_pose_path.replace("initial", "gt")
                         if os.path.exists(fallback_gt_pose_path):
-                            cand_gt_anchor_poses[fallback_label] = np.loadtxt(fallback_gt_pose_path)
+                            cand_gt_anchor_pose_paths[fallback_label] = fallback_gt_pose_path
                 elif not cand_caches:
                     raise FileNotFoundError(f"Fallback mesh not found: {fallback_mesh_path}")
 
@@ -937,15 +942,14 @@ if __name__ == "__main__":
             )
             cand_caches.insert(0, metric_cache)
             cand_anchor_poses[obs_label] = np.loadtxt(metric_pose_path)
-            cand_gt_anchor_poses[obs_label] = np.loadtxt(metric_gt_pose_path)
+            cand_gt_anchor_pose_paths[obs_label] = metric_gt_pose_path
 
         if not cand_caches:
             raise RuntimeError(f"No valid candidates for {obj_f} ({obj_name})")
 
         gt_pose_a_path = reader.get_reference_view_1_pose(anchor_path).replace("initial", "gt")
-        gt_pose_a = np.loadtxt(gt_pose_a_path)
         for cache in cand_caches:
-            cand_gt_anchor_poses.setdefault(cache.label, gt_pose_a)
+            cand_gt_anchor_pose_paths.setdefault(cache.label, gt_pose_a_path)
 
         print(f"\n{obj_f} ({obj_name}): {len(cand_caches)} candidate(s): "
               f"{[c.label for c in cand_caches]}")
@@ -986,10 +990,6 @@ if __name__ == "__main__":
             print(f"{obj_f}: object-level winner = {static_object_winner}")
 
         for i in tqdm(range(len(reader.color_files)), desc=f"{obj_f} - Frames"):
-            gt_pose_q = reader.get_gt_pose(i)
-            if gt_pose_q is None:
-                continue
-
             color_file = reader.color_files[i]
             color = cv2.cvtColor(cv2.imread(color_file), cv2.COLOR_BGR2RGB)
             depth = reader.get_depth(i)
@@ -1000,8 +1000,6 @@ if __name__ == "__main__":
             # ==============================================================
             best_label = None
             best_pred_pose_q = None
-            best_pred_q = None
-
             candidate_results = []
             eval_caches = cand_caches
             if (
@@ -1017,7 +1015,6 @@ if __name__ == "__main__":
                 pred_pose_a = cand_anchor_poses.get(cache.label)
                 if pred_pose_a is None:
                     pred_pose_a = np.eye(4)
-                gt_pose_a_for_candidate = cand_gt_anchor_poses.get(cache.label, gt_pose_a)
 
                 pred_pose_q_k = est.register(
                     K=reader.K,
@@ -1047,9 +1044,6 @@ if __name__ == "__main__":
                     )
                 prev_pred_pose_by_label[cache.label] = pred_pose_q_k.copy()
 
-                pose_aq = pred_pose_q_k @ np.linalg.inv(pred_pose_a)
-                pred_q_k = pose_aq @ gt_pose_a_for_candidate
-
                 # ==========================================================
                 # Observation consistency scoring (Eq. 14)
                 # ==========================================================
@@ -1067,7 +1061,7 @@ if __name__ == "__main__":
                 candidate_results.append({
                     "label": cache.label,
                     "pred_pose_q": pred_pose_q_k,
-                    "pred_q": pred_q_k,
+                    "pred_pose_a": pred_pose_a,
                     "selection_score": 0.0,
                     "s_query": s_query,
                     "pose_score": pose_score,
@@ -1137,7 +1131,6 @@ if __name__ == "__main__":
             )
             best_label = winner["label"]
             best_pred_pose_q = winner["pred_pose_q"]
-            pred_q = winner["pred_q"]
 
             for rank, result in enumerate(candidate_results, start=1):
                 candidate_score_rows.append({
@@ -1163,6 +1156,31 @@ if __name__ == "__main__":
                     "Pose_Score_Norm": float(result["pose_score_norm"]),
                     "Selection_Score": float(result["selection_score"]),
                 })
+
+            # Load evaluation-only GT only after Eq. (22) has fixed the winner.
+            # This ordering makes it impossible for GT pose annotations to
+            # affect registration, candidate scoring, or candidate selection.
+            gt_pose_q = reader.get_gt_pose(i)
+            if gt_pose_q is None:
+                skipped_frame_rows.append({
+                    "Class": obj_f,
+                    "Query_Frame_Index": i,
+                    "Color_File": color_file,
+                    "Reason": "missing_query_gt_pose",
+                })
+                continue
+            gt_anchor_path = cand_gt_anchor_pose_paths.get(best_label, gt_pose_a_path)
+            if not os.path.exists(gt_anchor_path):
+                skipped_frame_rows.append({
+                    "Class": obj_f,
+                    "Query_Frame_Index": i,
+                    "Color_File": color_file,
+                    "Reason": "missing_anchor_gt_pose",
+                })
+                continue
+            gt_pose_a_for_winner = np.loadtxt(gt_anchor_path)
+            pose_aq = best_pred_pose_q @ np.linalg.inv(winner["pred_pose_a"])
+            pred_q = pose_aq @ gt_pose_a_for_winner
 
             # Swap the winning candidate back for visualization
             winning_cache = next(c for c in cand_caches if c.label == best_label)
@@ -1385,7 +1403,24 @@ if __name__ == "__main__":
     df_all_frames.to_excel(output_path, index=False)
     candidate_scores_path = f"{save_results_est_path}/0_all_candidate_scores.xlsx"
     pd.DataFrame(candidate_score_rows).to_excel(candidate_scores_path, index=False)
+    coverage = {
+        "planned_query_frames": int(planned_frame_count),
+        "evaluated_query_frames": int(obj_count),
+        "skipped_query_frames": int(len(skipped_frame_rows)),
+        "complete": bool(
+            obj_count + len(skipped_frame_rows) == planned_frame_count
+        ),
+        "skipped": skipped_frame_rows,
+    }
+    coverage_path = f"{save_results_est_path}/evaluation_coverage.json"
+    with open(coverage_path, "w", encoding="utf-8") as f:
+        json.dump(coverage, f, indent=2)
     print(f"\nAll frames metrics saved to {output_path}")
     print(f"Per-candidate weighted scores saved to {candidate_scores_path}")
+    print(
+        "Evaluation coverage: "
+        f"{coverage['evaluated_query_frames']}/{coverage['planned_query_frames']} "
+        f"(skipped={coverage['skipped_query_frames']}); saved to {coverage_path}"
+    )
     print("\nSaved data preview:")
     print(df_all_frames)

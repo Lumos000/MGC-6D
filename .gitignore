@@ -52,6 +52,7 @@ demo_data/*
 
 # Vendored dependency outputs
 foundationpose/build/
+foundationpose/mycpp/build
 foundationpose/debug/
 foundationpose/exp/
 foundationpose/weights/*

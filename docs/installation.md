@@ -80,7 +80,13 @@ export RAYST3R_ROOT=$(realpath ../rayst3r)
 ```
 
 If your RaySt3R checkout does not propagate the selected device into
-`eval_model`, apply `third_party/rayst3r_patches/device_eval.patch`.
+`eval_model`, pin and apply the included inference-only patch:
+
+```bash
+cd /path/to/rayst3r
+git checkout 2c93f81b696909695c6dd5367b81753225b7254e
+git apply /path/to/MGC-6D/third_party/rayst3r_patches/device_eval.patch
+```
 
 ### nvdiffrast (build from source)
 

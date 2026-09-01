@@ -28,6 +28,7 @@ from foundationpose.Utils import (
 )
 from sam2_rayst3r import running_sam_box
 from candidate_selection import derive_anchor_reliability_scores, score_candidates
+from run_metadata import collect_source_revision
 
 
 OBJ_NUM_MAP = {
@@ -462,10 +463,10 @@ def main():
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Pair reverse ICP24 initializations with the exact inverses of the "
-            "forward initializations. Cycle error uses the selected direction's "
-            "hypothesis and the independently optimized reverse result with the "
-            "same index; best-of-two direction selection remains unchanged."
+            "Use inverse-paired deterministic initial hypotheses in the two "
+            "directional ICP searches, then report a reciprocal round trip by "
+            "refining the inverse of the selected transform. Direction selection "
+            "remains best-of-two; cycle values are diagnostic only."
         ),
     )
     parser.add_argument(
@@ -870,6 +871,7 @@ def main():
     )
 
     run_meta = {
+        "source_revision": collect_source_revision(),
         "anchor_folder": input_root,
         "output_root": result_root,
         "ycb_model_path": args.ycb_model_path,
@@ -896,10 +898,16 @@ def main():
             ),
             "icp_hypotheses_per_direction": int(args.icp_multi_hypo),
             "reciprocal_pairing": bool(args.icp_reciprocal_pairing),
-            "cycle_definition": (
-                "matched_inverse_initialization_hypothesis_round_trip"
+            "independent_cycle_definition": (
+                "composition_of_independently_optimized_directional_results"
+            ),
+            "reciprocal_cycle_definition": (
+                "selected_transform_inverse_refinement_round_trip"
                 if args.icp_reciprocal_pairing
-                else "independent_directional_optima"
+                else "not_computed"
+            ),
+            "translation_cycle_definition": (
+                "mean_bidirectional_surface_center_round_trip_displacement_over_diameter"
             ),
         },
         "selection": {

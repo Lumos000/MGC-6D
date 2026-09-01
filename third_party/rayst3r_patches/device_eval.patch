@@ -1,15 +1,17 @@
 diff --git a/eval_wrapper/eval.py b/eval_wrapper/eval.py
+index 28bb7fa..81b4f8c 100644
 --- a/eval_wrapper/eval.py
 +++ b/eval_wrapper/eval.py
-@@
- class EvalWrapper:
-     def __init__(self, checkpoint_path, distributed=False, device="cuda", dtype=torch.float32):
+@@ -27,3 +27,4 @@ class EvalWrapper(torch.nn.Module):
+     def __init__(self,checkpoint_path,distributed=False,device="cuda",dtype=torch.float32,**kwargs):
+         super().__init__()
 +        self.device = device
-         self.dtype = dtype
-@@
--        return eval_model(model, views, ...)
-+        return eval_model(model, views, device=self.device, ...)
-
-# Apply this intent manually if the exact upstream context differs. The
-# required behavior is that the device passed to EvalWrapper is stored and
-# forwarded into eval_model/eval_scene instead of silently defaulting to cuda:0.
+         checkpoint = torch.load(checkpoint_path, map_location='cpu',weights_only=False)
+@@ -41,3 +42,6 @@ class EvalWrapper(torch.nn.Module):
+     def forward(self,x,dino_model=None):
+-        pred, gt, loss, scale = eval_model(self.model,x,mode='viz',dino_model=dino_model,return_scale=True)
++        # Keep batch tensors on the same CUDA device as the model/DINO.
++        pred, gt, loss, scale = eval_model(
++            self.model, x, mode='viz', device=self.device, dino_model=dino_model, return_scale=True
++        )
+         return pred, gt, loss, scale

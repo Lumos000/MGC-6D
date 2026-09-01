@@ -357,6 +357,7 @@ def _icp_registration_hypotheses(
     max_corr_ratio: float,
     max_iter: int,
     init_transforms: Optional[Iterable[np.ndarray]] = None,
+    source_points: Optional[np.ndarray] = None,
 ) -> List[o3d.pipelines.registration.RegistrationResult]:
     if prior_mesh is None or target_points is None or len(target_points) == 0:
         return []
@@ -364,9 +365,12 @@ def _icp_registration_hypotheses(
     if voxel_size and voxel_size > 0:
         target_pcd = target_pcd.voxel_down_sample(voxel_size=voxel_size)
 
-    prior_pcd = _mesh_to_o3d(prior_mesh).sample_points_uniformly(
-        number_of_points=min(50000, len(target_pcd.points))
-    )
+    if source_points is None:
+        prior_pcd = _mesh_to_o3d(prior_mesh).sample_points_uniformly(
+            number_of_points=min(50000, len(target_pcd.points))
+        )
+    else:
+        prior_pcd = _points_to_o3d(np.asarray(source_points, dtype=np.float64))
     if voxel_size and voxel_size > 0:
         prior_pcd = prior_pcd.voxel_down_sample(voxel_size=voxel_size)
 
@@ -2629,7 +2633,7 @@ def _bidirectional_diagnostics(
     mesh_ray: trimesh.Trimesh,
     mesh_inst: trimesh.Trimesh,
     cfg: ReconstructionConfig,
-) -> Dict[str, float | bool]:
+) -> Dict[str, float | bool | str]:
     """Report strict-both validity and transform cycle consistency.
 
     The translation cycle error is normalized by the larger candidate bbox
@@ -2658,19 +2662,53 @@ def _bidirectional_diagnostics(
     )
     rotation_deg = float("nan")
     translation_norm = float("nan")
+    raw_translation_norm = float("nan")
     if reg_inst_to_ray is not None and reg_ray_to_inst is not None:
-        cycle = (
-            np.asarray(reg_inst_to_ray.transformation, dtype=np.float64)
-            @ np.asarray(reg_ray_to_inst.transformation, dtype=np.float64)
+        transform_inst_to_ray = np.asarray(
+            reg_inst_to_ray.transformation, dtype=np.float64
         )
-        cos_angle = np.clip((np.trace(cycle[:3, :3]) - 1.0) * 0.5, -1.0, 1.0)
+        transform_ray_to_inst = np.asarray(
+            reg_ray_to_inst.transformation, dtype=np.float64
+        )
+        cycle_ray = (
+            transform_inst_to_ray @ transform_ray_to_inst
+        )
+        cycle_inst = transform_ray_to_inst @ transform_inst_to_ray
+        cos_angle = np.clip(
+            (np.trace(cycle_ray[:3, :3]) - 1.0) * 0.5, -1.0, 1.0
+        )
         rotation_deg = float(np.degrees(np.arccos(cos_angle)))
         diameter = max(
             float(np.linalg.norm(np.asarray(mesh_ray.extents, dtype=np.float64))),
             float(np.linalg.norm(np.asarray(mesh_inst.extents, dtype=np.float64))),
             1e-8,
         )
-        translation_norm = float(np.linalg.norm(cycle[:3, 3]) / diameter)
+        # Both reconstructed surfaces currently live in anchor-camera
+        # coordinates, not object-centred coordinates.  The raw translation
+        # column of a non-identity cycle therefore depends on the arbitrary
+        # camera origin.  Measure the actual round-trip displacement of each
+        # surface centre and average the two directions instead.
+        ray_center = np.asarray(mesh_ray.vertices, dtype=np.float64).mean(axis=0)
+        inst_center = np.asarray(mesh_inst.vertices, dtype=np.float64).mean(axis=0)
+        ray_displacement = (
+            cycle_ray[:3, :3] @ ray_center + cycle_ray[:3, 3] - ray_center
+        )
+        inst_displacement = (
+            cycle_inst[:3, :3] @ inst_center + cycle_inst[:3, 3] - inst_center
+        )
+        translation_norm = float(
+            0.5
+            * (np.linalg.norm(ray_displacement) + np.linalg.norm(inst_displacement))
+            / diameter
+        )
+        raw_translation_norm = float(
+            0.5
+            * (
+                np.linalg.norm(cycle_ray[:3, 3])
+                + np.linalg.norm(cycle_inst[:3, 3])
+            )
+            / diameter
+        )
     return {
         "inst_to_ray_fitness": inst_fitness,
         "inst_to_ray_rmse": inst_rmse,
@@ -2681,6 +2719,10 @@ def _bidirectional_diagnostics(
         "strict_both_pass": bool(inst_pass and ray_pass),
         "cycle_rotation_deg": rotation_deg,
         "cycle_translation_normalized": translation_norm,
+        "cycle_translation_raw_column_normalized": raw_translation_norm,
+        "cycle_translation_definition": (
+            "mean_bidirectional_surface_center_round_trip_displacement_over_diameter"
+        ),
     }
 
 
@@ -2695,14 +2737,14 @@ def _reciprocal_cycle_diagnostics(
     reference_direction: str,
     hypothesis_index: Optional[int],
 ) -> Dict[str, float | bool | str]:
-    """Measure a round trip using a genuinely reciprocal ICP pair.
+    """Measure a round trip without changing the main best-of-two search.
 
-    The two best ICP24 results may occupy different symmetry basins. Multiplying
-    those independent optima is useful as an audit, but it is not a reciprocal
-    cycle for either estimate. The reported cycle instead uses the main
-    direction's best hypothesis and the independently optimized reverse result
-    whose initialization was the exact inverse of that same indexed hypothesis.
-    No cycle term is used to select the pair or the winning direction.
+    The independently optimized directional results define both the disclosed
+    best-of-two decision and the strict-both ablation.  For cycle reporting only,
+    the selected transform is inverted and refined once in the reverse direction.
+    This produces a true round trip for the selected estimate while preventing a
+    reviewer diagnostic from silently changing either directional ICP optimum.
+    No cycle term is used to select a direction or admit a fused candidate.
     """
 
     independent = _bidirectional_diagnostics(
@@ -2712,12 +2754,13 @@ def _reciprocal_cycle_diagnostics(
         mesh_inst,
         cfg,
     )
-    diagnostics: Dict[str, float | bool | str] = {
-        f"independent_{key}": value for key, value in independent.items()
-    }
+    diagnostics: Dict[str, float | bool | str] = dict(independent)
+    diagnostics.update(
+        {f"independent_{key}": value for key, value in independent.items()}
+    )
     diagnostics.update(
         {
-            "cycle_pairing_mode": "matched_inverse_initialization_hypothesis",
+            "cycle_pairing_mode": "selected_transform_inverse_refinement",
             "cycle_reference_direction": str(reference_direction),
             "cycle_hypothesis_index": (
                 int(hypothesis_index) if hypothesis_index is not None else -1
@@ -2728,7 +2771,22 @@ def _reciprocal_cycle_diagnostics(
     reciprocal = _bidirectional_diagnostics(
         paired_inst_to_ray, paired_ray_to_inst, mesh_ray, mesh_inst, cfg
     )
-    diagnostics.update(reciprocal)
+    # Keep the main directional pass/fail fields and strict-both result tied to
+    # the independently optimized searches.  Only the cycle values come from
+    # the selected-transform round trip.
+    diagnostics["cycle_rotation_deg"] = reciprocal["cycle_rotation_deg"]
+    diagnostics["cycle_translation_normalized"] = reciprocal[
+        "cycle_translation_normalized"
+    ]
+    diagnostics["cycle_translation_raw_column_normalized"] = reciprocal[
+        "cycle_translation_raw_column_normalized"
+    ]
+    diagnostics["cycle_translation_definition"] = reciprocal[
+        "cycle_translation_definition"
+    ]
+    diagnostics.update(
+        {f"reciprocal_{key}": value for key, value in reciprocal.items()}
+    )
     diagnostics["reciprocal_reverse_valid"] = bool(
         _is_valid_reg(paired_ray_to_inst)
         if reference_direction == "inst_to_ray"
@@ -2927,6 +2985,10 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
                 chosen_mesh_inst = mesh_inst
                 mesh_fused = mesh_ray
             elif obj_cfg.align_bidirectional_icp:
+                # Build paired initializations for the two directional ICP
+                # searches. Each direction is still optimized and selected
+                # independently; pairing only makes the hypothesis bank
+                # deterministic and comparable in both directions.
                 reciprocal_inst_inits = None
                 reciprocal_ray_inits = None
                 if obj_cfg.icp_reciprocal_pairing:
@@ -2936,17 +2998,10 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
                         obj_cfg.icp_multi_hypo,
                         obj_cfg.icp_init_sigma,
                     )
-                    # Each reverse-direction hypothesis is the exact inverse
-                    # of the corresponding InstantMesh-to-RaySt3R hypothesis.
-                    # The two ICP searches can still converge differently;
-                    # best-of-two remains the disclosed final selection rule.
                     reciprocal_ray_inits = [
                         np.linalg.inv(init) for init in reciprocal_inst_inits
                     ]
-                inst_registrations = []
-                ray_registrations = []
-                inst_best_index = None
-                ray_best_index = None
+
                 if obj_cfg.icp_reciprocal_pairing:
                     inst_registrations = _icp_registration_hypotheses(
                         mesh_inst,
@@ -2956,7 +3011,7 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
                         obj_cfg.icp_max_iter,
                         reciprocal_inst_inits,
                     )
-                    reg_inst, inst_best_index = _select_best_icp_registration(
+                    reg_inst, _ = _select_best_icp_registration(
                         inst_registrations, obj_cfg.icp_fitness_threshold
                     )
                     mesh_inst_aligned = _mesh_with_registration(mesh_inst, reg_inst)
@@ -2972,7 +3027,7 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
                         obj_cfg.icp_max_iter,
                         reciprocal_ray_inits,
                     )
-                    reg_ray, ray_best_index = _select_best_icp_registration(
+                    reg_ray, _ = _select_best_icp_registration(
                         ray_registrations, obj_cfg.icp_fitness_threshold
                     )
                     mesh_ray_aligned = _mesh_with_registration(mesh_ray, reg_ray)
@@ -2991,24 +3046,49 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
                     "inst_to_ray" if score_inst >= score_ray else "ray_to_inst"
                 )
                 if obj_cfg.icp_reciprocal_pairing:
+                    paired_inst = None
+                    paired_ray = None
                     if reference_direction == "inst_to_ray":
-                        cycle_hypothesis_index = inst_best_index
                         paired_inst = reg_inst_initial
-                        paired_ray = (
-                            ray_registrations[inst_best_index]
-                            if inst_best_index is not None
-                            and inst_best_index < len(ray_registrations)
-                            else None
-                        )
+                        if _is_valid_reg(reg_inst_initial):
+                            instant_target_points, _ = trimesh.sample.sample_surface(
+                                mesh_inst,
+                                obj_cfg.sample_points,
+                                seed=int(object_seed + 101),
+                            )
+                            ray_source_points, _ = trimesh.sample.sample_surface(
+                                mesh_ray,
+                                min(50000, len(instant_target_points)),
+                                seed=int(object_seed + 102),
+                            )
+                            reverse = _icp_registration_hypotheses(
+                                mesh_ray,
+                                instant_target_points,
+                                obj_cfg.icp_voxel_size,
+                                obj_cfg.icp_max_corr_ratio,
+                                obj_cfg.icp_max_iter,
+                                [np.linalg.inv(reg_inst_initial.transformation)],
+                                source_points=ray_source_points,
+                            )
+                            paired_ray = reverse[0] if reverse else None
                     else:
-                        cycle_hypothesis_index = ray_best_index
-                        paired_inst = (
-                            inst_registrations[ray_best_index]
-                            if ray_best_index is not None
-                            and ray_best_index < len(inst_registrations)
-                            else None
-                        )
                         paired_ray = reg_ray_initial
+                        if _is_valid_reg(reg_ray_initial):
+                            inst_source_points, _ = trimesh.sample.sample_surface(
+                                mesh_inst,
+                                min(50000, len(points)),
+                                seed=int(object_seed + 103),
+                            )
+                            reverse = _icp_registration_hypotheses(
+                                mesh_inst,
+                                points,
+                                obj_cfg.icp_voxel_size,
+                                obj_cfg.icp_max_corr_ratio,
+                                obj_cfg.icp_max_iter,
+                                [np.linalg.inv(reg_ray_initial.transformation)],
+                                source_points=inst_source_points,
+                            )
+                            paired_inst = reverse[0] if reverse else None
                     bidirectional_diag = _reciprocal_cycle_diagnostics(
                         reg_inst_initial,
                         reg_ray_initial,
@@ -3018,7 +3098,7 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
                         mesh_inst,
                         obj_cfg,
                         reference_direction,
-                        cycle_hypothesis_index,
+                        None,
                     )
                 else:
                     bidirectional_diag = _bidirectional_diagnostics(
