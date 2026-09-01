@@ -128,7 +128,6 @@ def main() -> None:
         if int(coverage.get("evaluated_query_frames", -1)) != len(evaluated):
             raise RuntimeError("Coverage count differs from the saved frame table")
 
-    source = manifest.get("source_revision", {})
     report = {
         "result_dir": str(root),
         "evaluated_frames": int(len(evaluated)),
@@ -138,7 +137,6 @@ def main() -> None:
         "weighted_argmax_mismatches": 0,
         "audit_columns": [],
         "coverage": coverage,
-        "source_revision": source,
     }
     print(json.dumps(report, indent=2))
 

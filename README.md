@@ -151,9 +151,9 @@ bash scripts/run_ho3d_query.sh
 ```
 
 Outputs are written below `results/ho3d_results/$QUERY_NAME/`. Every run saves
-the CLI configuration, source commit and dirty-state information, per-candidate
-Eq. (22) components, selected candidate, aggregate metrics, and evaluation
-coverage. No `Audit_*` or per-candidate GT metric is computed before selection.
+the CLI configuration, per-candidate Eq. (22) components, selected candidate,
+aggregate metrics, and evaluation coverage. No `Audit_*` or per-candidate GT
+metric is computed before selection.
 
 Validate a completed result folder with:
 

@@ -50,7 +50,6 @@ from candidate_selection import (
     parse_candidate_labels,
     score_candidates,
 )
-from run_metadata import collect_source_revision
 
 
 def _load_anchor_depth_meters(path: str, depth_unit: str) -> np.ndarray:
@@ -580,7 +579,6 @@ if __name__ == "__main__":
     os.makedirs(save_results_est_path, exist_ok=True)
 
     run_manifest = {
-        "source_revision": collect_source_revision(),
         "dataset": "HO3D",
         "mask_source": "precomputed_XMem_query_masks",
         "selection_policy": args.selection_policy,

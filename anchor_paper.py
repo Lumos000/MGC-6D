@@ -28,7 +28,6 @@ from foundationpose.Utils import (
 )
 from sam2_rayst3r import running_sam_box
 from candidate_selection import derive_anchor_reliability_scores, score_candidates
-from run_metadata import collect_source_revision
 
 
 OBJ_NUM_MAP = {
@@ -871,7 +870,6 @@ def main():
     )
 
     run_meta = {
-        "source_revision": collect_source_revision(),
         "anchor_folder": input_root,
         "output_root": result_root,
         "ycb_model_path": args.ycb_model_path,
