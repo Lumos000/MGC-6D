@@ -51,14 +51,10 @@ def _release_cuda_memory():
             torch.cuda.empty_cache()
 
 
-def _stable_trial_seed(
-    global_seed: int,
-    obj: str,
-    label: str,
-    strategy: str,
-    seed_index: int,
-) -> int:
-    key = f"{obj}|{label}|{strategy}|{seed_index}".encode("utf-8")
+def _stable_object_seed(global_seed: int, obj: str, label: str) -> int:
+    """Return the one deterministic registration seed for an object candidate."""
+
+    key = f"{obj}|{label}|single_any6d_coarse_aa".encode("utf-8")
     offset = int.from_bytes(hashlib.sha256(key).digest()[:4], "little")
     return int((int(global_seed) + offset) % (2**31 - 1))
 
@@ -455,8 +451,22 @@ def main():
     parser.add_argument(
         "--icp_multi_hypo",
         type=int,
-        default=1,
-        help="Number of ICP initial hypotheses",
+        default=24,
+        help=(
+            "Number of deterministic ICP initial hypotheses. Values up to 24 "
+            "enumerate proper axis rotations about the object centroid."
+        ),
+    )
+    parser.add_argument(
+        "--icp_reciprocal_pairing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Pair reverse ICP24 initializations with the exact inverses of the "
+            "forward initializations. Cycle error uses the selected direction's "
+            "hypothesis and the independently optimized reverse result with the "
+            "same index; best-of-two direction selection remains unchanged."
+        ),
     )
     parser.add_argument(
         "--icp_init_sigma",
@@ -570,14 +580,43 @@ def main():
     parser.add_argument("--rayst3r_crop_margin_ratio", type=float, default=0.05)
     parser.add_argument("--rayst3r_min_component_area_ratio", type=float, default=0.005)
     parser.add_argument("--rayst3r_target_faces", type=int, default=100000)
+    parser.add_argument(
+        "--fusion_mode",
+        choices=["poisson", "visible_patch"],
+        default="visible_patch",
+        help=(
+            "HO3D main method: preserve the InstantMesh topology and update "
+            "only its RGB-D-supported visible surface from RaySt3R."
+        ),
+    )
     parser.add_argument("--fusion_voxel_size", type=float, default=0.003)
     parser.add_argument("--fusion_sample_points", type=int, default=15000)
-    parser.add_argument("--fusion_poisson_depth", type=int, default=6)
-    parser.add_argument("--fusion_target_faces", type=int, default=20000)
+    parser.add_argument("--fusion_poisson_depth", type=int, default=8)
+    parser.add_argument(
+        "--fusion_target_faces",
+        type=int,
+        default=120000,
+        help="Safety cap metadata; visible_patch keeps the InstantMesh face connectivity.",
+    )
     parser.add_argument("--fusion_density_quantile", type=float, default=0.02)
+    parser.add_argument("--fusion_min_component_area_ratio", type=float, default=0.005)
     parser.add_argument("--fusion_visible_depth_tolerance", type=float, default=0.015)
     parser.add_argument("--fusion_observed_support_ratio", type=float, default=0.08)
     parser.add_argument("--fusion_agreement_ratio", type=float, default=0.025)
+    parser.add_argument("--fusion_min_prior_coverage", type=float, default=0.35)
+    parser.add_argument("--fusion_min_observed_coverage", type=float, default=0.50)
+    parser.add_argument("--fusion_min_extent_ratio", type=float, default=0.65)
+    parser.add_argument("--fusion_max_extent_ratio", type=float, default=1.35)
+    parser.add_argument("--fusion_max_center_offset_ratio", type=float, default=0.15)
+    parser.add_argument(
+        "--fusion_cycle_in_reliability",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Ablation only: use bidirectional cycle confidence in fused reliability. "
+            "The paper main result reports cycle error but does not gate or score with it."
+        ),
+    )
     # --- Observation consistency weights (Eq. 14): s_query ---
     parser.add_argument(
         "--select_depth_weight",
@@ -682,19 +721,14 @@ def main():
         help="Comma-separated HO3D object names to process; empty processes all.",
     )
     parser.add_argument(
-        "--anchor_pose_trials",
+        "--anchor_gt_symmetry_ablation",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
-            "Evaluate axis-aligned and non-axis-aligned anchor pose hypotheses "
-            "inside each geometry candidate, retaining only one pose per label."
+            "Ablation only: pass dataset-provided YCB discrete symmetries to "
+            "anchor Any6D registration. Disabled for the paper main protocol, "
+            "which does not use GT object symmetry during estimation."
         ),
-    )
-    parser.add_argument(
-        "--anchor_trials_per_strategy",
-        type=int,
-        default=1,
-        help="Fixed-seed trials per anchor pose strategy.",
     )
     args = parser.parse_args()
     if not 0.0 <= args.anchor_calibration_weight <= 1.0:
@@ -708,8 +742,6 @@ def main():
         raise ValueError("--rayst3r_crop_margin_ratio must be non-negative")
     if not 0.0 <= args.rayst3r_min_component_area_ratio < 1.0:
         raise ValueError("--rayst3r_min_component_area_ratio must lie in [0, 1)")
-    if args.anchor_trials_per_strategy < 1:
-        raise ValueError("--anchor_trials_per_strategy must be at least 1")
     for name in (
         "fusion_voxel_size",
         "fusion_visible_depth_tolerance",
@@ -799,6 +831,7 @@ def main():
         icp_max_iter=args.icp_max_iter,
         icp_fitness_threshold=args.icp_fitness_threshold,
         icp_multi_hypo=args.icp_multi_hypo,
+        icp_reciprocal_pairing=args.icp_reciprocal_pairing,
         icp_init_sigma=args.icp_init_sigma,
         icp_max_corr_ratio=args.icp_max_corr_ratio,
         icp_voxel_size=args.icp_voxel_size,
@@ -806,14 +839,22 @@ def main():
         rayst3r_crop_margin_ratio=args.rayst3r_crop_margin_ratio,
         rayst3r_min_component_area_ratio=args.rayst3r_min_component_area_ratio,
         rayst3r_target_faces=args.rayst3r_target_faces,
+        fusion_mode=args.fusion_mode,
         fusion_voxel_size=args.fusion_voxel_size,
         fusion_sample_points=args.fusion_sample_points,
         fusion_poisson_depth=args.fusion_poisson_depth,
         fusion_target_faces=args.fusion_target_faces,
         fusion_density_quantile=args.fusion_density_quantile,
+        fusion_min_component_area_ratio=args.fusion_min_component_area_ratio,
         fusion_visible_depth_tolerance=args.fusion_visible_depth_tolerance,
         fusion_observed_support_ratio=args.fusion_observed_support_ratio,
         fusion_agreement_ratio=args.fusion_agreement_ratio,
+        fusion_min_prior_coverage=args.fusion_min_prior_coverage,
+        fusion_min_observed_coverage=args.fusion_min_observed_coverage,
+        fusion_min_extent_ratio=args.fusion_min_extent_ratio,
+        fusion_max_extent_ratio=args.fusion_max_extent_ratio,
+        fusion_max_center_offset_ratio=args.fusion_max_center_offset_ratio,
+        fusion_cycle_in_reliability=args.fusion_cycle_in_reliability,
         seed=args.seed,
     )
 
@@ -822,7 +863,11 @@ def main():
     # ====================================================================
     recon_results = run_construction(cfg)
     _release_cuda_memory()
-    model_info = _load_model_info(args.ycb_model_path)
+    model_info = (
+        _load_model_info(args.ycb_model_path)
+        if args.anchor_gt_symmetry_ablation
+        else {}
+    )
 
     run_meta = {
         "anchor_folder": input_root,
@@ -831,7 +876,32 @@ def main():
         "mask_source": "dataset_gt" if not args.refine_mask else "sam2_refined",
         "geometry_units": "meters_after_construction",
         "candidate_canonicalization_scale": 1.0,
-        "reconstruction_method": "current_metric_scale_visible_prior_poisson_phi",
+        "reconstruction_method": (
+            "current_metric_scale_topology_preserving_visible_surface_phi_v5_ray_frame"
+            if args.fusion_mode == "visible_patch"
+            else "current_metric_scale_visible_prior_poisson_phi_v3_ray_frame"
+        ),
+        "anchor_pose_method": "single_any6d_coarse_axis_aligned",
+        "estimation_postprocessing": {
+            "gt_symmetry_adjustment": bool(args.anchor_gt_symmetry_ablation),
+            "paper_main_protocol": bool(not args.anchor_gt_symmetry_ablation),
+        },
+        "bidirectional_alignment": {
+            "selection_rule": "best_of_two",
+            "strict_both_gate": bool(args.align_strict_both),
+            "cycle_role": (
+                "bounded_reliability_ablation"
+                if args.fusion_cycle_in_reliability
+                else "diagnostic_only"
+            ),
+            "icp_hypotheses_per_direction": int(args.icp_multi_hypo),
+            "reciprocal_pairing": bool(args.icp_reciprocal_pairing),
+            "cycle_definition": (
+                "matched_inverse_initialization_hypothesis_round_trip"
+                if args.icp_reciprocal_pairing
+                else "independent_directional_optima"
+            ),
+        },
         "selection": {
             "select_depth_weight": args.select_depth_weight,
             "select_mask_weight": args.select_mask_weight,
@@ -863,7 +933,11 @@ def main():
 
     for obj in tqdm(obj_list, desc="Object"):
         obj_num = OBJ_NUM_MAP.get(obj, -1)
-        symmetry_tfs = _build_symmetry_tfs_for_object(obj, model_info)
+        symmetry_tfs = (
+            _build_symmetry_tfs_for_object(obj, model_info)
+            if args.anchor_gt_symmetry_ablation
+            else None
+        )
         input_obj_dir = os.path.join(input_root, obj)
         obj_dir = os.path.join(result_root, obj)
         os.makedirs(obj_dir, exist_ok=True)
@@ -919,6 +993,7 @@ def main():
                 recon_meta.get("align_fitness", -1.0) >= args.anchor_tau_inlier
                 and recon_meta.get("align_rmse", float("inf")) <= args.anchor_tau_rmse
                 and not bool(fusion_diagnostics.get("fallback_used", False))
+                and bool(fusion_diagnostics.get("output_valid", False))
             )
             if fused_consistency_ok:
                 candidates["fused"] = fused_path
@@ -939,12 +1014,6 @@ def main():
         # Step 3: For each candidate, run Any6D pose registration on anchor
         # image and compute observation consistency score (Eq. 14)
         # ====================================================================
-        trial_strategies = [{"name": "any6d_coarse_aa", "axis_align": True}]
-        if args.anchor_pose_trials:
-            trial_strategies.append(
-                {"name": "any6d_coarse_noaa", "axis_align": False}
-            )
-
         def _evaluate_mesh_pose(mesh_path: str, label: str):
             mesh_local = trimesh.load(mesh_path)
             if isinstance(mesh_local, trimesh.Scene):
@@ -960,129 +1029,72 @@ def main():
             mesh_local = align_mesh_to_coordinate(mesh_local, scale=1.0)
             mesh_local.export(os.path.join(obj_dir, f"center_mesh_{obj}_{label}.obj"))
 
-            best_trial = None
-            trial_records = []
-            for strategy in trial_strategies:
-                for seed_index in range(args.anchor_trials_per_strategy):
-                    trial_seed = _stable_trial_seed(
-                        args.seed, obj, label, strategy["name"], seed_index
-                    )
-                    random.seed(trial_seed)
-                    np.random.seed(trial_seed)
-                    torch.manual_seed(trial_seed)
-                    if torch.cuda.is_available():
-                        torch.cuda.manual_seed_all(trial_seed)
-                    est_local = Any6D(
-                        symmetry_tfs=symmetry_tfs,
-                        mesh=mesh_local.copy(),
-                        debug_dir=obj_dir,
-                        debug=0,
-                    )
-                    try:
-                        pred_pose_local = est_local.register_any6d(
-                            K=intrinsic,
-                            rgb=color,
-                            depth=depth,
-                            ob_mask=mask,
-                            iteration=args.any6d_iter,
-                            refinement=bool(args.any6d_refine),
-                            axis_align=bool(strategy["axis_align"]),
-                            coarse_est=True,
-                            random_seed=trial_seed,
-                            name=f"anchor_{label}_{strategy['name']}_s{seed_index}",
-                        )
-                        l_depth, l_mask, l_geom = _compute_self_supervised_losses(
-                            est=est_local,
-                            depth=depth,
-                            mask=mask,
-                            K=intrinsic,
-                            pred_pose=pred_pose_local,
-                            glctx=glctx,
-                        )
-                    except Exception as exc:
-                        trial_records.append(
-                            {
-                                "strategy": strategy["name"],
-                                "seed_index": int(seed_index),
-                                "random_seed": int(trial_seed),
-                                "valid": False,
-                                "error": f"{type(exc).__name__}: {exc}",
-                            }
-                        )
-                        del est_local
-                        _release_cuda_memory()
-                        continue
+            registration_seed = _stable_object_seed(args.seed, obj, label)
+            random.seed(registration_seed)
+            np.random.seed(registration_seed)
+            torch.manual_seed(registration_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(registration_seed)
+            est_local = Any6D(
+                symmetry_tfs=symmetry_tfs,
+                mesh=mesh_local.copy(),
+                debug_dir=obj_dir,
+                debug=0,
+            )
+            try:
+                pred_pose_local = est_local.register_any6d(
+                    K=intrinsic,
+                    rgb=color,
+                    depth=depth,
+                    ob_mask=mask,
+                    iteration=args.any6d_iter,
+                    refinement=bool(args.any6d_refine),
+                    axis_align=True,
+                    coarse_est=True,
+                    random_seed=registration_seed,
+                    name=f"anchor_{label}_single_aa",
+                )
+                l_depth, l_mask, l_geom = _compute_self_supervised_losses(
+                    est=est_local,
+                    depth=depth,
+                    mask=mask,
+                    K=intrinsic,
+                    pred_pose=pred_pose_local,
+                    glctx=glctx,
+                )
+                registered_mesh = est_local.mesh.copy()
+            except Exception:
+                del est_local
+                _release_cuda_memory()
+                raise
+            del est_local
+            _release_cuda_memory()
 
-                    trial_score = (
-                        args.select_depth_weight
-                        * np.clip(float(l_depth) / args.anchor_depth_scale, 0.0, 1.0)
-                        + args.select_mask_weight
-                        * np.clip(float(l_mask) / args.anchor_mask_scale, 0.0, 1.0)
-                        + args.select_geom_weight
-                        * np.clip(float(l_geom) / args.anchor_geom_scale, 0.0, 1.0)
-                    )
-                    record = {
-                        "strategy": strategy["name"],
-                        "seed_index": int(seed_index),
-                        "random_seed": int(trial_seed),
-                        "axis_align": bool(strategy["axis_align"]),
-                        "valid": True,
-                        "score": float(trial_score),
-                        "l_depth": float(l_depth),
-                        "l_mask": float(l_mask),
-                        "l_geom": float(l_geom),
-                    }
-                    trial_records.append(record)
-                    trial = {
-                        **record,
-                        "pred_pose": np.array(pred_pose_local, copy=True),
-                        "mesh": est_local.mesh.copy(),
-                    }
-                    if best_trial is None or trial["score"] < best_trial["score"]:
-                        best_trial = trial
-                    del est_local
-                    _release_cuda_memory()
-
-            with open(
-                os.path.join(obj_dir, f"{obj}_anchor_trials_{label}.json"),
-                "w",
-                encoding="utf-8",
-            ) as f:
-                json.dump(trial_records, f, indent=2)
-            if best_trial is None:
-                raise RuntimeError(f"No valid anchor pose trial for {obj}/{label}")
-
-            pred_pose_local = best_trial["pred_pose"]
-            best_mesh = best_trial["mesh"]
             np.savetxt(
                 os.path.join(obj_dir, f"{obj}_initial_pose_{label}.txt"),
                 pred_pose_local,
             )
-            best_mesh.export(os.path.join(obj_dir, f"final_mesh_{obj}_{label}.obj"))
+            registered_mesh.export(os.path.join(obj_dir, f"final_mesh_{obj}_{label}.obj"))
             np.savetxt(
                 os.path.join(obj_dir, f"{obj}_ldepth_{label}.txt"),
-                [best_trial["l_depth"]],
+                [l_depth],
             )
             np.savetxt(
                 os.path.join(obj_dir, f"{obj}_lmask_{label}.txt"),
-                [best_trial["l_mask"]],
+                [l_mask],
             )
             np.savetxt(
                 os.path.join(obj_dir, f"{obj}_cd_{label}.txt"),
-                [best_trial["l_geom"]],
+                [l_geom],
             )
             return {
-                "mesh": best_mesh,
+                "mesh": registered_mesh,
                 "pred_pose": pred_pose_local,
-                "l_depth": float(best_trial["l_depth"]),
-                "l_mask": float(best_trial["l_mask"]),
-                "l_geom": float(best_trial["l_geom"]),
-                "anchor_pose_strategy": best_trial["strategy"],
-                "anchor_pose_seed_index": int(best_trial["seed_index"]),
-                "anchor_pose_random_seed": int(best_trial["random_seed"]),
-                "anchor_pose_trial_count": int(
-                    sum(bool(record.get("valid")) for record in trial_records)
-                ),
+                "l_depth": float(l_depth),
+                "l_mask": float(l_mask),
+                "l_geom": float(l_geom),
+                "anchor_pose_method": "single_any6d_coarse_axis_aligned",
+                "anchor_pose_random_seed": int(registration_seed),
             }
 
         results_pose = {}
@@ -1205,8 +1217,8 @@ def main():
             f"S_anchor={s_anchor_scores[chosen_label]:.4f}"
         )
         chamfer_dis = best["l_geom"]
-        # Reuse the selected internal trial exactly.  Re-registering here used
-        # to make the registry pose/mesh differ from the values that won.
+        # Reuse the single registered pose/mesh exactly; do not run an outer
+        # axis-align/no-axis-align selection after candidate scoring.
         best["mesh"].export(os.path.join(obj_dir, f"center_mesh_{obj}.obj"))
         best["mesh"].export(os.path.join(obj_dir, f"final_mesh_{obj}.obj"))
         np.savetxt(
@@ -1227,7 +1239,7 @@ def main():
                 "L_geom": float(chamfer_dis),
                 "S_anchor": float(s_anchor_scores[chosen_label]),
                 "Selection_Score": float(selection_scores.get(chosen_label, float("inf"))),
-                "Anchor_Pose_Strategy": best["anchor_pose_strategy"],
+                "Anchor_Pose_Method": best["anchor_pose_method"],
                 "Anchor_Pose_Random_Seed": best["anchor_pose_random_seed"],
             }
         )
@@ -1254,13 +1266,8 @@ def main():
                 "l_depth": float(results_pose[label]["l_depth"]),
                 "l_mask": float(results_pose[label]["l_mask"]),
                 "l_geom": float(results_pose[label]["l_geom"]),
-                "anchor_pose_strategy": results_pose[label]["anchor_pose_strategy"],
-                "anchor_pose_seed_index": results_pose[label]["anchor_pose_seed_index"],
+                "anchor_pose_method": results_pose[label]["anchor_pose_method"],
                 "anchor_pose_random_seed": results_pose[label]["anchor_pose_random_seed"],
-                "anchor_pose_trial_count": results_pose[label]["anchor_pose_trial_count"],
-                "anchor_pose_trials_path": os.path.abspath(
-                    os.path.join(obj_dir, f"{obj}_anchor_trials_{label}.json")
-                ),
             }
         candidate_registry[obj] = {
             "chosen": chosen_label,
@@ -1278,6 +1285,14 @@ def main():
             "fusion_metadata": recon_meta.get("fusion_diagnostics", {}),
             "bidirectional_metadata": recon_meta.get("bidirectional", {}),
             "alignment_metadata": {
+                "selection_rule": "best_of_two",
+                "strict_both_gate": bool(args.align_strict_both),
+                "reciprocal_pairing": bool(args.icp_reciprocal_pairing),
+                "cycle_role": (
+                    "bounded_reliability_ablation"
+                    if args.fusion_cycle_in_reliability
+                    else "diagnostic_only"
+                ),
                 "direction": recon_meta.get("align_direction"),
                 "fitness": recon_meta.get("align_fitness"),
                 "rmse": recon_meta.get("align_rmse"),

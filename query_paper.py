@@ -52,6 +52,28 @@ from candidate_selection import (
 )
 
 
+def _load_anchor_depth_meters(path: str, depth_unit: str) -> np.ndarray:
+    """Load the copied anchor depth using the construction registry contract."""
+
+    depth = cv2.imread(path, cv2.IMREAD_ANYDEPTH)
+    if depth is None:
+        raise FileNotFoundError(path)
+    depth = depth.astype(np.float32)
+    unit = str(depth_unit or "auto")
+    if unit == "auto":
+        max_value = float(np.nanmax(depth))
+        unit = "rayst3r_uint16" if max_value > 20000 else (
+            "mm" if max_value > 200 else "meters"
+        )
+    if unit == "mm":
+        return depth / 1000.0
+    if unit == "rayst3r_uint16":
+        return depth / 65535.0 * 10.0
+    if unit == "meters":
+        return depth
+    raise ValueError(f"Unsupported anchor depth unit in registry: {unit}")
+
+
 # ---------------------------------------------------------------------------
 # Candidate cache for efficient query (Section 3.4)
 # ---------------------------------------------------------------------------
@@ -449,9 +471,19 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--candidate_color_mode",
-        choices=["native", "prior_transfer", "anchor_projected", "uniform_gray"],
-        default="prior_transfer",
-        help="Use a common disclosed appearance treatment for candidate registration.",
+        choices=[
+            "native",
+            "prior_transfer",
+            "anchor_projected",
+            "anchor_prior_hybrid",
+            "uniform_gray",
+        ],
+        default="anchor_prior_hybrid",
+        help=(
+            "Common disclosed appearance treatment. anchor_prior_hybrid first "
+            "transfers the InstantMesh prior appearance and then overwrites only "
+            "RGB-D-visible vertices with anchor RGB."
+        ),
     )
     parser.add_argument("--include_fallback_candidate", action=argparse.BooleanOptionalAction,
                         default=False,
@@ -486,14 +518,22 @@ if __name__ == "__main__":
     parser.add_argument(
         "--symmetry_consistency_enable",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Resolve pose branch by discrete symmetry to reduce frame-to-frame jumps.",
+        default=False,
+        help=(
+            "Ablation only: use dataset-provided discrete symmetries and the previous "
+            "query prediction to reduce frame-to-frame jumps. Disabled for the "
+            "paper main protocol because query pairs are evaluated independently."
+        ),
     )
     parser.add_argument(
         "--anchor_symmetry_align",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Align pred_pose_q to anchor symmetry state before pose transfer.",
+        default=False,
+        help=(
+            "Ablation only: align the query prediction to a dataset-provided anchor "
+            "symmetry branch. Disabled for the paper main protocol; GT symmetry "
+            "metadata is otherwise used only by symmetry-aware evaluation metrics."
+        ),
     )
 
     args = parser.parse_args()
@@ -550,6 +590,18 @@ if __name__ == "__main__":
         "pose_confidence_role": (
             "diagnostic_only" if float(args.w_pose) == 0.0 else "selection_ablation"
         ),
+        "estimation_postprocessing": {
+            "gt_symmetry_adjustment": bool(args.anchor_symmetry_align),
+            "cross_frame_symmetry_smoothing": bool(args.symmetry_consistency_enable),
+            "paper_main_protocol": bool(
+                not args.anchor_symmetry_align
+                and not args.symmetry_consistency_enable
+            ),
+            "gt_symmetry_evaluation_only": bool(
+                not args.anchor_symmetry_align
+                and not args.symmetry_consistency_enable
+            ),
+        },
         "normalization": {
             "anchor": "S_anchor / max_j(S_anchor_j) per query frame",
             "query_losses": args.query_loss_normalization,
@@ -572,6 +624,25 @@ if __name__ == "__main__":
             "candidate_color_mode": args.candidate_color_mode,
             "external_obs_candidate": bool(args.obs_anchor_path),
             "legacy_fallback_candidate": bool(args.include_fallback_candidate),
+        },
+        "evaluation_protocol": {
+            "reference": "taeyeopl/Any6D@80eb4866a1c96ecb18be18836aba4f4bd6e80e9e",
+            "add": "mean corresponding-point distance <= 0.1*object_diameter",
+            "adds": "mean nearest-neighbor distance <= 0.1*object_diameter",
+            "mssd_thresholds_diameter": [
+                0.05, 0.10, 0.15, 0.20, 0.25,
+                0.30, 0.35, 0.40, 0.45, 0.50,
+            ],
+            "mspd_thresholds_px": [5, 10, 15, 20, 25, 30, 35, 40, 45, 50],
+            "vsd_delta_mm": 15.0,
+            "vsd_taus": [
+                0.05, 0.10, 0.15, 0.20, 0.25,
+                0.30, 0.35, 0.40, 0.45, 0.50,
+            ],
+            "ar": "mean(MSSD_recall, MSPD_recall, VSD_recall)",
+            "primary_aggregation": "macro mean over the 13 HO3D sequences",
+            "secondary_aggregation": "frame-weighted mean, saved separately",
+            "add_adds_precision": "float64 stability fix; metric definition unchanged",
         },
         "args": vars(args),
     }
@@ -767,7 +838,8 @@ if __name__ == "__main__":
         if registry_meshes:
             anchor_rgb = None
             anchor_mask = None
-            if args.candidate_color_mode == "anchor_projected":
+            anchor_depth = None
+            if args.candidate_color_mode in {"anchor_projected", "anchor_prior_hybrid"}:
                 obj_anchor_dir = os.path.join(anchor_path, obj_name)
                 anchor_bgr = cv2.imread(os.path.join(obj_anchor_dir, "color.png"))
                 anchor_mask = cv2.imread(
@@ -775,9 +847,15 @@ if __name__ == "__main__":
                 )
                 if anchor_bgr is None or anchor_mask is None:
                     raise FileNotFoundError(
-                        f"anchor_projected requires color.png and mask.png in {obj_anchor_dir}"
+                        f"{args.candidate_color_mode} requires color.png and mask.png "
+                        f"in {obj_anchor_dir}"
                     )
                 anchor_rgb = cv2.cvtColor(anchor_bgr, cv2.COLOR_BGR2RGB)
+                depth_path = os.path.join(obj_anchor_dir, "depth.png")
+                anchor_depth = _load_anchor_depth_meters(
+                    depth_path,
+                    obj_registry.get("scale_metadata", {}).get("depth_unit", "auto"),
+                )
             registry_meshes, appearance_summary = apply_candidate_appearance(
                 registry_meshes,
                 cand_anchor_poses,
@@ -785,11 +863,13 @@ if __name__ == "__main__":
                 anchor_rgb=anchor_rgb,
                 anchor_mask=anchor_mask,
                 anchor_k=K_anchor if anchor_rgb is not None else None,
+                anchor_depth=anchor_depth,
             )
             print(
                 f"{obj_f}: appearance={appearance_summary.mode}, "
                 f"source={appearance_summary.source_label}, "
-                f"transferred={list(appearance_summary.transferred_labels)}"
+                f"transferred={list(appearance_summary.transferred_labels)}, "
+                f"anchor_projected={dict(appearance_summary.projected_vertex_counts)}"
             )
             for label, cand_mesh in registry_meshes.items():
                 score_row = anchor_score_by_label[label]
@@ -982,9 +1062,6 @@ if __name__ == "__main__":
                 else:
                     l_depth, l_mask, l_geom = 1.0, 1.0, 1.0
 
-                cand_err_r, cand_err_t = compute_RT_distances(pred_q_k, gt_pose_q)
-                cand_add = compute_add(gt_mesh.vertices, pred_q_k, gt_pose_q)
-                cand_adds = compute_adds(gt_mesh.vertices, pred_q_k, gt_pose_q)
                 anchor_info = obj_candidate_info_by_label.get(cache.label, {})
 
                 candidate_results.append({
@@ -1011,10 +1088,6 @@ if __name__ == "__main__":
                     "l_depth_norm": 1.0,
                     "l_mask_norm": 1.0,
                     "l_geom_norm": 1.0,
-                    "audit_add": float(cand_add <= gt_diameter * 0.1),
-                    "audit_adds": float(cand_adds <= gt_diameter * 0.1),
-                    "audit_r_error": float(np.asarray(cand_err_r).reshape(-1)[0]),
-                    "audit_t_error": float(np.asarray(cand_err_t).reshape(-1)[0]),
                 })
 
             if len(eval_caches) > 1 and args.per_frame_selection:
@@ -1089,10 +1162,6 @@ if __name__ == "__main__":
                     "Pose_Score_Raw": float(result["pose_score"]),
                     "Pose_Score_Norm": float(result["pose_score_norm"]),
                     "Selection_Score": float(result["selection_score"]),
-                    "Audit_ADD-S": float(result["audit_adds"]),
-                    "Audit_ADD": float(result["audit_add"]),
-                    "Audit_R_Error": float(result["audit_r_error"]),
-                    "Audit_T_Error": float(result["audit_t_error"]),
                 })
 
             # Swap the winning candidate back for visualization

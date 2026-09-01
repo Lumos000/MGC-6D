@@ -78,11 +78,20 @@ class Any6D:
         if hasattr(self, "_reset_cache") and mesh_id in self._reset_cache:
             cache = self._reset_cache[mesh_id]
             self.model_center = cache['model_center']
+            self.mesh = cache['mesh']
             self.mesh_o3d = cache['mesh_o3d']
             self.diameter = cache['diameter']
             self.vox_size = cache['vox_size']
+            self.dist_bin = cache['dist_bin']
+            self.angle_bin = cache['angle_bin']
             self.mesh_tensors = cache['mesh_tensors']
             self.symmetry_tfs = cache['symmetry_tfs']
+            def lazy_make_mesh_tensors():
+                if self.mesh_tensors is None:
+                    self.mesh_tensors = make_mesh_tensors(self.mesh)
+                    cache['mesh_tensors'] = self.mesh_tensors
+                return self.mesh_tensors
+            self.make_mesh_tensors_lazy = lazy_make_mesh_tensors
             return
 
         # ========= 2. 初始化缓存容器 =========
@@ -143,6 +152,9 @@ class Any6D:
         def lazy_make_mesh_tensors():
             if self.mesh_tensors is None:
                 self.mesh_tensors = make_mesh_tensors(self.mesh)
+                cache = getattr(self, "_reset_cache", {}).get(mesh_id)
+                if cache is not None:
+                    cache['mesh_tensors'] = self.mesh_tensors
             return self.mesh_tensors
         self.make_mesh_tensors_lazy = lazy_make_mesh_tensors
 
@@ -155,9 +167,12 @@ class Any6D:
         # ========= 10. 缓存结果以加速后续调用 =========
         self._reset_cache[mesh_id] = {
             'model_center': self.model_center,
+            'mesh': self.mesh,
             'mesh_o3d': mesh_o3d,
             'diameter': self.diameter,
             'vox_size': self.vox_size,
+            'dist_bin': self.dist_bin,
+            'angle_bin': self.angle_bin,
             'mesh_tensors': self.mesh_tensors,
             'symmetry_tfs': self.symmetry_tfs
         }

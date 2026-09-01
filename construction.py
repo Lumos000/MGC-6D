@@ -66,6 +66,7 @@ class ReconstructionConfig:
     icp_max_iter: int = 50
     icp_fitness_threshold: float = 0.05
     icp_multi_hypo: int = 1
+    icp_reciprocal_pairing: bool = False
     icp_init_sigma: float = 0.01
     icp_max_corr_ratio: float = 0.05  # fraction of rayst3r bbox diag
     icp_voxel_size: float = 0.005
@@ -88,8 +89,20 @@ class ReconstructionConfig:
     fusion_min_extent_ratio: float = 0.65
     fusion_max_extent_ratio: float = 1.35
     fusion_max_center_offset_ratio: float = 0.15
+    fusion_max_update_ratio: float = 0.04
+    fusion_min_normal_cosine: float = 0.15
+    fusion_smooth_iterations: int = 3
+    fusion_global_scale_min: float = 0.88
+    fusion_global_scale_max: float = 1.12
     fusion_cycle_in_reliability: bool = True
     rgbd_scale_recovery: bool = False
+    rgbd_scale_visible_sim3: bool = False
+    rgbd_scale_min_margin: float = 0.002
+    rgbd_scale_min_reciprocal_fraction: float = 0.0
+    rgbd_scale_silhouette_weight: float = 0.0
+    rgbd_scale_min_silhouette_quality: float = 0.0
+    rgbd_scale_ambiguity_fallback: bool = False
+    rgbd_scale_sim3_iterations: int = 5
     rgbd_scale_grid_steps: int = 9
     rgbd_scale_multiplier_min: float = 0.65
     rgbd_scale_multiplier_max: float = 1.35
@@ -285,6 +298,20 @@ def _set_object_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _proper_axis_rotations() -> List[np.ndarray]:
+    """Return the 24 deterministic proper signed-axis rotations."""
+
+    rotations: List[np.ndarray] = []
+    for permutation in itertools.permutations(range(3)):
+        for signs in itertools.product((-1.0, 1.0), repeat=3):
+            rotation = np.zeros((3, 3), dtype=np.float64)
+            rotation[np.arange(3), permutation] = signs
+            if np.linalg.det(rotation) > 0.5:
+                rotations.append(rotation)
+    rotations.sort(key=lambda rotation: float(np.linalg.norm(rotation - np.eye(3))))
+    return rotations
+
+
 def _build_icp_inits(
     source_center: np.ndarray,
     target_center: np.ndarray,
@@ -306,14 +333,7 @@ def _build_icp_inits(
     # every transform rotates about the source centroid and maps it to the
     # target centroid.  This is still one ICP alignment stage, not an extra
     # geometry candidate.
-    rotations = []
-    for permutation in itertools.permutations(range(3)):
-        for signs in itertools.product((-1.0, 1.0), repeat=3):
-            rotation = np.zeros((3, 3), dtype=np.float64)
-            rotation[np.arange(3), permutation] = signs
-            if np.linalg.det(rotation) > 0.5:
-                rotations.append(rotation)
-    rotations.sort(key=lambda rotation: float(np.linalg.norm(rotation - np.eye(3))))
+    rotations = _proper_axis_rotations()
 
     rng = np.random.RandomState(0)
     inits = []
@@ -330,17 +350,16 @@ def _build_icp_inits(
     return inits
 
 
-def _icp_align_prior(
+def _icp_registration_hypotheses(
     prior_mesh: trimesh.Trimesh,
     target_points: np.ndarray,
     voxel_size: float,
     max_corr_ratio: float,
     max_iter: int,
-    fitness_threshold: float,
     init_transforms: Optional[Iterable[np.ndarray]] = None,
-) -> Tuple[Optional[trimesh.Trimesh], Optional[o3d.pipelines.registration.RegistrationResult]]:
+) -> List[o3d.pipelines.registration.RegistrationResult]:
     if prior_mesh is None or target_points is None or len(target_points) == 0:
-        return None, None
+        return []
     target_pcd = _points_to_o3d(target_points)
     if voxel_size and voxel_size > 0:
         target_pcd = target_pcd.voxel_down_sample(voxel_size=voxel_size)
@@ -367,7 +386,7 @@ def _icp_align_prior(
     if init_transforms is None:
         init_transforms = [np.eye(4, dtype=np.float64)]
 
-    best_reg = None
+    registrations = []
     for init in init_transforms:
         reg = o3d.pipelines.registration.registration_icp(
             prior_pcd,
@@ -377,20 +396,65 @@ def _icp_align_prior(
             estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
             criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=max_iter),
         )
-        if best_reg is None:
-            best_reg = reg
-        else:
-            if (reg.fitness > best_reg.fitness) or (
-                reg.fitness == best_reg.fitness and reg.inlier_rmse < best_reg.inlier_rmse
-            ):
-                best_reg = reg
+        registrations.append(reg)
+    return registrations
 
-    if best_reg is None or (not best_reg.fitness) or best_reg.fitness < fitness_threshold:
+
+def _select_best_icp_registration(
+    registrations: Iterable[o3d.pipelines.registration.RegistrationResult],
+    fitness_threshold: float,
+) -> Tuple[Optional[o3d.pipelines.registration.RegistrationResult], Optional[int]]:
+    registrations = list(registrations)
+    if not registrations:
         return None, None
+    best_index = max(
+        range(len(registrations)),
+        key=lambda index: (
+            float(registrations[index].fitness),
+            -float(registrations[index].inlier_rmse),
+        ),
+    )
+    best_reg = registrations[best_index]
+    if (not best_reg.fitness) or best_reg.fitness < fitness_threshold:
+        return None, best_index
+    return best_reg, best_index
 
+
+def _mesh_with_registration(
+    prior_mesh: trimesh.Trimesh,
+    registration: Optional[o3d.pipelines.registration.RegistrationResult],
+) -> Optional[trimesh.Trimesh]:
+    if registration is None:
+        return None
     prior_mesh_aligned = prior_mesh.copy()
-    prior_mesh_aligned.apply_transform(best_reg.transformation)
-    return prior_mesh_aligned, best_reg
+    prior_mesh_aligned.apply_transform(registration.transformation)
+    return prior_mesh_aligned
+
+
+def _icp_align_prior(
+    prior_mesh: trimesh.Trimesh,
+    target_points: np.ndarray,
+    voxel_size: float,
+    max_corr_ratio: float,
+    max_iter: int,
+    fitness_threshold: float,
+    init_transforms: Optional[Iterable[np.ndarray]] = None,
+) -> Tuple[Optional[trimesh.Trimesh], Optional[o3d.pipelines.registration.RegistrationResult]]:
+    registrations = _icp_registration_hypotheses(
+        prior_mesh,
+        target_points,
+        voxel_size,
+        max_corr_ratio,
+        max_iter,
+        init_transforms,
+    )
+    best_reg, _ = _select_best_icp_registration(
+        registrations, fitness_threshold
+    )
+
+    if best_reg is None:
+        return None, None
+    return _mesh_with_registration(prior_mesh, best_reg), best_reg
 
 
 def _rayst3r_reconstruct(
@@ -553,9 +617,14 @@ def _prepare_instantmesh_metric_frame(
         else np.asarray(ray_points, dtype=np.float64).mean(axis=0)
     )
     source_center = np.asarray(prepared.vertices, dtype=np.float64).mean(axis=0)
-    prepared.apply_translation(target_center - source_center)
+    translation = target_center - source_center
+    prepared.apply_translation(translation)
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] *= float(scale)
+    transform[:3, 3] = np.asarray(translation, dtype=np.float64)
     prepared.metadata = dict(getattr(prepared, "metadata", {}) or {})
     prepared.metadata["instantmesh_metric_scale"] = float(scale)
+    prepared.metadata["instantmesh_metric_transform"] = transform.tolist()
     return prepared
 
 
@@ -579,6 +648,435 @@ def _robust_pixel_bounds(mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     return lo, np.maximum(hi, lo + 1.0)
 
 
+def _projected_silhouette_quality(
+    points: np.ndarray,
+    mask: np.ndarray,
+    intrinsic: np.ndarray,
+) -> Tuple[float, float, float]:
+    """Compare a complete hypothesis projection with the observed silhouette.
+
+    Visible-surface distance alone can reward an oversized completion because
+    only the subset falling inside the anchor mask participates in the fit.
+    This GT-free check uses the full projected hypothesis and therefore exposes
+    scale/translation solutions that explain the visible patch while violating
+    the observed image extent.
+    """
+
+    points = np.asarray(points, dtype=np.float64)
+    if len(points) < 20:
+        return 0.0, 0.0, float("inf")
+    z = points[:, 2]
+    valid = np.isfinite(points).all(axis=1) & (z > 1e-6)
+    if int(valid.sum()) < 20:
+        return 0.0, 0.0, float("inf")
+    projected = (np.asarray(intrinsic, dtype=np.float64).reshape(3, 3) @ points[valid].T).T
+    uv = projected[:, :2] / z[valid, None]
+    uv = uv[np.isfinite(uv).all(axis=1)]
+    if len(uv) < 20:
+        return 0.0, 0.0, float("inf")
+
+    obs_lo, obs_hi = _robust_pixel_bounds(mask)
+    obs_size = np.maximum(obs_hi - obs_lo, 1.0)
+    obs_center = 0.5 * (obs_lo + obs_hi)
+    pred_lo = np.quantile(uv, 0.01, axis=0)
+    pred_hi = np.quantile(uv, 0.99, axis=0)
+    pred_size = np.maximum(pred_hi - pred_lo, 1.0)
+    pred_center = 0.5 * (pred_lo + pred_hi)
+    size_error = float(np.mean(np.abs(np.log(pred_size / obs_size))))
+    center_error = float(np.linalg.norm((pred_center - obs_center) / obs_size))
+    quality = float(np.exp(-size_error - 0.5 * center_error))
+
+    h, w = np.asarray(mask).shape[:2]
+    pixels = np.rint(uv).astype(np.int64)
+    inside = (
+        (pixels[:, 0] >= 0)
+        & (pixels[:, 0] < w)
+        & (pixels[:, 1] >= 0)
+        & (pixels[:, 1] < h)
+    )
+    supported = np.zeros(len(pixels), dtype=bool)
+    if np.any(inside):
+        supported[inside] = np.asarray(mask, dtype=bool)[
+            pixels[inside, 1], pixels[inside, 0]
+        ]
+    projected_mask_support = float(np.mean(supported))
+    return quality, projected_mask_support, size_error
+
+
+def _umeyama_similarity(source: np.ndarray, target: np.ndarray) -> Optional[np.ndarray]:
+    """Least-squares Sim(3) estimate for paired 3-D points."""
+
+    source = np.asarray(source, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    if len(source) < 3 or source.shape != target.shape:
+        return None
+    source_mean = source.mean(axis=0)
+    target_mean = target.mean(axis=0)
+    source_zero = source - source_mean
+    target_zero = target - target_mean
+    variance = float(np.mean(np.sum(source_zero * source_zero, axis=1)))
+    if not np.isfinite(variance) or variance <= 1e-12:
+        return None
+    covariance = target_zero.T @ source_zero / float(len(source))
+    try:
+        u, singular, vt = np.linalg.svd(covariance)
+    except np.linalg.LinAlgError:
+        return None
+    correction = np.eye(3, dtype=np.float64)
+    if np.linalg.det(u @ vt) < 0.0:
+        correction[-1, -1] = -1.0
+    rotation = u @ correction @ vt
+    scale = float(np.sum(singular * np.diag(correction)) / variance)
+    if not np.isfinite(scale) or scale <= 1e-8:
+        return None
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = scale * rotation
+    transform[:3, 3] = target_mean - scale * rotation @ source_mean
+    return transform
+
+
+def _similarity_scale(transform: np.ndarray) -> float:
+    linear = np.asarray(transform, dtype=np.float64)[:3, :3]
+    determinant = float(np.linalg.det(linear))
+    return float(np.cbrt(max(determinant, 1e-24)))
+
+
+def _visible_surface_sim3_scale_recovery(
+    mesh: trimesh.Trimesh,
+    depth: np.ndarray,
+    mask: np.ndarray,
+    intrinsic: np.ndarray,
+    cfg: ReconstructionConfig,
+    label: str,
+) -> Tuple[trimesh.Trimesh, np.ndarray, Dict[str, float | int | str | bool]]:
+    """Robustly align the generated visible surface to anchor RGB-D by Sim(3).
+
+    The fit uses only front-most mesh samples projected inside the GT anchor
+    mask. Correspondences are reciprocal whenever enough mutual pairs exist,
+    then MAD-filtered before a closed-form Umeyama update. The 24 rotations are
+    initialization hypotheses of one reconstruction, not geometry candidates.
+    Boundary or scale-ambiguous solutions are re-estimated with wider bounds;
+    an unresolved solution is rejected rather than silently accepted.
+    """
+
+    identity = np.eye(4, dtype=np.float64)
+    diagnostics: Dict[str, float | int | str | bool] = {
+        "enabled": True,
+        "method": "anchor_visible_surface_robust_sim3_v2",
+        "label": str(label),
+        "valid": False,
+        "transform_applied": False,
+    }
+    observed = _backproject_anchor_depth(
+        depth,
+        mask,
+        intrinsic,
+        max_points=min(max(int(cfg.rgbd_scale_max_points), 1000), 5000),
+    )
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    if len(observed) < 80 or len(vertices) < 20 or not np.isfinite(vertices).all():
+        diagnostics["reason"] = "insufficient_anchor_depth_or_mesh"
+        return mesh.copy(), identity, diagnostics
+
+    sample_count = min(max(int(cfg.rgbd_scale_max_points), 1000), 5000)
+    try:
+        source, _ = trimesh.sample.sample_surface(mesh, sample_count)
+    except Exception:
+        source = vertices
+    source = np.asarray(source, dtype=np.float64)
+    source = source[np.isfinite(source).all(axis=1)]
+    if len(source) < 80:
+        diagnostics["reason"] = "insufficient_surface_samples"
+        return mesh.copy(), identity, diagnostics
+
+    observed_center = np.median(observed, axis=0)
+    source_center = np.median(source, axis=0)
+    observed_radius = float(
+        np.quantile(np.linalg.norm(observed - observed_center, axis=1), 0.90)
+    )
+    source_radius = float(
+        np.quantile(np.linalg.norm(source - source_center, axis=1), 0.90)
+    )
+    if observed_radius <= 1e-6 or source_radius <= 1e-8:
+        diagnostics["reason"] = "degenerate_visible_extent"
+        return mesh.copy(), identity, diagnostics
+    initial_scale = float(np.clip(observed_radius / source_radius, 1e-4, 10.0))
+    observed_tree = cKDTree(observed)
+    support_distance = max(
+        float(cfg.rgbd_scale_depth_tolerance),
+        2.0 * float(cfg.icp_voxel_size),
+    )
+    image_shape = np.asarray(mask).shape[:2]
+
+    def _clamp_similarity(
+        transform: np.ndarray,
+        lower: float,
+        upper: float,
+        paired_source: np.ndarray,
+        paired_target: np.ndarray,
+    ) -> np.ndarray:
+        total_scale = _similarity_scale(transform)
+        lower_scale = initial_scale * lower
+        upper_scale = initial_scale * upper
+        clipped_scale = float(np.clip(total_scale, lower_scale, upper_scale))
+        if abs(clipped_scale - total_scale) <= 1e-10:
+            return transform
+        rotation = transform[:3, :3] / max(total_scale, 1e-12)
+        corrected = transform.copy()
+        corrected[:3, :3] = clipped_scale * rotation
+        corrected[:3, 3] = (
+            paired_target.mean(axis=0)
+            - clipped_scale * rotation @ paired_source.mean(axis=0)
+        )
+        return corrected
+
+    def _fit_one(init: np.ndarray, lower: float, upper: float, iterations: int):
+        transform = init.copy()
+        reciprocal_fraction = 0.0
+        paired_count = 0
+        for _ in range(max(int(iterations), 1)):
+            transformed = _apply_similarity_to_points(source, transform)
+            u, v, inside, in_mask, observed_depth = _project_points_to_anchor(
+                transformed, depth, mask, intrinsic
+            )
+            front = _zbuffer_visible_vertices(
+                u,
+                v,
+                transformed[:, 2],
+                inside,
+                in_mask,
+                observed_depth,
+                image_shape,
+                front_slack=max(float(cfg.icp_voxel_size), 0.002),
+            )
+            visible_ids = np.flatnonzero(front)
+            if len(visible_ids) < 30:
+                return None
+            visible = transformed[visible_ids]
+            distance, target_ids = observed_tree.query(visible, k=1, workers=-1)
+            back_ids = cKDTree(visible).query(observed, k=1, workers=-1)[1]
+            mutual = back_ids[target_ids] == np.arange(len(visible))
+            reciprocal_fraction = float(np.mean(mutual))
+            pair_mask = mutual.copy()
+            if int(pair_mask.sum()) < 30:
+                pair_mask[:] = True
+            pair_distance = distance[pair_mask]
+            median = float(np.median(pair_distance))
+            mad = float(np.median(np.abs(pair_distance - median)))
+            cutoff = min(
+                2.5 * support_distance,
+                max(median + 2.5 * max(1.4826 * mad, 1e-5), 0.5 * support_distance),
+            )
+            pair_mask &= distance <= cutoff
+            pair_local_ids = np.flatnonzero(pair_mask)
+            if len(pair_local_ids) < 20:
+                return None
+            # A final trimmed set makes the Sim(3) update insensitive to
+            # completion surfaces that happen to project inside the mask.
+            ordered = pair_local_ids[np.argsort(distance[pair_local_ids])]
+            keep = max(20, int(0.80 * len(ordered)))
+            pair_local_ids = ordered[:keep]
+            source_ids = visible_ids[pair_local_ids]
+            paired_source = source[source_ids]
+            paired_target = observed[target_ids[pair_local_ids]]
+            updated = _umeyama_similarity(paired_source, paired_target)
+            if updated is None:
+                return None
+            updated = _clamp_similarity(
+                updated, lower, upper, paired_source, paired_target
+            )
+            paired_count = len(paired_source)
+            if np.linalg.norm(updated - transform) < 1e-6:
+                transform = updated
+                break
+            transform = updated
+
+        transformed = _apply_similarity_to_points(source, transform)
+        u, v, inside, in_mask, observed_depth = _project_points_to_anchor(
+            transformed, depth, mask, intrinsic
+        )
+        front = _zbuffer_visible_vertices(
+            u,
+            v,
+            transformed[:, 2],
+            inside,
+            in_mask,
+            observed_depth,
+            image_shape,
+            front_slack=max(float(cfg.icp_voxel_size), 0.002),
+        )
+        visible = transformed[front]
+        if len(visible) < 30:
+            return None
+        surface_distance = observed_tree.query(visible, k=1, workers=-1)[0]
+        visible_tree = cKDTree(visible)
+        observed_distance = visible_tree.query(observed, k=1, workers=-1)[0]
+        trimmed_surface = np.sort(surface_distance)[: max(1, int(0.80 * len(surface_distance)))]
+        trimmed_observed = np.sort(observed_distance)[: max(1, int(0.80 * len(observed_distance)))]
+        symmetric_distance = float(0.5 * (trimmed_surface.mean() + trimmed_observed.mean()))
+        support = float(np.mean(observed_distance <= support_distance))
+        quality = float(np.exp(-symmetric_distance / max(support_distance, 1e-8)))
+        silhouette_quality, projected_mask_support, silhouette_size_error = (
+            _projected_silhouette_quality(transformed, mask, intrinsic)
+        )
+        silhouette_weight = float(
+            np.clip(cfg.rgbd_scale_silhouette_weight, 0.0, 0.50)
+        )
+        visible_score = float(0.75 * quality + 0.25 * support)
+        score = float(
+            (1.0 - silhouette_weight) * visible_score
+            + silhouette_weight * silhouette_quality
+        )
+        total_scale = _similarity_scale(transform)
+        multiplier = total_scale / max(initial_scale, 1e-12)
+        return {
+            "transform": transform,
+            "score": score,
+            "scale": total_scale,
+            "multiplier": multiplier,
+            "symmetric_distance": symmetric_distance,
+            "support": support,
+            "reciprocal_fraction": reciprocal_fraction,
+            "paired_points": int(paired_count),
+            "silhouette_quality": silhouette_quality,
+            "projected_mask_support": projected_mask_support,
+            "silhouette_size_error": silhouette_size_error,
+        }
+
+    def _search(lower: float, upper: float, iterations: int):
+        records = []
+        rotations = _proper_axis_rotations()
+        for rotation in rotations:
+            init = np.eye(4, dtype=np.float64)
+            init[:3, :3] = initial_scale * rotation
+            init[:3, 3] = observed_center - initial_scale * rotation @ source_center
+            record = _fit_one(init, lower, upper, iterations)
+            if record is not None:
+                records.append(record)
+        records.sort(key=lambda record: record["score"], reverse=True)
+        return records
+
+    lower = float(cfg.rgbd_scale_multiplier_min)
+    upper = float(cfg.rgbd_scale_multiplier_max)
+    records = _search(lower, upper, cfg.rgbd_scale_sim3_iterations)
+    if not records:
+        diagnostics["reason"] = "no_finite_visible_sim3_hypothesis"
+        return mesh.copy(), identity, diagnostics
+
+    def _margin(best_record, candidates) -> float:
+        distinct = [
+            record["score"]
+            for record in candidates[1:]
+            if abs(np.log(max(record["scale"], 1e-12) / max(best_record["scale"], 1e-12)))
+            >= 0.02
+        ]
+        runner_up = max(distinct) if distinct else 0.0
+        return max(float(best_record["score"]) - float(runner_up), 0.0)
+
+    best = records[0]
+    margin = _margin(best, records)
+    boundary = bool(
+        np.isclose(best["multiplier"], lower, atol=0.01)
+        or np.isclose(best["multiplier"], upper, atol=0.01)
+    )
+    reestimated = bool(boundary or margin < float(cfg.rgbd_scale_min_margin))
+    if reestimated:
+        expanded_lower = max(0.35, 0.80 * lower)
+        expanded_upper = min(2.50, 1.20 * upper)
+        expanded = _search(
+            expanded_lower,
+            expanded_upper,
+            max(int(cfg.rgbd_scale_sim3_iterations) + 2, 3),
+        )
+        if expanded and expanded[0]["score"] >= best["score"] - 0.01:
+            records = expanded
+            best = expanded[0]
+            lower, upper = expanded_lower, expanded_upper
+            margin = _margin(best, records)
+            boundary = bool(
+                np.isclose(best["multiplier"], lower, atol=0.01)
+                or np.isclose(best["multiplier"], upper, atol=0.01)
+            )
+
+    weak_reciprocal = bool(
+        float(best["reciprocal_fraction"])
+        < float(cfg.rgbd_scale_min_reciprocal_fraction)
+    )
+    weak_silhouette = bool(
+        float(best["silhouette_quality"])
+        < float(cfg.rgbd_scale_min_silhouette_quality)
+    )
+    rejected = bool(
+        boundary
+        or margin < float(cfg.rgbd_scale_min_margin)
+        or weak_reciprocal
+        or weak_silhouette
+    )
+    diagnostics.update(
+        {
+            "initial_scale": initial_scale,
+            "chosen_scale": float(best["scale"]),
+            "chosen_multiplier": float(best["multiplier"]),
+            "objective": float(best["score"]),
+            "objective_margin": float(margin),
+            "symmetric_visible_distance": float(best["symmetric_distance"]),
+            "observed_support": float(best["support"]),
+            "reciprocal_pair_fraction": float(best["reciprocal_fraction"]),
+            "paired_points": int(best["paired_points"]),
+            "silhouette_quality": float(best["silhouette_quality"]),
+            "projected_mask_support": float(best["projected_mask_support"]),
+            "silhouette_size_error": float(best["silhouette_size_error"]),
+            "silhouette_weight": float(cfg.rgbd_scale_silhouette_weight),
+            "min_reciprocal_pair_fraction": float(
+                cfg.rgbd_scale_min_reciprocal_fraction
+            ),
+            "min_silhouette_quality": float(
+                cfg.rgbd_scale_min_silhouette_quality
+            ),
+            "at_search_boundary": boundary,
+            "weak_reciprocal_pairing": weak_reciprocal,
+            "weak_silhouette": weak_silhouette,
+            "reestimated": reestimated,
+            "rejected": rejected,
+            "hypotheses": int(len(records)),
+            "search_multiplier_min": float(lower),
+            "search_multiplier_max": float(upper),
+        }
+    )
+    if rejected:
+        if boundary:
+            diagnostics["reason"] = "boundary_solution"
+        elif margin < float(cfg.rgbd_scale_min_margin):
+            diagnostics["reason"] = "low_scale_objective_margin"
+        elif weak_reciprocal:
+            diagnostics["reason"] = "low_reciprocal_pair_fraction"
+        else:
+            diagnostics["reason"] = "low_projected_silhouette_quality"
+        return mesh.copy(), identity, diagnostics
+
+    recovered = mesh.copy()
+    recovered.apply_transform(best["transform"])
+    reliability = float(
+        np.clip(
+            best["score"]
+            * (0.80 + 0.20 * min(margin / max(float(cfg.rgbd_scale_min_margin) * 5.0, 1e-6), 1.0)),
+            0.0,
+            1.0,
+        )
+    )
+    diagnostics.update(
+        {
+            "valid": True,
+            "transform_applied": True,
+            "reliability": reliability,
+        }
+    )
+    recovered.metadata = dict(getattr(recovered, "metadata", {}) or {})
+    recovered.metadata["rgbd_scale_recovery"] = diagnostics
+    recovered.metadata[f"{label}_metric_scale"] = float(best["scale"])
+    return recovered, np.asarray(best["transform"], dtype=np.float64), diagnostics
+
+
 def _rgbd_self_supervised_scale_recovery(
     mesh: trimesh.Trimesh,
     depth: np.ndarray,
@@ -596,6 +1094,69 @@ def _rgbd_self_supervised_scale_recovery(
     and projected silhouette agreement.  No dataset CAD or query ground truth
     enters this operation.
     """
+
+    if cfg.rgbd_scale_visible_sim3:
+        recovered, transform, diagnostics = _visible_surface_sim3_scale_recovery(
+            mesh, depth, mask, intrinsic, cfg, label
+        )
+        if bool(diagnostics.get("valid", False)) or not cfg.rgbd_scale_ambiguity_fallback:
+            return recovered, transform, diagnostics
+
+        primary_attempt = dict(diagnostics)
+        if label == "instantmesh":
+            observed = _backproject_anchor_depth(
+                depth,
+                mask,
+                intrinsic,
+                max_points=max(int(cfg.rgbd_scale_max_points), 1000),
+            )
+            if len(observed) >= 50:
+                init_center = guess_translation(depth, mask, intrinsic)
+                fallback = _prepare_instantmesh_metric_frame(
+                    mesh, observed, init_center=init_center
+                )
+                fallback_meta = dict(getattr(fallback, "metadata", {}) or {})
+                fallback_transform = np.asarray(
+                    fallback_meta.get("instantmesh_metric_transform", np.eye(4)),
+                    dtype=np.float64,
+                ).reshape(4, 4)
+                fallback_scale = float(
+                    fallback_meta.get("instantmesh_metric_scale", 1.0)
+                )
+                diagnostics = {
+                    "enabled": True,
+                    "valid": True,
+                    "transform_applied": True,
+                    "method": "anchor_depth_extent_fallback_after_ambiguous_sim3_v1",
+                    "label": str(label),
+                    "fallback_used": True,
+                    "fallback_reason": primary_attempt.get("reason", "ambiguous_sim3"),
+                    "chosen_scale": fallback_scale,
+                    "reliability": 0.50,
+                    "primary_attempt": primary_attempt,
+                }
+                fallback.metadata["rgbd_scale_recovery"] = diagnostics
+                return fallback, fallback_transform, diagnostics
+
+        # RaySt3R is already RGB-D conditioned and metric.  If its optional
+        # Sim(3) correction is ambiguous, preserving the native metric frame is
+        # safer than applying an underconstrained single-view similarity.
+        diagnostics = {
+            "enabled": True,
+            "valid": True,
+            "transform_applied": False,
+            "method": "native_metric_fallback_after_ambiguous_sim3_v1",
+            "label": str(label),
+            "fallback_used": True,
+            "fallback_reason": primary_attempt.get("reason", "ambiguous_sim3"),
+            "chosen_scale": 1.0,
+            "reliability": 0.50,
+            "primary_attempt": primary_attempt,
+        }
+        native = mesh.copy()
+        native.metadata = dict(getattr(native, "metadata", {}) or {})
+        native.metadata["rgbd_scale_recovery"] = diagnostics
+        return native, np.eye(4, dtype=np.float64), diagnostics
 
     identity = np.eye(4, dtype=np.float64)
     diagnostics: Dict[str, float | int | str | bool] = {
@@ -806,18 +1367,20 @@ def _align_instantmesh_to_rayst3r(
     mesh_instant_metric: trimesh.Trimesh,
     ray_points: np.ndarray,
     cfg: ReconstructionConfig,
+    init_transforms: Optional[Iterable[np.ndarray]] = None,
 ) -> Tuple[Optional[trimesh.Trimesh], Optional[o3d.pipelines.registration.RegistrationResult]]:
     if ray_points is None or len(ray_points) == 0:
         return mesh_instant_metric, None
 
     target_center = ray_points.mean(axis=0)
     source_center = mesh_instant_metric.vertices.mean(axis=0)
-    init_transforms = _build_icp_inits(
-        source_center,
-        target_center,
-        cfg.icp_multi_hypo,
-        cfg.icp_init_sigma,
-    )
+    if init_transforms is None:
+        init_transforms = _build_icp_inits(
+            source_center,
+            target_center,
+            cfg.icp_multi_hypo,
+            cfg.icp_init_sigma,
+        )
     aligned, reg = _icp_align_prior(
         mesh_instant_metric,
         ray_points,
@@ -834,16 +1397,18 @@ def _align_rayst3r_to_instantmesh(
     mesh_ray: trimesh.Trimesh,
     mesh_instant: trimesh.Trimesh,
     cfg: ReconstructionConfig,
+    init_transforms: Optional[Iterable[np.ndarray]] = None,
 ) -> Tuple[Optional[trimesh.Trimesh], Optional[o3d.pipelines.registration.RegistrationResult]]:
     target_points, _ = trimesh.sample.sample_surface(mesh_instant, cfg.sample_points)
     target_center = target_points.mean(axis=0)
     source_center = mesh_ray.vertices.mean(axis=0)
-    init_transforms = _build_icp_inits(
-        source_center,
-        target_center,
-        cfg.icp_multi_hypo,
-        cfg.icp_init_sigma,
-    )
+    if init_transforms is None:
+        init_transforms = _build_icp_inits(
+            source_center,
+            target_center,
+            cfg.icp_multi_hypo,
+            cfg.icp_init_sigma,
+        )
     aligned, reg = _icp_align_prior(
         mesh_ray,
         target_points,
@@ -1173,6 +1738,87 @@ def _trimesh_to_clean_o3d(
     return result
 
 
+def _zbuffer_visible_vertices(
+    u: np.ndarray,
+    v: np.ndarray,
+    z: np.ndarray,
+    inside: np.ndarray,
+    in_mask: np.ndarray,
+    observed_depth: np.ndarray,
+    image_shape: Tuple[int, int],
+    front_slack: float,
+) -> np.ndarray:
+    """Return vertices on the front-most mesh layer at each anchor pixel.
+
+    The earlier visible-patch implementation accepted every vertex close to
+    the measured depth.  Thin or concave objects can project front and back
+    surfaces to the same pixel, causing both layers to move and producing an
+    inflated/doubled fused surface.  This lightweight z-buffer keeps only the
+    closest candidate layer while still using RGB-D as the visibility target.
+    """
+
+    h, w = int(image_shape[0]), int(image_shape[1])
+    valid = (
+        np.asarray(inside, dtype=bool)
+        & np.asarray(in_mask, dtype=bool)
+        & np.isfinite(z)
+        & (np.asarray(z) > 1e-8)
+        & np.isfinite(observed_depth)
+        & (np.asarray(observed_depth) > 1e-8)
+    )
+    ids = np.flatnonzero(valid)
+    if ids.size == 0:
+        return np.zeros(len(z), dtype=bool)
+    pixels = np.asarray(v[ids], dtype=np.int64) * w + np.asarray(
+        u[ids], dtype=np.int64
+    )
+    z_buffer = np.full(h * w, np.inf, dtype=np.float64)
+    np.minimum.at(z_buffer, pixels, np.asarray(z, dtype=np.float64)[ids])
+    front = np.zeros(len(z), dtype=bool)
+    front[ids] = np.asarray(z, dtype=np.float64)[ids] <= (
+        z_buffer[pixels] + max(float(front_slack), 1e-6)
+    )
+    return valid & front
+
+
+def _smooth_bounded_displacements(
+    mesh: trimesh.Trimesh,
+    displacements: np.ndarray,
+    active: np.ndarray,
+    max_distance: float,
+    iterations: int,
+) -> np.ndarray:
+    """Taper visible-surface updates over the prior topology.
+
+    Only active vertices can move.  Inactive neighbours contribute a zero
+    displacement, which naturally fades the update at the visible/unobserved
+    boundary without changing connectivity or creating a seam.
+    """
+
+    disp = np.asarray(displacements, dtype=np.float64).copy()
+    active = np.asarray(active, dtype=bool)
+    disp[~active] = 0.0
+    edges = np.asarray(mesh.edges_unique, dtype=np.int64)
+    if len(edges) and int(iterations) > 0:
+        for _ in range(int(iterations)):
+            sums = np.zeros_like(disp)
+            counts = np.zeros(len(disp), dtype=np.float64)
+            np.add.at(sums, edges[:, 0], disp[edges[:, 1]])
+            np.add.at(sums, edges[:, 1], disp[edges[:, 0]])
+            np.add.at(counts, edges[:, 0], 1.0)
+            np.add.at(counts, edges[:, 1], 1.0)
+            neighbour = sums / np.maximum(counts[:, None], 1.0)
+            disp[active] = 0.80 * disp[active] + 0.20 * neighbour[active]
+            disp[~active] = 0.0
+    lengths = np.linalg.norm(disp, axis=1)
+    too_far = lengths > max(float(max_distance), 1e-8)
+    if np.any(too_far):
+        disp[too_far] *= (
+            float(max_distance) / np.maximum(lengths[too_far], 1e-12)
+        )[:, None]
+    return disp
+
+
 def _fuse_meshes_visible_patch(
     mesh_ray: trimesh.Trimesh,
     mesh_instant: trimesh.Trimesh,
@@ -1181,7 +1827,7 @@ def _fuse_meshes_visible_patch(
     intrinsic: np.ndarray,
     cfg: ReconstructionConfig,
 ) -> trimesh.Trimesh:
-    """Topology-preserving visible-surface fusion operator ``Phi``.
+    """RGB-D-constrained topology-preserving fusion operator ``Phi``.
 
     InstantMesh supplies the complete prior topology.  At vertices that are
     visible in the anchor and supported by measured RGB-D, the prior surface is
@@ -1194,19 +1840,70 @@ def _fuse_meshes_visible_patch(
     disconnected seams that were particularly harmful to FoundationPose.
     """
 
-    fallback = _concatenate_meshes(mesh_ray, mesh_instant)
+    # A failed fusion is never admitted to the candidate registry.  Returning
+    # the prior as the diagnostic fallback avoids recreating the old doubled
+    # concat mesh even if a caller accidentally exports the failed output.
+    fallback = mesh_instant.copy()
     diagnostics: Dict[str, float | int | str | bool] = {
-        "method": "topology_preserving_visible_surface_phi_v5_ray_frame",
+        "method": "rgbd_scale_corrected_topology_phi_v7_ray_frame",
         "fallback_used": False,
         "coordinate_frame": "rayst3r_anchor_camera",
         "prior_backbone_preserved": True,
         "global_poisson_used": False,
-        "surface_update": "rgbd_supported_prior_vertex_deformation",
+        "surface_update": "bounded_ray_envelope_scale_then_zbuffered_rgbd_patch_deformation",
     }
     try:
         n_samples = max(int(cfg.fusion_sample_points), 1000)
         ray_pts, _ = _sample_mesh_with_normals(mesh_ray, n_samples)
         inst_pts, _ = _sample_mesh_with_normals(mesh_instant, n_samples)
+
+        # InstantMesh supplies the complete topology, but its unseen extent can
+        # remain systematically too large or too small even after the two
+        # reconstructions have independently recovered metric scale.  Estimate
+        # a *single bounded uniform correction* from the robust RaySt3R and
+        # InstantMesh envelopes.  This uses only the two anchor reconstructions
+        # (no CAD/GT geometry), preserves aspect ratio and connectivity, and is
+        # deliberately capped so that RaySt3R cannot erase the completion
+        # prior through an unreliable anisotropic warp.
+        ray_lo, ray_hi = np.percentile(ray_pts, [2.0, 98.0], axis=0)
+        inst_lo, inst_hi = np.percentile(inst_pts, [2.0, 98.0], axis=0)
+        ray_extent = np.maximum(ray_hi - ray_lo, 1e-8)
+        inst_extent = np.maximum(inst_hi - inst_lo, 1e-8)
+        valid_axes = inst_extent > 0.05 * float(np.max(inst_extent))
+        axis_ratios = ray_extent[valid_axes] / inst_extent[valid_axes]
+        robust_diagonal_ratio = float(
+            np.linalg.norm(ray_extent) / max(np.linalg.norm(inst_extent), 1e-8)
+        )
+        envelope_ratio = float(
+            0.5 * np.median(axis_ratios) + 0.5 * robust_diagonal_ratio
+        )
+        global_scale = float(
+            np.clip(
+                envelope_ratio,
+                float(cfg.fusion_global_scale_min),
+                float(cfg.fusion_global_scale_max),
+            )
+        )
+        prior_scale_center = np.median(
+            np.asarray(mesh_instant.vertices, dtype=np.float64), axis=0
+        )
+        mesh_prior = mesh_instant.copy()
+        mesh_prior.vertices = prior_scale_center + global_scale * (
+            np.asarray(mesh_instant.vertices, dtype=np.float64)
+            - prior_scale_center
+        )
+        inst_pts, _ = _sample_mesh_with_normals(mesh_prior, n_samples)
+        diagnostics.update(
+            {
+                "prior_global_scale_correction": global_scale,
+                "prior_global_scale_estimate": envelope_ratio,
+                "prior_global_scale_bounds": [
+                    float(cfg.fusion_global_scale_min),
+                    float(cfg.fusion_global_scale_max),
+                ],
+                "prior_global_scale_source": "robust_cross_reconstruction_envelope_no_gt",
+            }
+        )
         combined_extent = np.ptp(np.vstack([ray_pts, inst_pts]), axis=0)
         diameter = max(float(np.linalg.norm(combined_extent)), 1e-6)
         voxel = max(float(cfg.fusion_voxel_size), 1e-4)
@@ -1265,26 +1962,56 @@ def _fuse_meshes_visible_patch(
         if len(supported_ray_vertices) < 50:
             raise RuntimeError("RaySt3R has too few RGB-D-supported surface vertices")
 
-        prior_vertices = np.asarray(mesh_instant.vertices, dtype=np.float64)
-        _, _, prior_inside, prior_in_mask, prior_observed_depth = (
+        prior_vertices = np.asarray(mesh_prior.vertices, dtype=np.float64)
+        prior_u, prior_v, prior_inside, prior_in_mask, prior_observed_depth = (
             _project_points_to_anchor(
                 prior_vertices, depth, supported_depth_mask, intrinsic
             )
         )
         prior_valid_depth = np.isfinite(prior_observed_depth)
         prior_depth_residual = np.abs(prior_vertices[:, 2] - prior_observed_depth)
+        prior_front = _zbuffer_visible_vertices(
+            prior_u,
+            prior_v,
+            prior_vertices[:, 2],
+            prior_inside,
+            prior_in_mask,
+            prior_observed_depth,
+            np.asarray(mask).shape[:2],
+            front_slack=max(voxel, 0.25 * depth_tolerance),
+        )
         prior_visible = (
-            prior_inside
-            & prior_in_mask
+            prior_front
             & prior_valid_depth
-            & (prior_depth_residual <= max(2.0 * depth_tolerance, support_distance))
+            & (prior_depth_residual <= max(depth_tolerance, agreement_distance))
         )
         ray_tree = cKDTree(supported_ray_vertices)
         prior_to_ray_distance, prior_to_ray_index = ray_tree.query(
             prior_vertices, k=1, workers=-1
         )
-        update_radius = max(2.0 * agreement_distance, support_distance)
-        update_mask = prior_visible & (prior_to_ray_distance <= update_radius)
+        prior_normals = np.asarray(mesh_prior.vertex_normals, dtype=np.float64)
+        ray_normals_all = np.asarray(mesh_ray.vertex_normals, dtype=np.float64)
+        supported_ray_normals = ray_normals_all[ray_supported]
+        normal_cosine = np.abs(
+            np.einsum(
+                "ij,ij->i",
+                prior_normals,
+                supported_ray_normals[prior_to_ray_index],
+            )
+        )
+        min_normal_cosine = float(np.clip(cfg.fusion_min_normal_cosine, 0.0, 0.95))
+        normal_confidence = np.clip(
+            (normal_cosine - min_normal_cosine)
+            / max(1.0 - min_normal_cosine, 1e-8),
+            0.0,
+            1.0,
+        )
+        update_radius = max(1.5 * agreement_distance, 2.0 * voxel)
+        update_mask = (
+            prior_visible
+            & (prior_to_ray_distance <= update_radius)
+            & (normal_cosine >= min_normal_cosine)
+        )
         if int(update_mask.sum()) < 25:
             raise RuntimeError("too few InstantMesh vertices have reliable visible support")
 
@@ -1299,13 +2026,54 @@ def _fuse_meshes_visible_patch(
             -np.nan_to_num(prior_depth_residual, nan=update_radius)
             / max(depth_tolerance, 1e-8)
         )
-        blend = np.clip(distance_confidence * depth_confidence, 0.0, 1.0)
-        blend = np.where(update_mask, 0.90 * (0.25 + 0.75 * blend), 0.0)
-        target_vertices = supported_ray_vertices[prior_to_ray_index]
-        fused_vertices = prior_vertices + blend[:, None] * (
-            target_vertices - prior_vertices
+        blend = np.clip(
+            distance_confidence * depth_confidence * normal_confidence,
+            0.0,
+            1.0,
         )
-        fused = mesh_instant.copy()
+        # Supported vertices must inherit a meaningful portion of the
+        # RaySt3R surface; an overly conservative blend made Phi practically
+        # identical to InstantMesh and therefore unable to contribute a real
+        # third hypothesis.  Z-buffer, normal agreement and the displacement
+        # cap still bound every update.
+        blend = np.where(update_mask, 0.95 * (0.40 + 0.60 * blend), 0.0)
+
+        # Use the RaySt3R surface for local detail while anchoring every update
+        # to the measured RGB-D ray at that pixel.  This prevents an ICP-local
+        # optimum from dragging the visible patch away from the observation.
+        ray_targets = supported_ray_vertices[prior_to_ray_index]
+        observed_targets = ray_targets.copy()
+        obs_ids = np.flatnonzero(prior_valid_depth & prior_inside & prior_in_mask)
+        if obs_ids.size:
+            observed_z = prior_observed_depth[obs_ids]
+            fx, fy = float(intrinsic[0, 0]), float(intrinsic[1, 1])
+            cx, cy = float(intrinsic[0, 2]), float(intrinsic[1, 2])
+            observed_targets[obs_ids, 0] = (
+                (prior_u[obs_ids].astype(np.float64) - cx)
+                * observed_z
+                / max(fx, 1e-8)
+            )
+            observed_targets[obs_ids, 1] = (
+                (prior_v[obs_ids].astype(np.float64) - cy)
+                * observed_z
+                / max(fy, 1e-8)
+            )
+            observed_targets[obs_ids, 2] = observed_z
+        target_vertices = 0.75 * ray_targets + 0.25 * observed_targets
+        raw_displacements = blend[:, None] * (target_vertices - prior_vertices)
+        max_update_distance = max(
+            float(cfg.fusion_max_update_ratio) * diameter,
+            2.0 * voxel,
+        )
+        displacements = _smooth_bounded_displacements(
+            mesh_prior,
+            raw_displacements,
+            update_mask,
+            max_update_distance,
+            cfg.fusion_smooth_iterations,
+        )
+        fused_vertices = prior_vertices + displacements
+        fused = mesh_prior.copy()
         fused.vertices = fused_vertices
         if not isinstance(fused, trimesh.Trimesh) or len(fused.faces) < 50:
             raise RuntimeError("topology-preserving Phi produced an empty mesh")
@@ -1317,6 +2085,13 @@ def _fuse_meshes_visible_patch(
         prior_coverage = float(
             np.mean(
                 fused_tree.query(inst_pts, k=1, workers=-1)[0]
+                <= coverage_distance
+            )
+        )
+        prior_tree = cKDTree(inst_pts)
+        prior_observed_coverage = float(
+            np.mean(
+                prior_tree.query(obs_pts, k=1, workers=-1)[0]
                 <= coverage_distance
             )
         )
@@ -1350,9 +2125,47 @@ def _fuse_meshes_visible_patch(
         center_offset_ratio = float(
             np.linalg.norm(fused_center - source_center) / source_diagonal
         )
+        # Validate relative improvement/non-degradation as well as absolute
+        # bounds.  A fixed 50% observation threshold unfairly rejected useful
+        # partial fusions when the completion prior itself covered less than
+        # 50%; conversely, merely retaining the prior is not sufficient.
+        required_observed_coverage = min(
+            float(cfg.fusion_min_observed_coverage),
+            max(0.20, 0.95 * prior_observed_coverage),
+        )
+        depth_before = float(np.median(prior_depth_residual[update_mask]))
+        fused_u, fused_v, fused_inside, fused_in_mask, fused_observed_depth = (
+            _project_points_to_anchor(
+                fused_vertices, depth, supported_depth_mask, intrinsic
+            )
+        )
+        fused_depth_valid = (
+            fused_inside
+            & fused_in_mask
+            & np.isfinite(fused_observed_depth)
+            & update_mask
+        )
+        depth_after = (
+            float(
+                np.median(
+                    np.abs(
+                        fused_vertices[fused_depth_valid, 2]
+                        - fused_observed_depth[fused_depth_valid]
+                    )
+                )
+            )
+            if np.any(fused_depth_valid)
+            else float("inf")
+        )
+        rgbd_non_degrading = bool(
+            np.isfinite(depth_after)
+            and depth_after <= max(1.05 * depth_before, depth_before + voxel)
+        )
         output_valid = bool(
             prior_coverage >= float(cfg.fusion_min_prior_coverage)
-            and observed_coverage >= float(cfg.fusion_min_observed_coverage)
+            and observed_coverage >= required_observed_coverage
+            and observed_coverage + 0.02 >= prior_observed_coverage
+            and rgbd_non_degrading
             and float(cfg.fusion_min_extent_ratio)
             <= extent_ratio
             <= float(cfg.fusion_max_extent_ratio)
@@ -1362,6 +2175,8 @@ def _fuse_meshes_visible_patch(
             raise RuntimeError(
                 "patch Phi failed bounded validation: "
                 f"prior={prior_coverage:.3f}, observed={observed_coverage:.3f}, "
+                f"required_observed={required_observed_coverage:.3f}, "
+                f"depth_before={depth_before:.5f}, depth_after={depth_after:.5f}, "
                 f"extent={extent_ratio:.3f}, center={center_offset_ratio:.3f}"
             )
 
@@ -1380,13 +2195,26 @@ def _fuse_meshes_visible_patch(
         conflict_ratio = float(np.mean(ray_conflict[ray_inside & ray_in_mask])) if np.any(
             ray_inside & ray_in_mask
         ) else 1.0
+        visible_distances = prior_to_ray_distance[prior_visible]
+        visible_distance = float(np.median(visible_distances))
         distance_quality = float(
-            np.exp(-symmetric_distance / max(agreement_distance, 1e-8))
+            np.exp(-visible_distance / max(agreement_distance, 1e-8))
         )
+        rgbd_quality = float(
+            np.exp(-depth_after / max(depth_tolerance, 1e-8))
+        )
+        rgbd_gain = float(
+            np.clip(
+                (depth_before - depth_after) / max(depth_tolerance, 1e-8),
+                -1.0,
+                1.0,
+            )
+        )
+        gain_quality = float(0.5 + 0.5 * np.tanh(2.0 * rgbd_gain))
         coverage_quality = (
-            0.50 * prior_coverage
-            + 0.30 * observed_coverage
-            + 0.20 * visible_ray_coverage
+            0.35 * prior_coverage
+            + 0.40 * observed_coverage
+            + 0.25 * visible_ray_coverage
         )
         shape_quality = float(
             np.exp(-abs(np.log(max(extent_ratio, 1e-8))) / 0.35)
@@ -1394,9 +2222,13 @@ def _fuse_meshes_visible_patch(
         )
         reliability = float(
             np.clip(
-                (0.5 * overlap + 0.5 * distance_quality)
-                * (1.0 - conflict_ratio)
-                * coverage_quality
+                (
+                    0.25 * distance_quality
+                    + 0.35 * rgbd_quality
+                    + 0.15 * gain_quality
+                    + 0.25 * coverage_quality
+                )
+                * (1.0 - 0.5 * conflict_ratio)
                 * shape_quality,
                 0.0,
                 1.0,
@@ -1405,7 +2237,9 @@ def _fuse_meshes_visible_patch(
         diagnostics.update(
             {
                 "output_prior_coverage": prior_coverage,
+                "input_prior_observed_coverage": prior_observed_coverage,
                 "output_observed_coverage": observed_coverage,
+                "required_observed_coverage": required_observed_coverage,
                 "output_visible_ray_coverage": visible_ray_coverage,
                 "output_coverage_distance": float(coverage_distance),
                 "output_extent_ratio": float(extent_ratio),
@@ -1419,12 +2253,18 @@ def _fuse_meshes_visible_patch(
                 "prior_vertices_updated": int(update_mask.sum()),
                 "prior_vertex_update_ratio": float(np.mean(update_mask)),
                 "mean_update_distance": float(
-                    np.mean(np.linalg.norm(fused_vertices[update_mask] - prior_vertices[update_mask], axis=1))
+                    np.mean(np.linalg.norm(displacements[update_mask], axis=1))
                 ),
                 "max_update_distance": float(
-                    np.max(np.linalg.norm(fused_vertices[update_mask] - prior_vertices[update_mask], axis=1))
+                    np.max(np.linalg.norm(displacements[update_mask], axis=1))
                 ),
-                "prior_faces_retained": int(len(mesh_instant.faces)),
+                "update_distance_cap": float(max_update_distance),
+                "normal_cosine_median": float(np.median(normal_cosine[update_mask])),
+                "visible_depth_before": depth_before,
+                "visible_depth_after": depth_after,
+                "visible_depth_gain": float(depth_before - depth_after),
+                "rgbd_non_degrading": rgbd_non_degrading,
+                "prior_faces_retained": int(len(mesh_prior.faces)),
                 "prior_faces_removed": 0,
                 "prior_backbone_topology_decimated": False,
                 "topology_preserved": True,
@@ -1439,7 +2279,7 @@ def _fuse_meshes_visible_patch(
         fused = fallback
         diagnostics.update(
             {
-                "method": "concat_fallback",
+                "method": "prior_fallback_not_candidate",
                 "fallback_used": True,
                 "output_valid": False,
                 "error": f"{type(exc).__name__}: {exc}",
@@ -1844,6 +2684,59 @@ def _bidirectional_diagnostics(
     }
 
 
+def _reciprocal_cycle_diagnostics(
+    independent_inst_to_ray: Optional[o3d.pipelines.registration.RegistrationResult],
+    independent_ray_to_inst: Optional[o3d.pipelines.registration.RegistrationResult],
+    paired_inst_to_ray: Optional[o3d.pipelines.registration.RegistrationResult],
+    paired_ray_to_inst: Optional[o3d.pipelines.registration.RegistrationResult],
+    mesh_ray: trimesh.Trimesh,
+    mesh_inst: trimesh.Trimesh,
+    cfg: ReconstructionConfig,
+    reference_direction: str,
+    hypothesis_index: Optional[int],
+) -> Dict[str, float | bool | str]:
+    """Measure a round trip using a genuinely reciprocal ICP pair.
+
+    The two best ICP24 results may occupy different symmetry basins. Multiplying
+    those independent optima is useful as an audit, but it is not a reciprocal
+    cycle for either estimate. The reported cycle instead uses the main
+    direction's best hypothesis and the independently optimized reverse result
+    whose initialization was the exact inverse of that same indexed hypothesis.
+    No cycle term is used to select the pair or the winning direction.
+    """
+
+    independent = _bidirectional_diagnostics(
+        independent_inst_to_ray,
+        independent_ray_to_inst,
+        mesh_ray,
+        mesh_inst,
+        cfg,
+    )
+    diagnostics: Dict[str, float | bool | str] = {
+        f"independent_{key}": value for key, value in independent.items()
+    }
+    diagnostics.update(
+        {
+            "cycle_pairing_mode": "matched_inverse_initialization_hypothesis",
+            "cycle_reference_direction": str(reference_direction),
+            "cycle_hypothesis_index": (
+                int(hypothesis_index) if hypothesis_index is not None else -1
+            ),
+            "reciprocal_initialization_pairing": True,
+        }
+    )
+    reciprocal = _bidirectional_diagnostics(
+        paired_inst_to_ray, paired_ray_to_inst, mesh_ray, mesh_inst, cfg
+    )
+    diagnostics.update(reciprocal)
+    diagnostics["reciprocal_reverse_valid"] = bool(
+        _is_valid_reg(paired_ray_to_inst)
+        if reference_direction == "inst_to_ray"
+        else _is_valid_reg(paired_inst_to_ray)
+    )
+    return diagnostics
+
+
 def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
     anchor_root = os.path.realpath(cfg.anchor_root)
     output_root = os.path.realpath(cfg.output_root or cfg.anchor_root)
@@ -2034,18 +2927,117 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
                 chosen_mesh_inst = mesh_inst
                 mesh_fused = mesh_ray
             elif obj_cfg.align_bidirectional_icp:
-                mesh_inst_aligned, reg_inst = _align_instantmesh_to_rayst3r(
-                    mesh_inst, points, obj_cfg
-                )
-                mesh_ray_aligned, reg_ray = _align_rayst3r_to_instantmesh(mesh_ray, mesh_inst, obj_cfg)
+                reciprocal_inst_inits = None
+                reciprocal_ray_inits = None
+                if obj_cfg.icp_reciprocal_pairing:
+                    reciprocal_inst_inits = _build_icp_inits(
+                        np.asarray(mesh_inst.vertices, dtype=np.float64).mean(axis=0),
+                        np.asarray(points, dtype=np.float64).mean(axis=0),
+                        obj_cfg.icp_multi_hypo,
+                        obj_cfg.icp_init_sigma,
+                    )
+                    # Each reverse-direction hypothesis is the exact inverse
+                    # of the corresponding InstantMesh-to-RaySt3R hypothesis.
+                    # The two ICP searches can still converge differently;
+                    # best-of-two remains the disclosed final selection rule.
+                    reciprocal_ray_inits = [
+                        np.linalg.inv(init) for init in reciprocal_inst_inits
+                    ]
+                inst_registrations = []
+                ray_registrations = []
+                inst_best_index = None
+                ray_best_index = None
+                if obj_cfg.icp_reciprocal_pairing:
+                    inst_registrations = _icp_registration_hypotheses(
+                        mesh_inst,
+                        points,
+                        obj_cfg.icp_voxel_size,
+                        obj_cfg.icp_max_corr_ratio,
+                        obj_cfg.icp_max_iter,
+                        reciprocal_inst_inits,
+                    )
+                    reg_inst, inst_best_index = _select_best_icp_registration(
+                        inst_registrations, obj_cfg.icp_fitness_threshold
+                    )
+                    mesh_inst_aligned = _mesh_with_registration(mesh_inst, reg_inst)
+
+                    instant_target_points, _ = trimesh.sample.sample_surface(
+                        mesh_inst, obj_cfg.sample_points
+                    )
+                    ray_registrations = _icp_registration_hypotheses(
+                        mesh_ray,
+                        instant_target_points,
+                        obj_cfg.icp_voxel_size,
+                        obj_cfg.icp_max_corr_ratio,
+                        obj_cfg.icp_max_iter,
+                        reciprocal_ray_inits,
+                    )
+                    reg_ray, ray_best_index = _select_best_icp_registration(
+                        ray_registrations, obj_cfg.icp_fitness_threshold
+                    )
+                    mesh_ray_aligned = _mesh_with_registration(mesh_ray, reg_ray)
+                else:
+                    mesh_inst_aligned, reg_inst = _align_instantmesh_to_rayst3r(
+                        mesh_inst, points, obj_cfg
+                    )
+                    mesh_ray_aligned, reg_ray = _align_rayst3r_to_instantmesh(
+                        mesh_ray, mesh_inst, obj_cfg
+                    )
                 reg_inst_initial = reg_inst
                 reg_ray_initial = reg_ray
-                bidirectional_diag = _bidirectional_diagnostics(
-                    reg_inst_initial, reg_ray_initial, mesh_ray, mesh_inst, obj_cfg
-                )
-
                 score_inst = _align_decision_score(reg_inst, obj_cfg)
                 score_ray = _align_decision_score(reg_ray, obj_cfg)
+                reference_direction = (
+                    "inst_to_ray" if score_inst >= score_ray else "ray_to_inst"
+                )
+                if obj_cfg.icp_reciprocal_pairing:
+                    if reference_direction == "inst_to_ray":
+                        cycle_hypothesis_index = inst_best_index
+                        paired_inst = reg_inst_initial
+                        paired_ray = (
+                            ray_registrations[inst_best_index]
+                            if inst_best_index is not None
+                            and inst_best_index < len(ray_registrations)
+                            else None
+                        )
+                    else:
+                        cycle_hypothesis_index = ray_best_index
+                        paired_inst = (
+                            inst_registrations[ray_best_index]
+                            if ray_best_index is not None
+                            and ray_best_index < len(inst_registrations)
+                            else None
+                        )
+                        paired_ray = reg_ray_initial
+                    bidirectional_diag = _reciprocal_cycle_diagnostics(
+                        reg_inst_initial,
+                        reg_ray_initial,
+                        paired_inst,
+                        paired_ray,
+                        mesh_ray,
+                        mesh_inst,
+                        obj_cfg,
+                        reference_direction,
+                        cycle_hypothesis_index,
+                    )
+                else:
+                    bidirectional_diag = _bidirectional_diagnostics(
+                        reg_inst_initial,
+                        reg_ray_initial,
+                        mesh_ray,
+                        mesh_inst,
+                        obj_cfg,
+                    )
+                    bidirectional_diag["cycle_pairing_mode"] = (
+                        "independent_directional_optima"
+                    )
+                    bidirectional_diag["cycle_reference_direction"] = (
+                        reference_direction
+                    )
+                    bidirectional_diag["reciprocal_initialization_pairing"] = False
+                bidirectional_diag["hypotheses_per_direction"] = int(
+                    obj_cfg.icp_multi_hypo
+                )
 
                 if score_inst >= score_ray and reg_inst is not None:
                     mesh_fused = _fuse_meshes(
