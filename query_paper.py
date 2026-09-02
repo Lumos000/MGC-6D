@@ -403,15 +403,6 @@ if __name__ == "__main__":
                         help="w2: weight for L_mask in s_query (Eq. 14)")
     parser.add_argument("--w_geom", type=float, default=0.25,
                         help="w3: weight for L_geom (Chamfer) in s_query (Eq. 14)")
-    parser.add_argument(
-        "--w_pose",
-        type=float,
-        default=0.0,
-        help=(
-            "Weight for normalized FoundationPose confidence. The revised main "
-            "protocol uses 0; non-zero values are pose-confidence ablations."
-        ),
-    )
     # --- Total score balance (Eq. 2) ---
     parser.add_argument("--score_alpha", type=float, default=0.3,
                         help="alpha: weight for s_anchor in total score (Eq. 2)")
@@ -543,7 +534,6 @@ if __name__ == "__main__":
         "w_depth": args.w_depth,
         "w_mask": args.w_mask,
         "w_geom": args.w_geom,
-        "w_pose": args.w_pose,
         "score_alpha": args.score_alpha,
         "score_beta": args.score_beta,
     }
@@ -551,7 +541,7 @@ if __name__ == "__main__":
         raise ValueError(f"All scoring weights must be finite and non-negative: {score_weights}")
     if args.score_alpha + args.score_beta <= 0.0:
         raise ValueError("At least one of --score_alpha and --score_beta must be positive")
-    if args.w_depth + args.w_mask + args.w_geom + args.w_pose <= 0.0:
+    if args.w_depth + args.w_mask + args.w_geom <= 0.0:
         raise ValueError("At least one query-consistency weight must be positive")
     positive_scales = {
         "query_depth_scale": args.query_depth_scale,
@@ -585,10 +575,6 @@ if __name__ == "__main__":
         "selection_formula": (
             "argmax_i alpha*S_anchor_norm(i) + beta*S_query(i), where "
             "S_query=-(w_depth*L_depth_norm+w_mask*L_mask_norm+w_geom*L_geom_norm)"
-            "+w_pose*S_pose_norm"
-        ),
-        "pose_confidence_role": (
-            "diagnostic_only" if float(args.w_pose) == 0.0 else "selection_ablation"
         ),
         "estimation_postprocessing": {
             "gt_symmetry_adjustment": bool(args.anchor_symmetry_align),
@@ -1022,14 +1008,6 @@ if __name__ == "__main__":
                     iteration=args.register_iteration,
                     name=obj_f,
                 )
-                pose_scores = getattr(est, "scores", None)
-                if pose_scores is None or len(pose_scores) == 0:
-                    pose_score = 0.0
-                else:
-                    pose_score_value = pose_scores[0]
-                    if torch.is_tensor(pose_score_value):
-                        pose_score_value = pose_score_value.detach().cpu().item()
-                    pose_score = float(pose_score_value)
                 if args.anchor_symmetry_align and len(sym_tfs_list) > 1:
                     pred_pose_q_k = _resolve_pose_to_anchor_symmetry(
                         pred_pose_q_k, pred_pose_a, sym_tfs_list
@@ -1062,7 +1040,6 @@ if __name__ == "__main__":
                     "pred_pose_a": pred_pose_a,
                     "selection_score": 0.0,
                     "s_query": s_query,
-                    "pose_score": pose_score,
                     "s_anchor": cache.s_anchor,
                     "s_anchor_raw": float(
                         anchor_info.get("s_anchor_raw", anchor_info.get("s_anchor", cache.s_anchor))
@@ -1090,7 +1067,6 @@ if __name__ == "__main__":
                     w_geom=args.w_geom,
                     score_alpha=args.score_alpha,
                     score_beta=args.score_beta,
-                    w_pose=args.w_pose,
                     loss_normalization=args.query_loss_normalization,
                     depth_scale=args.query_depth_scale,
                     mask_scale=args.query_mask_scale,
@@ -1109,7 +1085,6 @@ if __name__ == "__main__":
                     w_geom=args.w_geom,
                     score_alpha=args.score_alpha,
                     score_beta=args.score_beta,
-                    w_pose=args.w_pose,
                     loss_normalization=args.query_loss_normalization,
                     depth_scale=args.query_depth_scale,
                     mask_scale=args.query_mask_scale,
@@ -1150,8 +1125,6 @@ if __name__ == "__main__":
                     "L_mask_norm": float(result["l_mask_norm"]),
                     "L_geom_norm": float(result["l_geom_norm"]),
                     "S_query": float(result["s_query"]),
-                    "Pose_Score_Raw": float(result["pose_score"]),
-                    "Pose_Score_Norm": float(result["pose_score_norm"]),
                     "Selection_Score": float(result["selection_score"]),
                 })
 

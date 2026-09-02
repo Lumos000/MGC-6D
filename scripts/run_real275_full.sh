@@ -20,7 +20,6 @@ exec /data/gst/envs/rayst3r/bin/python -u run_real275_query.py \
   --w_depth 0.5 \
   --w_mask 0.25 \
   --w_geom 0.25 \
-  --w_pose 0 \
   --query_loss_normalization fixed_scale \
   --query_depth_scale 0.10 \
   --query_mask_scale 1.00 \

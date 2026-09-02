@@ -38,7 +38,6 @@ CUDA_VISIBLE_DEVICES="$QUERY_GPU" "$PYTHON_BIN" -u query_paper.py \
   --w_depth 0.5 \
   --w_mask 0.25 \
   --w_geom 0.25 \
-  --w_pose 0.0 \
   --score_alpha 0.4 \
   --score_beta 0.6 \
   --query_loss_normalization fixed_scale \

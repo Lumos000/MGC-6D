@@ -5,7 +5,6 @@ candidate is selected only by the disclosed scalar score
 
     alpha * S_anchor_norm
     + beta * (-weighted_query_loss
-              + w_pose * S_pose_norm
               + w_consensus * S_consensus).
 
 They also provide an optional appearance transfer from the RGB-conditioned
@@ -63,7 +62,6 @@ def score_candidates(
     w_geom: float,
     score_alpha: float,
     score_beta: float,
-    w_pose: float = 0.0,
     w_appearance: float = 0.0,
     w_consensus: float = 0.0,
     loss_normalization: str = "minmax",
@@ -77,9 +75,8 @@ def score_candidates(
     ``S_anchor`` is divided by the largest non-negative anchor score.  Query
     losses are normalized either with disclosed fixed scales or by candidate-set
     min-max normalization, then combined using the user-visible weights.  The
-    optional appearance loss measures RGB agreement, the pose term is the
-    normalized FoundationPose confidence, and the consensus term records
-    agreement between independently registered geometry candidates.  No
+    optional appearance loss measures RGB agreement, and the consensus term
+    records agreement between independently registered geometry candidates. No
     default candidate, threshold replacement, hysteresis, or label-specific
     penalty is applied.
     """
@@ -87,7 +84,7 @@ def score_candidates(
     if not candidates:
         return candidates
     weights = np.asarray(
-        [w_depth, w_mask, w_geom, w_pose, w_appearance, w_consensus],
+        [w_depth, w_mask, w_geom, w_appearance, w_consensus],
         dtype=np.float64,
     )
     if not np.isfinite(weights).all() or (weights < 0).any() or float(weights.sum()) <= 0:
@@ -126,17 +123,6 @@ def score_candidates(
         raise ValueError(f"Unsupported loss normalization: {loss_normalization}")
     max_anchor = max(max(float(c.get("s_anchor", 0.0)), 0.0) for c in candidates)
     anchor_den = max(max_anchor, 1e-8)
-    pose_values = np.asarray(
-        [float(c.get("pose_score", 0.0)) for c in candidates], dtype=np.float64
-    )
-    pose_values = np.nan_to_num(pose_values, nan=0.0, posinf=0.0, neginf=0.0)
-    pose_lo = float(pose_values.min())
-    pose_hi = float(pose_values.max())
-    if pose_hi - pose_lo <= 1e-8:
-        pose_norm = np.zeros_like(pose_values)
-    else:
-        pose_norm = (pose_values - pose_lo) / (pose_hi - pose_lo)
-
     consensus = np.asarray(
         [float(c.get("pose_consensus", 1.0)) for c in candidates],
         dtype=np.float64,
@@ -145,13 +131,12 @@ def score_candidates(
         np.nan_to_num(consensus, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0
     )
 
-    for candidate, ld, lm, lg, la, sp, sc in zip(
+    for candidate, ld, lm, lg, la, sc in zip(
         candidates,
         depth_norm,
         mask_norm,
         geom_norm,
         appearance_norm,
-        pose_norm,
         consensus,
     ):
         query_loss = float(
@@ -160,7 +145,7 @@ def score_candidates(
             + w_geom * lg
             + w_appearance * la
         )
-        s_query = float(-query_loss + w_pose * sp + w_consensus * sc)
+        s_query = float(-query_loss + w_consensus * sc)
         s_anchor_norm = max(float(candidate.get("s_anchor", 0.0)), 0.0) / anchor_den
         total_score = float(score_alpha * s_anchor_norm + score_beta * s_query)
         candidate.update(
@@ -171,7 +156,6 @@ def score_candidates(
                 "l_appearance_norm": float(la),
                 "s_anchor_norm": float(s_anchor_norm),
                 "s_query": float(s_query),
-                "pose_score_norm": float(sp),
                 "pose_consensus": float(sc),
                 "total_score": total_score,
             }
@@ -325,12 +309,14 @@ def project_anchor_vertex_colors(
     anchor_mask: np.ndarray,
     anchor_k: np.ndarray,
     anchor_depth: np.ndarray | None = None,
+    depth_tolerance_m: float = 0.03,
 ) -> tuple[trimesh.Trimesh, int]:
     """Paint anchor-visible vertices from the observed RGB image.
 
     Visibility is checked against the anchor mask and, when available, the
-    measured depth (a fixed 3 cm tolerance).  Existing colors are retained on
-    unseen vertices, so this operation does not invent query-view information.
+    measured depth (a caller-disclosed metric tolerance). Existing colors are
+    retained on unseen vertices, so this operation does not invent query-view
+    information.
     """
 
     result = mesh.copy()
@@ -367,7 +353,10 @@ def project_anchor_vertex_colors(
             valid_idx = np.flatnonzero(valid)
             if valid_idx.size:
                 observed_z = depth[v[valid_idx], u[valid_idx]]
-                depth_ok = (observed_z > 1e-6) & (np.abs(z[valid_idx] - observed_z) <= 0.03)
+                depth_ok = (observed_z > 1e-6) & (
+                    np.abs(z[valid_idx] - observed_z)
+                    <= max(float(depth_tolerance_m), 0.0)
+                )
                 valid[valid_idx] &= depth_ok
 
     colors = _vertex_rgba(result)
@@ -394,6 +383,7 @@ def apply_candidate_appearance(
     anchor_mask: np.ndarray | None = None,
     anchor_k: np.ndarray | None = None,
     anchor_depth: np.ndarray | None = None,
+    anchor_depth_tolerance_m: float = 0.03,
 ) -> tuple[dict[str, trimesh.Trimesh], AppearanceSummary]:
     """Apply the selected, explicitly reportable candidate appearance mode."""
 
@@ -445,6 +435,7 @@ def apply_candidate_appearance(
                 anchor_mask,
                 anchor_k,
                 anchor_depth,
+                anchor_depth_tolerance_m,
             )
             if count > 0:
                 projected.append(label)

@@ -618,13 +618,6 @@ if __name__ == '__main__':
     parser.add_argument("--w_geom", type=float, default=0.25,
                         help="Weight for L_geom (Chamfer) in observation consistency")
     parser.add_argument(
-        "--w_pose", type=float, default=0.0,
-        help=(
-            "FoundationPose-confidence weight. Keep 0 for the paper Eq. (22); "
-            "non-zero values are an explicitly labelled ablation."
-        ),
-    )
-    parser.add_argument(
         "--query_loss_normalization",
         type=str,
         default="fixed_scale",
@@ -658,7 +651,7 @@ if __name__ == '__main__':
 
     if min(args.query_depth_scale, args.query_mask_scale, args.query_geom_scale) <= 0:
         parser.error("query fixed scales must be positive")
-    if min(args.w_depth, args.w_mask, args.w_geom, args.w_pose) < 0:
+    if min(args.w_depth, args.w_mask, args.w_geom) < 0:
         parser.error("query score weights must be non-negative")
 
     seed_everything(int(args.seed))
@@ -702,20 +695,12 @@ if __name__ == '__main__':
         },
         "selection": {
             "rule": "direct weighted argmax; no default candidate or hard replacement gate",
-            "formula": (
-                "alpha*S_anchor_norm+beta*(-wd*Ld_norm-wm*Lm_norm-wg*Lg_norm)"
-                if args.w_pose == 0.0 else
-                "alpha*S_anchor_norm+beta*(-wd*Ld_norm-wm*Lm_norm-wg*Lg_norm+wpose*Spose_norm)"
-            ),
-            "paper_equation_22": bool(args.w_pose == 0.0),
-            "pose_confidence_role": (
-                "diagnostic_only" if args.w_pose == 0.0 else "explicit_ablation"
-            ),
+            "formula": "alpha*S_anchor_norm+beta*(-wd*Ld_norm-wm*Lm_norm-wg*Lg_norm)",
+            "paper_equation_22": True,
             "loss_normalization": args.query_loss_normalization,
             "w_depth": args.w_depth,
             "w_mask": args.w_mask,
             "w_geom": args.w_geom,
-            "w_pose": args.w_pose,
             "depth_scale": args.query_depth_scale,
             "mask_scale": args.query_mask_scale,
             "geom_scale": args.query_geom_scale,
@@ -1164,15 +1149,6 @@ if __name__ == '__main__':
                         )
                         continue
 
-                pose_scores = getattr(est, "scores", None)
-                if pose_scores is None or len(pose_scores) == 0:
-                    pose_score = 0.0
-                else:
-                    pose_score_value = pose_scores[0]
-                    if torch.is_tensor(pose_score_value):
-                        pose_score_value = pose_score_value.detach().cpu().item()
-                    pose_score = float(pose_score_value)
-
                 local_symmetry_tfs = candidate["local_symmetry_tfs"]
                 if args.anchor_symmetry_align and len(local_symmetry_tfs) > 1:
                     cand_pred = _resolve_pose_to_anchor_symmetry(
@@ -1204,7 +1180,6 @@ if __name__ == '__main__':
                         "l_mask": float(l_m),
                         "l_geom": float(l_g),
                         "coverage": float(coverage),
-                        "pose_score": float(pose_score),
                     }
                 )
 
@@ -1215,7 +1190,6 @@ if __name__ == '__main__':
                 w_depth=args.w_depth,
                 w_mask=args.w_mask,
                 w_geom=args.w_geom,
-                w_pose=args.w_pose,
                 score_alpha=args.score_alpha,
                 score_beta=args.score_beta,
                 loss_normalization=args.query_loss_normalization,
@@ -1244,8 +1218,6 @@ if __name__ == '__main__':
                         "L_depth_norm": result["l_depth_norm"],
                         "L_mask_norm": result["l_mask_norm"],
                         "L_geom_norm": result["l_geom_norm"],
-                        "Pose_Score_Raw": result["pose_score"],
-                        "Pose_Score_Norm": result["pose_score_norm"],
                         "Mesh_Fingerprint": result["cache"].fingerprint,
                         "Mesh_Vertices": int(len(result["cache"].mesh.vertices)),
                         "Mesh_Diameter": float(result["cache"].diameter),

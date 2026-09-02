@@ -20,8 +20,8 @@ The main protocol is deliberately explicit:
   direction, followed by best-of-two direction selection;
 - fusion: topology-preserving visible-patch update in the RaySt3R anchor frame;
 - query selection: direct Eq. (22) weighted argmax, with
-  `alpha=0.4`, `beta=0.6`, `(w_depth,w_mask,w_geom)=(0.5,0.25,0.25)`, and
-  `w_pose=0`;
+  `alpha=0.4`, `beta=0.6`, and
+  `(w_depth,w_mask,w_geom)=(0.5,0.25,0.25)`;
 - appearance: `prior_transfer`;
 - inference-time GT symmetry adjustment and temporal smoothing: disabled;
 - external `obs` and legacy fallback candidates: disabled.
@@ -170,7 +170,7 @@ same anchor command from `scripts/run_ho3d_full.sh` in a new output directory
 and add `--align_strict_both`. Do not combine strict-both anchors with the main
 result name.
 
-The optional flags `--refine_mask`, `--obs_anchor_path`, nonzero `--w_pose`,
+The optional flags `--refine_mask`, `--obs_anchor_path`,
 `--symmetry_consistency_enable`, and `--anchor_symmetry_align` are ablations and
 are intentionally absent from the released main command.
 
