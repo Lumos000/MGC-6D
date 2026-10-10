@@ -47,13 +47,11 @@ ENV CONDA_DEFAULT_ENV=mgc6d
 COPY . .
 
 RUN conda install -y -c conda-forge eigen=3.4.0 \
-    && cd sam2 && pip install -e . && cd .. \
-    && cd bop_toolkit && pip install -e . && cd ..
+    && PYTHON_BIN=python CUDA_HOME=/usr/local/cuda \
+       bash scripts/install_revision_dependencies.sh
 
-# FoundationPose CUDA extensions are machine/toolchain-sensitive. Build them
-# inside the container after mounting/downloading the required weights:
-#   cd foundationpose && bash build_all_conda.sh
-# RaySt3R remains external; set RAYST3R_ROOT at runtime.
+# RaySt3R remains external; pin it to the commit documented in README.md and
+# set RAYST3R_ROOT at runtime. Model weights are intentionally not baked in.
 
 ENV SHELL=/bin/bash
 CMD ["bash"]

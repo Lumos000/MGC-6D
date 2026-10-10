@@ -6,8 +6,9 @@ docs/experiments.md for anchor/query runtime validation.
 """
 
 from pathlib import Path
+import argparse
 import importlib
-import subprocess
+import py_compile
 import sys
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -24,22 +25,41 @@ LIGHT_MODULES = [
 
 CLI_HELP = [
     "query_paper.py",
+    "query_paper_toyl.py",
+    "run_real275_query.py",
+]
+
+FULL_MODULES = [
+    "nvdiffrast.torch",
+    "pytorch3d",
+    "open3d",
+    "trimesh",
+    "sam2",
+    "foundationpose.Utils",
 ]
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--full", action="store_true")
+    args = parser.parse_args()
     for name in LIGHT_MODULES:
         importlib.import_module(name)
         print(f"ok import {name}")
     for script in CLI_HELP:
-        subprocess.run(
-            [sys.executable, script, "--help"],
-            cwd=PROJECT_ROOT,
-            check=True,
-            stdout=subprocess.DEVNULL,
-        )
-        print(f"ok help {script}")
-    print("skipped anchor_paper.py --help by default; it requires RaySt3R import setup")
+        py_compile.compile(str(PROJECT_ROOT / script), doraise=True)
+        print(f"ok compile {script}")
+    if args.full:
+        for name in FULL_MODULES:
+            importlib.import_module(name)
+            print(f"ok import {name}")
+        from foundationpose.Utils import mycpp
+
+        if mycpp is None or not hasattr(mycpp, "cluster_poses"):
+            raise RuntimeError("FoundationPose mycpp.cluster_poses is unavailable")
+        print("ok FoundationPose mycpp.cluster_poses")
+    else:
+        print("use --full to validate CUDA renderers and FoundationPose extensions")
 
 
 if __name__ == "__main__":

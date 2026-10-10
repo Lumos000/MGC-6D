@@ -1,19 +1,4 @@
-"""
-REAL275 query evaluation — v3 (baseline-fair).
-
-Evaluation modes:
-  - 'baseline_fair': Matches HO3D baseline protocol exactly.
-      * Model vertices scaled by NOCS scale (gt_vertices_eval = base * s).
-      * Poses decomposed to pure SE(3) via decompose_nocs_pose.
-      * Diameter computed on scaled vertices.
-      * ADD/ADD-S threshold = diameter * 0.1 (consistent scale).
-      * BOP symmetry from models_info.json discrete transforms (like HO3D).
-      * No z-correction, no extra tricks.
-  - 'nocs_scaled': Legacy mode (direct_nocs / decomposed_se3 sub-modes).
-  - 'physical': Legacy mode (physical metric scale).
-
-The 'baseline_fair' mode is the recommended default for fair comparison.
-"""
+"""REAL275 query evaluation using the fixed baseline-fair paper protocol."""
 
 from project_paths import setup_project_paths
 setup_project_paths()
@@ -23,6 +8,7 @@ import hashlib
 import os
 import argparse
 import pickle
+import time
 import warnings
 
 import cv2
@@ -33,19 +19,32 @@ import torch
 import nvdiffrast.torch as dr
 from tqdm import tqdm
 
-from estimater import *
-from metrics import *
+from estimater import Any6D, PoseRefinePredictor, ScorePredictor
+from metrics import compute_RT_distances, compute_add, compute_adds
 from bop_toolkit_lib.pose_error_custom import mssd, mspd, vsd
-from bop_toolkit_lib.renderer_vispy import RendererVispy
-from foundationpose.Utils import calc_pts_diameter, make_mesh_tensors, nvdiffrast_render
+from foundationpose.Utils import (
+    calc_pts_diameter,
+    compute_mesh_diameter,
+    make_mesh_tensors,
+    nvdiffrast_render,
+    visualize_frame_results_gt,
+)
 from pytorch_lightning import seed_everything
 from datetime import datetime
 import json
 from candidate_selection import (
     PAPER_CANDIDATE_LABELS,
     apply_candidate_appearance,
-    parse_candidate_labels,
+    candidate_mesh_diameter,
+    compute_anchor_reliability_components,
+    paper_registry_candidates,
     score_candidates,
+    select_scored_candidate,
+)
+from revision_protocol import (
+    add_query_protocol_arguments,
+    runtime_provenance,
+    validate_query_protocol,
 )
 
 
@@ -63,7 +62,12 @@ class CandidateCache:
         "dist_bin", "angle_bin", "mesh_tensors", "mesh_o3d", "fingerprint",
     )
 
-    def __init__(self, label: str, mesh: trimesh.Trimesh):
+    def __init__(
+        self,
+        label: str,
+        mesh: trimesh.Trimesh,
+        diameter_mode: str = "bbox_diagonal",
+    ):
         import open3d as o3d
 
         self.label = str(label)
@@ -75,7 +79,11 @@ class CandidateCache:
         centered = mesh.copy()
         centered.vertices = vertices - self.model_center.reshape(1, 3)
         self.mesh = centered
-        self.diameter = float(np.linalg.norm(max_xyz - min_xyz))
+        self.diameter = candidate_mesh_diameter(
+            centered.vertices,
+            diameter_mode,
+            sampled_diameter_fn=compute_mesh_diameter,
+        )
         self.vox_size = max(self.diameter / 20.0, 0.003)
         self.dist_bin = self.vox_size / 2.0
         self.angle_bin = 20
@@ -123,80 +131,6 @@ def swap_candidate(est: Any6D, cache: CandidateCache) -> None:
 
 # ---------------------------------------------------------------------------
 # Symmetry helpers for pose consistency (ported from query_method_ablation.py)
-# ---------------------------------------------------------------------------
-
-def _resolve_pose_to_anchor_symmetry(
-    pose_q: np.ndarray,
-    pose_a: np.ndarray,
-    sym_tfs: list,
-) -> np.ndarray:
-    """Pick the symmetry branch of pose_q closest to pose_a."""
-    if len(sym_tfs) <= 1:
-        return pose_q
-    inv_a = np.linalg.inv(pose_a.astype(np.float64))
-    best_pose = pose_q
-    best_angle = float("inf")
-    for sym_tf in sym_tfs:
-        pose_try = pose_q @ sym_tf
-        rel = pose_try.astype(np.float64) @ inv_a
-        trace = np.clip((np.trace(rel[:3, :3]) - 1.0) / 2.0, -1.0, 1.0)
-        angle = float(np.degrees(np.arccos(trace)))
-        if angle < best_angle:
-            best_angle = angle
-            best_pose = pose_try
-    return best_pose
-
-
-def _pose_jump_score(pose_curr: np.ndarray, pose_prev: np.ndarray) -> float:
-    rel = pose_curr @ np.linalg.inv(pose_prev)
-    r = rel[:3, :3]
-    trace_val = np.clip((np.trace(r) - 1.0) * 0.5, -1.0, 1.0)
-    rot_deg = float(np.degrees(np.arccos(trace_val)))
-    trans_cm = float(np.linalg.norm(rel[:3, 3]) * 100.0)
-    return rot_deg + 2.0 * trans_cm
-
-
-def _resolve_pose_with_symmetry(
-    pose_curr: np.ndarray,
-    sym_tfs: list,
-    pose_prev: np.ndarray | None,
-) -> np.ndarray:
-    """Pick the symmetry branch of pose_curr closest to pose_prev (temporal)."""
-    if pose_prev is None or len(sym_tfs) <= 1:
-        return pose_curr
-    best_pose = pose_curr
-    best_score = float("inf")
-    for sym_tf in sym_tfs:
-        pose_try = pose_curr @ sym_tf
-        score_try = _pose_jump_score(pose_try, pose_prev)
-        if score_try < best_score:
-            best_score = float(score_try)
-            best_pose = pose_try
-    return best_pose
-
-
-def _candidate_local_symmetry_list(raw_tfs) -> list[np.ndarray]:
-    """Parse symmetry transforms expressed in one candidate's local frame.
-
-    These transforms are deliberately sourced from the candidate registry,
-    never from REAL275 GT/BOP metadata.  Generated candidates currently store
-    identity only, so the main no-adjustment experiment cannot accidentally
-    benefit from evaluation annotations.
-    """
-
-    parsed = []
-    for raw in raw_tfs or []:
-        try:
-            tf = np.asarray(raw, dtype=np.float64).reshape(4, 4)
-        except Exception:
-            continue
-        if np.isfinite(tf).all():
-            parsed.append(tf)
-    return parsed or [np.eye(4, dtype=np.float64)]
-
-
-# ---------------------------------------------------------------------------
-# Observation consistency scoring (Eq. 14 from paper)
 # ---------------------------------------------------------------------------
 
 def _backproject_depth_to_points(depth, K, valid_mask, max_points=5000):
@@ -397,118 +331,63 @@ def load_gt_poses(gt_dir, scene, frame_id):
 # Symmetry helpers
 # ---------------------------------------------------------------------------
 
-def _axis_rotation_matrix(axis, angle):
-    c, s = np.cos(angle), np.sin(angle)
-    if axis == 'x':
-        return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
-    if axis == 'y':
-        return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
-    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+def _load_real275_evaluation_resources(
+    *, obj_name, model_dir, anchor_gt_path, models_info_path, renderer,
+):
+    """Load the fixed baseline-fair evaluation resources after selection."""
 
+    anchor_gt_pose = np.loadtxt(anchor_gt_path)
+    gt_model_path = os.path.join(model_dir, f"{obj_name}.obj")
+    if not os.path.exists(gt_model_path):
+        raise FileNotFoundError(gt_model_path)
+    gt_mesh_nocs = trimesh.load(gt_model_path)
+    gt_vertices_eval = np.asarray(gt_mesh_nocs.vertices, dtype=np.float64)
+    gt_diameter = calc_pts_diameter(gt_vertices_eval)
+    ob_id = REAL275_OBJECTS.index(obj_name) + 1
+    renderer.my_add_object(
+        {
+            "pts": gt_vertices_eval * 1e3,
+            "normals": np.asarray(gt_mesh_nocs.face_normals),
+            "faces": np.asarray(gt_mesh_nocs.faces),
+        },
+        ob_id,
+    )
+    trans_disc = [{"R": np.eye(3), "t": np.zeros((3, 1))}]
+    if os.path.exists(models_info_path):
+        with open(models_info_path, "r", encoding="utf-8") as handle:
+            models_info = json.load(handle)
+        for symmetry in models_info.get(str(ob_id), {}).get("symmetries_discrete", []):
+            matrix = np.reshape(symmetry, (4, 4))
+            trans_disc.append(
+                {"R": matrix[:3, :3], "t": matrix[:3, 3].reshape((3, 1))}
+            )
+    return {
+        "anchor_gt_pose": anchor_gt_pose,
+        "gt_mesh_nocs": gt_mesh_nocs,
+        "gt_vertices_eval": gt_vertices_eval,
+        "gt_diameter": gt_diameter,
+        "ob_id": ob_id,
+        "is_symmetric": obj_name in REVOLUTION_SYMMETRIC_OBJECTS,
+        "use_symmetry_metrics": len(trans_disc) > 1,
+        "sym_axis": "discrete",
+        "trans_disc": trans_disc,
+    }
 
-def _build_continuous_symmetry_disc(n_steps=12, axis='z'):
-    """Discrete approximation of continuous revolution symmetry around axis."""
-    trans_disc = [{"R": np.eye(3), "t": np.array([[0, 0, 0]]).T}]
-    for i in range(1, n_steps):
-        angle = 2 * np.pi * i / n_steps
-        R = _axis_rotation_matrix(axis, angle)
-        trans_disc.append({"R": R, "t": np.array([[0, 0, 0]]).T})
-    return trans_disc
-
-
-def _infer_revolution_axis(obj_name, verts):
-    """Infer likely revolution axis for REAL275 symmetric objects."""
-    ext = verts.max(axis=0) - verts.min(axis=0)
-    # REAL275 convention by category:
-    # - bottle/can: revolution axis aligns with the longest extent (height)
-    # - bowl: revolution axis aligns with the shortest extent (height)
-    if obj_name.startswith('bowl_'):
-        axis_idx = int(np.argmin(ext))
-    elif obj_name.startswith('bottle_') or obj_name.startswith('can_'):
-        axis_idx = int(np.argmax(ext))
-    else:
-        axis_idx = 2
-    return ['x', 'y', 'z'][axis_idx]
-
-
-# ---------------------------------------------------------------------------
-# Lightweight z-only depth correction (final prediction, optional)
-# ---------------------------------------------------------------------------
-
-def _depth_z_correction(pred_q, depth, mask, K, diameter_m,
-                        z_weight=0.3, min_pts=50):
-    """Correct ONLY the z-component of the final prediction using depth obs.
-
-    Unlike the full _depth_correct_final_pose (which was harmful for REAL275),
-    this only touches z and uses a conservative weight.  This addresses the
-    systematic depth bias from relative-pose-chain translation transfer
-    without perturbing xy (which the chain estimates well).
-    """
-    valid = (depth > 1e-6) & np.isfinite(depth) & (mask > 0)
-    if int(valid.sum()) < min_pts:
-        return pred_q
-
-    z_vals = depth[valid].astype(np.float64)
-    lo, hi = np.percentile(z_vals, [15, 85])
-    trimmed = z_vals[(z_vals >= lo) & (z_vals <= hi)]
-    if len(trimmed) < 16:
-        z_obs = float(np.median(z_vals))
-    else:
-        z_obs = float(np.mean(trimmed))
-
-    pred_z = float(pred_q[2, 3])
-    dev = abs(pred_z - z_obs)
-    if dev < diameter_m * 0.05 or dev > diameter_m * 5.0:
-        return pred_q
-
-    corrected = pred_q.copy()
-    corrected[2, 3] = (1.0 - z_weight) * pred_z + z_weight * z_obs
-    return corrected
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    seed_everything(0)
-
-    parser = argparse.ArgumentParser(description="REAL275 Query Evaluation (v2-fixed)")
+    parser = argparse.ArgumentParser(description="REAL275 paper-protocol query evaluation")
     parser.add_argument("--name", type=str, default="any6d_real275")
     parser.add_argument(
         "--anchor_path", type=str,
-        default="/data/gst/MGC-6D/results/anchor_results/real275_mgc6d_seed0_cuda23_20260828_080131",
+        required=True,
+        help="Anchor result folder containing candidate_registry.json",
     )
     parser.add_argument(
         "--real275_data_root", type=str,
-        default="/data/gst/data/REAL275",
+        required=True,
     )
     parser.add_argument("--running_stride", type=int, default=10)
     parser.add_argument("--register_iteration", type=int, default=5)
-    parser.add_argument(
-        "--use_tracking_init",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Use the previous query pose as registration initialization. Disabled "
-            "for the paper's independent anchor-query protocol."
-        ),
-    )
-    parser.add_argument(
-        "--reinit_interval",
-        type=int,
-        default=25,
-        help=(
-            "Periodically re-initialize tracking every N successful frames "
-            "within a scene (<=0 disables periodic reinit)."
-        ),
-    )
-    parser.add_argument(
-        "--oom_retry_iteration",
-        type=int,
-        default=2,
-        help="Fallback register iterations used after CUDA OOM (set <=0 to disable retry)",
-    )
     parser.add_argument(
         "--obj_classes", type=str, default="",
         help="Comma-separated object classes to evaluate (empty = all 18)",
@@ -518,28 +397,6 @@ if __name__ == '__main__':
         help="Comma-separated scenes to evaluate (empty = all 6)",
     )
     parser.add_argument("--min_mask_pixels", type=int, default=64)
-    parser.add_argument("--symmetry_n_steps", type=int, default=12,
-                        help="Discrete steps for revolution-symmetric BOP metrics")
-    parser.add_argument("--z_correct_enable", action=argparse.BooleanOptionalAction,
-                        default=False,
-                        help="Enable lightweight z-only depth correction on final pose")
-    parser.add_argument("--z_correct_weight", type=float, default=0.3,
-                        help="Blend weight for z correction (0=no change, 1=full depth)")
-    parser.add_argument(
-        "--eval_scale_mode",
-        type=str,
-        default="baseline_fair",
-        choices=["baseline_fair", "physical", "nocs_scaled"],
-        help=(
-            "Evaluation protocol selector. "
-            "'baseline_fair': use REAL275 *_norm.obj in its native metric "
-            "scale, decompose poses to SE(3), use discrete symmetry from "
-            "models_info.json, and apply no z-correction. "
-            "'physical': use REAL275 *_norm.obj in native metric scale and "
-            "evaluate on decomposed SE(3) poses. "
-            "'nocs_scaled': legacy Any6D-style REAL275 evaluation."
-        ),
-    )
     parser.add_argument(
         "--models_info_path",
         type=str,
@@ -549,113 +406,27 @@ if __name__ == '__main__':
             "symmetry transforms. Used only when eval_scale_mode=baseline_fair."
         ),
     )
-    parser.add_argument(
-        "--nocs_scaled_disable_symmetry",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "When eval_scale_mode=nocs_scaled, disable REAL275-specific BOP "
-            "symmetry handling (MSSD/MSPD/VSD). This does NOT affect the "
-            "dataset primary ADD(-S) computation, which still uses ADD-S for "
-            "known symmetric classes."
-        ),
-    )
-    parser.add_argument(
-        "--nocs_scaled_pose_mode",
-        type=str,
-        default="decomposed_se3",
-        choices=["decomposed_se3", "direct_nocs"],
-        help=(
-            "How to evaluate poses when eval_scale_mode=nocs_scaled. "
-            "'decomposed_se3' scales the model by NOCS scale and evaluates on "
-            "pure SE(3) poses (recommended; closer to HO3D/Any6D style). "
-            "'direct_nocs' keeps the model unscaled and evaluates directly on "
-            "NOCS poses carrying scale."
-        ),
-    )
-    parser.add_argument(
-        "--nocs_scaled_disable_z_correction",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "When eval_scale_mode=nocs_scaled, force-disable z-only depth "
-            "correction to keep the protocol aligned with original Any6D."
-        ),
-    )
-    parser.add_argument(
-        "--nocs_scaled_report_add_as_primary",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "When eval_scale_mode=nocs_scaled, use ADD as the primary summary "
-            "metric instead of the dataset primary ADD(-S) summary."
-        ),
-    )
-    # --- Symmetry consistency (ported from ablation) ---
-    parser.add_argument(
-        "--symmetry_consistency_enable",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Estimation-only ablation: resolve temporal pose branches by discrete "
-            "symmetry. GT evaluation symmetry remains enabled independently."
-        ),
-    )
-    parser.add_argument(
-        "--anchor_symmetry_align",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Estimation-only ablation: align a candidate-local query pose to its "
-            "anchor branch. Disabled for the main no-adjustment contrast."
-        ),
-    )
-    # --- Multi-candidate mesh support ---
-    parser.add_argument("--w_depth", type=float, default=0.5,
-                        help="Weight for L_depth in observation consistency")
-    parser.add_argument("--w_mask", type=float, default=0.25,
-                        help="Weight for L_mask in observation consistency")
-    parser.add_argument("--w_geom", type=float, default=0.25,
-                        help="Weight for L_geom (Chamfer) in observation consistency")
-    parser.add_argument(
-        "--query_loss_normalization",
-        type=str,
-        default="fixed_scale",
-        choices=["fixed_scale", "minmax"],
-    )
-    parser.add_argument("--query_depth_scale", type=float, default=0.10)
-    parser.add_argument("--query_mask_scale", type=float, default=1.00)
-    parser.add_argument("--query_geom_scale", type=float, default=0.10)
-    parser.add_argument("--score_alpha", type=float, default=0.4)
-    parser.add_argument("--score_beta", type=float, default=0.6)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
-        "--candidate_labels",
-        type=str,
-        default=",".join(PAPER_CANDIDATE_LABELS),
-        help="Comma-separated candidate_registry labels used in the main evaluation.",
+        "--mesh_diameter_mode",
+        choices=["bbox_diagonal", "sampled_surface"],
+        default="bbox_diagonal",
+        help=(
+            "FoundationPose registration diameter. bbox_diagonal restores the "
+            "validated v7 protocol; sampled_surface is retained only for A/B."
+        ),
     )
-    parser.add_argument(
-        "--candidate_color_mode",
-        type=str,
-        default="anchor_prior_hybrid",
-        choices=[
-            "native",
-            "prior_transfer",
-            "anchor_projected",
-            "anchor_prior_hybrid",
-            "uniform_gray",
-        ],
-    )
+    add_query_protocol_arguments(parser)
     args = parser.parse_args()
-
-    if min(args.query_depth_scale, args.query_mask_scale, args.query_geom_scale) <= 0:
-        parser.error("query fixed scales must be positive")
-    if min(args.w_depth, args.w_mask, args.w_geom) < 0:
-        parser.error("query score weights must be non-negative")
+    args.w_appearance = 0.0
+    args.query_loss_normalization = "fixed_scale"
+    args.query_depth_scale = 0.10
+    args.query_mask_scale = 1.00
+    args.query_geom_scale = 0.10
+    args.query_appearance_scale = 1.00
 
     seed_everything(int(args.seed))
-    selected_labels = parse_candidate_labels(args.candidate_labels)
+    selected_labels = validate_query_protocol(args)
 
     anchor_path = args.anchor_path
     data_root = args.real275_data_root
@@ -680,33 +451,48 @@ if __name__ == '__main__':
         "registry_path": os.path.abspath(registry_path),
         "seed": int(args.seed),
         "mask_source": "ground-truth instance mask",
-        "query_protocol": "independent anchor-query" if not args.use_tracking_init else "tracking-init ablation",
+        "mask_sources": {
+            "anchor": "dataset_ground_truth_instance_mask",
+            "query": "dataset_ground_truth_instance_mask",
+        },
+        "query_protocol": "independent anchor-query",
         "candidate_labels": sorted(selected_labels or []),
         "candidate_color_mode": args.candidate_color_mode,
+        "mesh_diameter_mode": args.mesh_diameter_mode,
         "symmetry": {
             "gt_evaluation": (
                 "dataset/BOP symmetry definitions remain active in ADD(-S), MSSD, MSPD and VSD"
             ),
-            "candidate_local_anchor_adjustment": bool(args.anchor_symmetry_align),
-            "candidate_local_temporal_adjustment": bool(
-                args.use_tracking_init and args.symmetry_consistency_enable
-            ),
+            "candidate_local_anchor_adjustment": False,
+            "candidate_local_temporal_adjustment": False,
             "separated_contract": True,
         },
+        "gt_usage": {
+            "candidate_registration": False,
+            "candidate_scoring": False,
+            "candidate_selection": False,
+            "anchor_gt_pose": "relative-pose evaluation conversion after winner selection only",
+            "query_gt_pose": "loaded only after winner selection for final metrics",
+            "gt_cad": "evaluation module only; never passed to registration, scoring, or selection",
+        },
         "selection": {
+            "policy": "weighted",
             "rule": "direct weighted argmax; no default candidate or hard replacement gate",
-            "formula": "alpha*S_anchor_norm+beta*(-wd*Ld_norm-wm*Lm_norm-wg*Lg_norm)",
+            "formula": "alpha*S_anchor_norm+beta*(-wd*Ld-wm*Lm-wg*Lg)",
             "paper_equation_22": True,
             "loss_normalization": args.query_loss_normalization,
             "w_depth": args.w_depth,
             "w_mask": args.w_mask,
             "w_geom": args.w_geom,
+            "w_appearance": args.w_appearance,
             "depth_scale": args.query_depth_scale,
             "mask_scale": args.query_mask_scale,
             "geom_scale": args.query_geom_scale,
+            "appearance_scale": args.query_appearance_scale,
             "score_alpha": args.score_alpha,
             "score_beta": args.score_beta,
         },
+        "provenance": runtime_provenance(os.path.dirname(__file__)),
         "args": vars(args),
     }
     with open(os.path.join(save_root, "query_run_manifest.json"), "w", encoding="utf-8") as f:
@@ -744,6 +530,8 @@ if __name__ == '__main__':
         debug=0,
         glctx=glctx,
     )
+    # Defer EGL initialization until after argument parsing.
+    from bop_toolkit_lib.renderer_vispy import RendererVispy
 
     renderer = RendererVispy(640, 480, mode='depth')
 
@@ -753,6 +541,7 @@ if __name__ == '__main__':
             'MSSD': [], 'MSPD': [], 'R error': [], 'T error': [],
             'cls_id': [], 'instance_id': [],
             'scene': [], 'frame_num': [], 'chosen_candidate': [],
+            'selection_time_s': [],
         }
         for obj in obj_list
     }
@@ -761,13 +550,16 @@ if __name__ == '__main__':
         'ADD-S': [], 'ADD': [], 'ADD(-S)': [], 'AR': [],
         'MSSD': [], 'MSPD': [], 'VSD': [],
         'R_error': [], 'T_error': [], 'Chosen_Candidate': [],
+        'Selection_Time_s': [],
     }
 
     data = []
     obj_count = 0
     evaluated_objects = []
     candidate_score_rows = []
-    appearance_audit_rows = []
+    selection_times = []
+    registration_failure_frames = 0
+    sampled_frame_instances = 0
 
     for obj_name in tqdm(obj_list, desc='Evaluating Objects'):
         # ============================================================
@@ -792,7 +584,6 @@ if __name__ == '__main__':
             continue
 
         pred_pose_a = np.loadtxt(anchor_pose_path)       # SE(3)
-        gt_pose_a = np.loadtxt(anchor_gt_path)            # NOCS [sR|t]
         anchor_mesh = trimesh.load(anchor_mesh_path)
         anchor_k = np.loadtxt(anchor_k_path)
         anchor_color_bgr = cv2.imread(os.path.join(obj_anchor_dir, "color.png"))
@@ -819,76 +610,16 @@ if __name__ == '__main__':
         # Do not apply an object-level centering offset here: doing so a second
         # time was one source of REAL275 anchor/query frame inconsistency.
 
-        # ============================================================
-        #  2. Load normalised GT model & compute real-world scale
-        # ============================================================
-        gt_model_path = os.path.join(model_dir, f"{obj_name}.obj")
-        if not os.path.exists(gt_model_path):
-            print(f"Skip {obj_name}: GT model not found at {gt_model_path}")
-            continue
-        gt_mesh_nocs = trimesh.load(gt_model_path)
-
-        nocs_scale, _ = decompose_nocs_pose(gt_pose_a)
-        gt_vertices_base = np.asarray(gt_mesh_nocs.vertices, dtype=np.float64)
-        use_any6d_nocs_protocol = (args.eval_scale_mode == "nocs_scaled")
-        use_baseline_fair = (args.eval_scale_mode == "baseline_fair")
-
-        if use_baseline_fair:
-            # baseline_fair: REAL275 _norm.obj vertices are already in physical
-            # metric scale (meters). Do NOT multiply by nocs_scale — that is
-            # the scale factor inside the NOCS pose [sR|t], not a model scaler.
-            # This matches HO3D where gt_mesh.vertices are also metric-scale.
-            gt_vertices_eval = gt_vertices_base
-        elif use_any6d_nocs_protocol:
-            if args.nocs_scaled_pose_mode == "decomposed_se3":
-                gt_vertices_eval = gt_vertices_base * nocs_scale
-            else:
-                gt_vertices_eval = gt_vertices_base
-        else:
-            gt_vertices_eval = gt_vertices_base
-        gt_diameter = calc_pts_diameter(gt_vertices_eval)
-
+        evaluation_resources = None
+        anchor_gt_pose_evaluation_only = None
+        gt_mesh_nocs = None
+        gt_vertices_eval = None
+        gt_diameter = float("nan")
         ob_id = REAL275_OBJECTS.index(obj_name) + 1
-        renderer.my_add_object(
-            {
-                'pts': gt_vertices_eval * 1e3,
-                'normals': np.asarray(gt_mesh_nocs.face_normals),
-                'faces': np.asarray(gt_mesh_nocs.faces),
-            },
-            ob_id,
-        )
-
-        is_symmetric = obj_name in REVOLUTION_SYMMETRIC_OBJECTS
-
-        if use_baseline_fair:
-            # baseline_fair: use discrete symmetry from models_info.json,
-            # exactly like HO3D baseline does.
-            trans_disc = [{"R": np.eye(3), "t": np.array([[0, 0, 0]]).T}]
-            sym_axis = 'discrete'
-            if os.path.exists(args.models_info_path):
-                with open(args.models_info_path, 'r') as f:
-                    models_info = json.load(f)
-                key = str(ob_id)
-                if key in models_info and "symmetries_discrete" in models_info[key]:
-                    for sym in models_info[key]["symmetries_discrete"]:
-                        sym_4x4 = np.reshape(sym, (4, 4))
-                        R = sym_4x4[:3, :3]
-                        t = sym_4x4[:3, 3].reshape((3, 1))
-                        trans_disc.append({"R": R, "t": t})
-            use_symmetry_metrics = len(trans_disc) > 1
-        else:
-            use_symmetry_metrics = is_symmetric
-            if use_any6d_nocs_protocol and args.nocs_scaled_disable_symmetry:
-                use_symmetry_metrics = False
-
-            if use_symmetry_metrics:
-                sym_axis = _infer_revolution_axis(obj_name, gt_vertices_eval)
-                trans_disc = _build_continuous_symmetry_disc(
-                    args.symmetry_n_steps, axis=sym_axis
-                )
-            else:
-                sym_axis = 'none'
-                trans_disc = [{"R": np.eye(3), "t": np.array([[0, 0, 0]]).T}]
+        is_symmetric = False
+        use_symmetry_metrics = False
+        sym_axis = "deferred"
+        trans_disc = None
 
         # ============================================================
         #  3. Collect query frames (exclude anchor, apply stride)
@@ -932,9 +663,31 @@ if __name__ == '__main__':
         # relative transform when candidate coordinate frames differ.
         candidate_meshes = []
         obj_registry = candidate_registry.get(obj_name, {})
-        for label, info in obj_registry.get("candidates", {}).items():
-            if selected_labels is not None and label not in selected_labels:
-                continue
+        if (
+            obj_registry.get("anchor_score_version")
+            != "bounded_observation_calibrated_v1"
+        ):
+            raise ValueError(
+                f"{obj_name}: legacy or missing anchor score contract; "
+                "regenerate the REAL275 anchor with the current code"
+            )
+        registry_candidates = paper_registry_candidates(
+            obj_registry.get("candidates", {})
+        )
+        registry_candidates = {
+            label: info
+            for label, info in registry_candidates.items()
+            if label in selected_labels
+        }
+        for label, info in registry_candidates.items():
+            if (
+                info.get("anchor_score_version")
+                != "bounded_observation_calibrated_v1"
+            ):
+                raise ValueError(
+                    f"{obj_name}/{label}: missing bounded anchor score metadata; "
+                    "regenerate the REAL275 anchor with the current code"
+                )
             mesh_path = info.get("mesh_path", "")
             pose_path = info.get("pose_path", "")
             if not (os.path.exists(mesh_path) and os.path.exists(pose_path)):
@@ -951,9 +704,6 @@ if __name__ == '__main__':
             ).reshape(3)
             mesh_frame = str(info.get("mesh_frame", "legacy_unknown"))
             pose_frame = str(info.get("pose_frame", "legacy_unknown"))
-            local_symmetry_tfs = _candidate_local_symmetry_list(
-                info.get("candidate_local_symmetry_tfs")
-            )
             if (
                 mesh_frame == "any6d_internal_centered"
                 and pose_frame == "any6d_internal_centered_to_anchor_camera"
@@ -982,20 +732,30 @@ if __name__ == '__main__':
                     "registry_model_center": candidate_model_center,
                     "mesh_frame": mesh_frame,
                     "pose_frame": pose_frame,
-                    "local_symmetry_tfs": local_symmetry_tfs,
-                    "local_symmetry_source": info.get(
-                        "candidate_local_symmetry_source", "identity_default"
-                    ),
                     "s_anchor": float(info.get("s_anchor", 1.0)),
+                    "anchor_observation_quality": float(
+                        info.get("anchor_observation_quality", info.get("s_anchor", 1.0))
+                    ),
+                    "fusion_admission": info.get("fusion_admission", {}),
+                    "registry_info": dict(info),
+                    "shared_anchor_reliability": compute_anchor_reliability_components(
+                        info, obj_registry
+                    ),
                 }
             )
         if not candidate_meshes:
             print(f"Skip {obj_name}: no valid registry candidates")
             continue
 
+        base_meshes_for_appearance = {
+            item["label"]: item["mesh"].copy() for item in candidate_meshes
+        }
+        anchor_poses_for_appearance = {
+            item["label"]: item["anchor_pose"] for item in candidate_meshes
+        }
         appearance_meshes, appearance_summary = apply_candidate_appearance(
-            {item["label"]: item["mesh"] for item in candidate_meshes},
-            {item["label"]: item["anchor_pose"] for item in candidate_meshes},
+            base_meshes_for_appearance,
+            anchor_poses_for_appearance,
             args.candidate_color_mode,
             anchor_rgb=anchor_rgb,
             anchor_mask=anchor_mask,
@@ -1004,7 +764,9 @@ if __name__ == '__main__':
         )
         for item in candidate_meshes:
             item["mesh"] = appearance_meshes[item["label"]]
-            item["cache"] = CandidateCache(item["label"], item["mesh"])
+            item["cache"] = CandidateCache(
+                item["label"], item["mesh"], args.mesh_diameter_mode
+            )
         anchor_mesh = candidate_meshes[0]["mesh"]
         pred_pose_a = candidate_meshes[0]["anchor_pose"]
         print(
@@ -1013,62 +775,21 @@ if __name__ == '__main__':
             f"transferred={list(appearance_summary.transferred_labels)}, "
             f"projected={list(appearance_summary.projected_labels)}"
         )
-        projected_count_map = dict(appearance_summary.projected_vertex_counts)
-        for item in candidate_meshes:
-            n_vertices = max(int(len(item["mesh"].vertices)), 1)
-            n_projected = int(projected_count_map.get(item["label"], 0))
-            appearance_audit_rows.append(
-                {
-                    "Class": obj_name,
-                    "Focus_Object": any(
-                        token in obj_name.lower() for token in ("camera", "mug", "laptop")
-                    ),
-                    "Candidate": item["label"],
-                    "Mode": appearance_summary.mode,
-                    "Prior_Source": appearance_summary.source_label,
-                    "Prior_Transferred": (
-                        item["label"] in appearance_summary.transferred_labels
-                    ),
-                    "Anchor_RGB_Projected": (
-                        item["label"] in appearance_summary.projected_labels
-                    ),
-                    "Projected_Vertices": n_projected,
-                    "Mesh_Vertices": n_vertices,
-                    "Projected_Vertex_Ratio": float(n_projected / n_vertices),
-                    "Mesh_Frame": item["mesh_frame"],
-                    "Pose_Frame": item["pose_frame"],
-                    "Candidate_Local_Symmetry_Source": item[
-                        "local_symmetry_source"
-                    ],
-                    "Candidate_Local_Symmetry_Count": len(
-                        item["local_symmetry_tfs"]
-                    ),
-                }
-            )
-
         swap_candidate(est, candidate_meshes[0]["cache"])
-        print(f"\n{obj_name}: {len(query_frames)} query frames "
-              f"(stride={args.running_stride}, scale={nocs_scale:.4f}, "
-              f"diameter={gt_diameter:.4f}m, eval_scale_mode={args.eval_scale_mode}, "
-              f"sym={is_symmetric}, sym_eval={use_symmetry_metrics}, "
-              f"sym_axis={sym_axis}, candidates={len(candidate_meshes)})")
+        sampled_frame_instances += len(query_frames)
+        print(
+            f"\n{obj_name}: {len(query_frames)} query frames "
+            f"(stride={args.running_stride}, protocol=baseline_fair, "
+            f"candidates={len(candidate_meshes)})"
+        )
 
         # ============================================================
         #  5. Per-frame evaluation loop (SIMPLE — no depth correction)
         # ============================================================
-        prev_scene = None
-        prev_pose_q = None
-        scene_success_count = 0
-
         for scene, frame_id, inst_id in tqdm(
             query_frames, desc=f"{obj_name}"
         ):
             scene_dir = os.path.join(data_root, 'real_test', scene)
-
-            if scene != prev_scene:
-                prev_pose_q = None
-                prev_scene = scene
-                scene_success_count = 0
 
             color_path = os.path.join(scene_dir, f"{frame_id:04d}_color.png")
             if not os.path.exists(color_path):
@@ -1088,28 +809,14 @@ if __name__ == '__main__':
             if mask.sum() < args.min_mask_pixels:
                 continue
 
-            gt_rts = load_gt_poses(gt_dir, scene, frame_id)
-            if gt_rts is None or inst_id - 1 >= gt_rts.shape[0]:
-                continue
-            gt_pose_q = gt_rts[inst_id - 1]
-            if not np.isfinite(gt_pose_q).all():
-                continue
-            q_scale = np.linalg.norm(gt_pose_q[:3, :3], axis=0).mean()
-            if q_scale < 1e-4:
-                continue
-
-            # --- Registration with multi-candidate + symmetry ---
-            use_reinit = (
-                args.use_tracking_init
-                and args.reinit_interval > 0
-                and prev_pose_q is not None
-                and scene_success_count > 0
-                and (scene_success_count % args.reinit_interval == 0)
-            )
-            init_pose_cur = None if (not args.use_tracking_init or use_reinit) else prev_pose_q
-
+            # Registration and Eq. (22) selection intentionally happen before
+            # loading the query GT pose. GT instance masks remain the disclosed
+            # input protocol, but pose/CAD annotations cannot affect selection.
+            init_pose_cur = None
+            selection_started = time.perf_counter()
             candidate_results = []
-            for candidate in candidate_meshes:
+            eval_candidate_meshes = candidate_meshes
+            for candidate in eval_candidate_meshes:
                 cand_label = candidate["label"]
                 cand_mesh = candidate["mesh"]
                 cand_pose_a = candidate["anchor_pose"]
@@ -1119,49 +826,14 @@ if __name__ == '__main__':
                     cand_pred = est.register(
                         K=K, rgb=color, depth=depth, ob_mask=mask,
                         iteration=args.register_iteration, name=obj_name,
-                        init_pose=init_pose_cur,
                         glctx=glctx,
                     )
                 except Exception as exc:
-                    msg = str(exc).lower()
-                    if "out of memory" in msg and args.oom_retry_iteration > 0:
-                        warnings.warn(
-                            f"OOM on {obj_name} {scene}/{frame_id}, "
-                            f"retry with iteration={args.oom_retry_iteration}"
-                        )
-                        try:
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                            cand_pred = est.register(
-                                K=K, rgb=color, depth=depth, ob_mask=mask,
-                                iteration=args.oom_retry_iteration, name=obj_name,
-                                init_pose=None,
-                                glctx=glctx,
-                            )
-                        except Exception as exc2:
-                            warnings.warn(
-                                f"Register retry failed: {obj_name} {scene}/{frame_id}: {exc2}"
-                            )
-                            continue
-                    else:
-                        warnings.warn(
-                            f"Register failed: {obj_name} {scene}/{frame_id}: {exc}"
-                        )
-                        continue
+                    warnings.warn(
+                        f"Register failed: {obj_name} {scene}/{frame_id}: {exc}"
+                    )
+                    continue
 
-                local_symmetry_tfs = candidate["local_symmetry_tfs"]
-                if args.anchor_symmetry_align and len(local_symmetry_tfs) > 1:
-                    cand_pred = _resolve_pose_to_anchor_symmetry(
-                        cand_pred, cand_pose_a, local_symmetry_tfs
-                    )
-                if (
-                    args.use_tracking_init
-                    and args.symmetry_consistency_enable
-                    and len(local_symmetry_tfs) > 1
-                ):
-                    cand_pred = _resolve_pose_with_symmetry(
-                        cand_pred, local_symmetry_tfs, prev_pose_q
-                    )
                 try:
                     l_d, l_m, l_g, coverage = compute_observation_consistency(
                         est, depth, mask, K, cand_pred, glctx,
@@ -1176,141 +848,134 @@ if __name__ == '__main__':
                         "pred_pose_q": cand_pred,
                         "anchor_pose": cand_pose_a,
                         "s_anchor": candidate["s_anchor"],
+                        "anchor_reliability": candidate["shared_anchor_reliability"]["score"],
+                        "anchor_low_reliability": candidate["shared_anchor_reliability"]["low_reliability"],
                         "l_depth": float(l_d),
                         "l_mask": float(l_m),
                         "l_geom": float(l_g),
-                        "coverage": float(coverage),
+                        "l_appearance": 1.0,
+                        "coverage": float(np.clip(coverage, 0.0, 1.0)),
                     }
                 )
 
             if not candidate_results:
+                registration_failure_frames += 1
                 continue
             score_candidates(
                 candidate_results,
                 w_depth=args.w_depth,
                 w_mask=args.w_mask,
                 w_geom=args.w_geom,
+                w_appearance=args.w_appearance,
                 score_alpha=args.score_alpha,
                 score_beta=args.score_beta,
                 loss_normalization=args.query_loss_normalization,
                 depth_scale=args.query_depth_scale,
                 mask_scale=args.query_mask_scale,
                 geom_scale=args.query_geom_scale,
+                appearance_scale=args.query_appearance_scale,
             )
-            winner = max(candidate_results, key=lambda row: row["total_score"])
+            ranked_results = sorted(
+                candidate_results,
+                key=lambda row: float(row["total_score"]),
+                reverse=True,
+            )
+            winner = select_scored_candidate(candidate_results)
+            runner_up = ranked_results[1] if len(ranked_results) > 1 else None
+            score_margin = (
+                float(winner["total_score"] - runner_up["total_score"])
+                if runner_up is not None else float("nan")
+            )
             pred_pose_q = winner["pred_pose_q"]
             pred_pose_a = winner["anchor_pose"]
             best_cand_label = winner["label"]
             swap_candidate(est, winner["cache"])
+            selection_time_s = float(time.perf_counter() - selection_started)
+            selection_times.append(selection_time_s)
 
+            if evaluation_resources is None:
+                evaluation_resources = _load_real275_evaluation_resources(
+                    obj_name=obj_name,
+                    model_dir=model_dir,
+                    anchor_gt_path=anchor_gt_path,
+                    models_info_path=args.models_info_path,
+                    renderer=renderer,
+                )
+                anchor_gt_pose_evaluation_only = evaluation_resources["anchor_gt_pose"]
+                gt_mesh_nocs = evaluation_resources["gt_mesh_nocs"]
+                gt_vertices_eval = evaluation_resources["gt_vertices_eval"]
+                gt_diameter = evaluation_resources["gt_diameter"]
+                ob_id = evaluation_resources["ob_id"]
+                is_symmetric = evaluation_resources["is_symmetric"]
+                use_symmetry_metrics = evaluation_resources["use_symmetry_metrics"]
+                sym_axis = evaluation_resources["sym_axis"]
+                trans_disc = evaluation_resources["trans_disc"]
+
+            gt_rts = load_gt_poses(gt_dir, scene, frame_id)
+            if gt_rts is None or inst_id - 1 >= gt_rts.shape[0]:
+                continue
+            gt_pose_q = gt_rts[inst_id - 1]
+            if not np.isfinite(gt_pose_q).all():
+                continue
+            q_scale = np.linalg.norm(gt_pose_q[:3, :3], axis=0).mean()
+            if q_scale < 1e-4:
+                continue
+
+            rank_by_label = {
+                result["label"]: rank
+                for rank, result in enumerate(ranked_results, start=1)
+            }
             for result in candidate_results:
                 audit_row = {
                         "Scene": scene,
                         "Frame_Num": frame_id,
+                        "Instance_ID": inst_id,
                         "Class": obj_name,
                         "Candidate": result["label"],
                         "Selected": result is winner,
                         "S_anchor": result["s_anchor"],
                         "S_anchor_norm": result["s_anchor_norm"],
+                        "Anchor_Reliability": result.get("anchor_reliability", result["s_anchor"]),
+                        "Anchor_Low_Reliability": result.get("anchor_low_reliability", False),
                         "L_depth": result["l_depth"],
                         "L_mask": result["l_mask"],
                         "L_geom": result["l_geom"],
+                        "L_appearance": result.get("l_appearance", 1.0),
                         "L_depth_norm": result["l_depth_norm"],
                         "L_mask_norm": result["l_mask_norm"],
                         "L_geom_norm": result["l_geom_norm"],
+                        "L_appearance_norm": result.get("l_appearance_norm", 0.0),
                         "Mesh_Fingerprint": result["cache"].fingerprint,
                         "Mesh_Vertices": int(len(result["cache"].mesh.vertices)),
                         "Mesh_Diameter": float(result["cache"].diameter),
                         "Coverage": result["coverage"],
                         "S_query": result["s_query"],
                         "Total_Score": result["total_score"],
+                        "Selection_Rank": rank_by_label[result["label"]],
+                        "Winning_Score": float(winner["total_score"]),
+                        "Runner_Up_Candidate": (
+                            runner_up["label"] if runner_up is not None else ""
+                        ),
+                        "Score_Margin": score_margin,
+                        "Selection_Time_s": selection_time_s,
                     }
                 candidate_score_rows.append(audit_row)
                 result["audit_row"] = audit_row
-
-            prev_pose_q = pred_pose_q
-            scene_success_count += 1
 
             # --- Relative pose transfer ---
             try:
                 pose_aq = pred_pose_q @ np.linalg.inv(pred_pose_a)
             except np.linalg.LinAlgError:
                 continue
-            pred_q_world = pose_aq @ gt_pose_a
+            pred_q_world = pose_aq @ anchor_gt_pose_evaluation_only
 
-            # --- Choose evaluation pose protocol ---
-            if use_baseline_fair:
-                # baseline_fair: always decompose to pure SE(3), like HO3D
-                _, pred_eval = decompose_nocs_pose(pred_q_world)
-                _, gt_eval = decompose_nocs_pose(gt_pose_q)
-            elif use_any6d_nocs_protocol:
-                if args.nocs_scaled_pose_mode == "direct_nocs":
-                    pred_eval = pred_q_world.astype(np.float64)
-                    gt_eval = gt_pose_q.astype(np.float64)
-                else:
-                    _, pred_eval = decompose_nocs_pose(pred_q_world)
-                    _, gt_eval = decompose_nocs_pose(gt_pose_q)
-            else:
-                _, pred_eval = decompose_nocs_pose(pred_q_world)
-                _, gt_eval = decompose_nocs_pose(gt_pose_q)
+            # Fixed baseline-fair protocol: pure SE(3), like HO3D.
+            _, pred_eval = decompose_nocs_pose(pred_q_world)
+            _, gt_eval = decompose_nocs_pose(gt_pose_q)
 
             if (not np.isfinite(pred_eval).all()
                     or not np.isfinite(gt_eval).all()):
                 continue
-
-            # Per-candidate pose audit is evaluation-only and never enters
-            # Eq. (22).  It makes mesh/pose mismatches and selector mistakes
-            # visible without changing registration or candidate selection.
-            for result in candidate_results:
-                row = result.get("audit_row")
-                if row is None:
-                    continue
-                try:
-                    cand_world = (
-                        result["pred_pose_q"]
-                        @ np.linalg.inv(result["anchor_pose"])
-                        @ gt_pose_a
-                    )
-                    if use_baseline_fair:
-                        _, cand_eval = decompose_nocs_pose(cand_world)
-                    elif use_any6d_nocs_protocol and args.nocs_scaled_pose_mode == "direct_nocs":
-                        cand_eval = cand_world.astype(np.float64)
-                    else:
-                        _, cand_eval = decompose_nocs_pose(cand_world)
-                    cand_add = float(compute_add(gt_vertices_eval, cand_eval, gt_eval))
-                    cand_adds = float(compute_adds(gt_vertices_eval, cand_eval, gt_eval))
-                    cand_r, cand_t = compute_RT_distances(cand_eval, gt_eval)
-                    cand_r = cand_r.tolist()[0] if hasattr(cand_r, "tolist") else float(cand_r)
-                    cand_t = cand_t.tolist()[0] if hasattr(cand_t, "tolist") else float(cand_t)
-                    row.update(
-                        {
-                            "Audit_ADD_Distance": cand_add,
-                            "Audit_ADDS_Distance": cand_adds,
-                            "Audit_ADD": float(cand_add <= gt_diameter * 0.1),
-                            "Audit_ADDS": float(cand_adds <= gt_diameter * 0.1),
-                            "Audit_ADD(-S)": float(
-                                cand_adds <= gt_diameter * 0.1
-                                if is_symmetric else cand_add <= gt_diameter * 0.1
-                            ),
-                            "Audit_R_Error": float(cand_r),
-                            "Audit_T_Error": float(cand_t),
-                        }
-                    )
-                except Exception as exc:
-                    row["Audit_Error"] = f"{type(exc).__name__}: {exc}"
-
-            # --- Optional: lightweight z-only correction ---
-            # baseline_fair: never use z-correction (match HO3D baseline)
-            use_z_correction = args.z_correct_enable
-            if use_baseline_fair:
-                use_z_correction = False
-            elif use_any6d_nocs_protocol and args.nocs_scaled_disable_z_correction:
-                use_z_correction = False
-            if use_z_correction:
-                pred_eval = _depth_z_correction(
-                    pred_eval, depth, mask, K, gt_diameter,
-                    z_weight=args.z_correct_weight,
-                )
 
             # --- Rotation / translation error ---
             err_R, err_T = compute_RT_distances(pred_eval, gt_eval)
@@ -1401,6 +1066,7 @@ if __name__ == '__main__':
             m['scene'].append(scene)
             m['frame_num'].append(frame_id)
             m['chosen_candidate'].append(best_cand_label)
+            m['selection_time_s'].append(selection_time_s)
 
             try:
                 visualize_frame_results_gt(
@@ -1440,6 +1106,7 @@ if __name__ == '__main__':
             'R_error': m['R error'],
             'T_error': m['T error'],
             'Chosen_Candidate': m['chosen_candidate'],
+            'Selection_Time_s': m['selection_time_s'],
         })
 
         means_obj = {
@@ -1452,6 +1119,7 @@ if __name__ == '__main__':
             'VSD':   np.mean(m['VSD']) * 100,
             'R_error': np.mean(m['R error']),
             'T_error': np.mean(m['T error']),
+            'Selection_Time_s': np.mean(m['selection_time_s']),
         }
 
         mean_row = pd.DataFrame({
@@ -1467,6 +1135,7 @@ if __name__ == '__main__':
             'R_error': [f"{means_obj['R_error']:.1f}"],
             'T_error': [f"{means_obj['T_error']:.1f}"],
             'Chosen_Candidate': [''],
+            'Selection_Time_s': [f"{means_obj['Selection_Time_s']:.3f}"],
         })
         df_obj = pd.concat([df_obj, mean_row], ignore_index=True)
 
@@ -1499,6 +1168,7 @@ if __name__ == '__main__':
         all_frame_data['R_error'].extend(m['R error'])
         all_frame_data['T_error'].extend(m['T error'])
         all_frame_data['Chosen_Candidate'].extend(m['chosen_candidate'])
+        all_frame_data['Selection_Time_s'].extend(m['selection_time_s'])
 
     # ================================================================
     #  7. Aggregate results across all objects
@@ -1516,9 +1186,6 @@ if __name__ == '__main__':
         })
 
         primary_add_key = 'ADD(-S)'
-        if args.eval_scale_mode == 'nocs_scaled' and args.nocs_scaled_report_add_as_primary:
-            primary_add_key = 'ADD'
-
         latex_str = (
             f"MEAN & {overall_means['AR']:.1f} & {overall_means['VSD']:.1f}"
             f" & {overall_means['MSSD']:.1f} & {overall_means['MSPD']:.1f}"
@@ -1548,6 +1215,7 @@ if __name__ == '__main__':
             'R_error': f"{df_all['R_error'].mean():.1f}",
             'T_error': f"{df_all['T_error'].mean():.1f}",
             'Chosen_Candidate': '',
+            'Selection_Time_s': f"{df_all['Selection_Time_s'].mean():.3f}",
         }
         df_all = pd.concat(
             [df_all, pd.DataFrame([means_all])], ignore_index=True
@@ -1557,11 +1225,58 @@ if __name__ == '__main__':
     df_all.to_excel(output_path, index=False)
     score_output_path = f'{save_root}/0_all_candidate_scores.xlsx'
     pd.DataFrame(candidate_score_rows).to_excel(score_output_path, index=False)
-    appearance_output_path = f'{save_root}/0_candidate_appearance_audit.xlsx'
-    pd.DataFrame(appearance_audit_rows).to_excel(appearance_output_path, index=False)
+    selection_count_path = f'{save_root}/0_candidate_selection_counts.xlsx'
+    if len(df_all) > 0:
+        selected_frames = df_all[df_all['Frame_ID'] != 'MEAN']
+        selection_counts = (
+            selected_frames['Chosen_Candidate']
+            .value_counts(dropna=False)
+            .rename_axis('Candidate')
+            .reset_index(name='Selected_Frames')
+        )
+        selection_counts['Selection_Rate'] = (
+            selection_counts['Selected_Frames']
+            / max(int(selection_counts['Selected_Frames'].sum()), 1)
+        )
+    else:
+        selection_counts = pd.DataFrame(
+            columns=['Candidate', 'Selected_Frames', 'Selection_Rate']
+        )
+    selection_counts.to_excel(selection_count_path, index=False)
+    run_manifest["completed"] = True
+    run_manifest["evaluated_frames"] = int(obj_count)
+    run_manifest["evaluated_objects"] = list(evaluated_objects)
+    run_manifest["coverage"] = {
+        "sampled_frame_instances": int(sampled_frame_instances),
+        "evaluated_frame_instances": int(obj_count),
+        "skipped_frame_instances": int(max(sampled_frame_instances - obj_count, 0)),
+        "registration_failure_frames": int(registration_failure_frames),
+    }
+    run_manifest["runtime"] = {
+        "measurement": "registration through Eq.22 winner selection",
+        "frames": int(len(selection_times)),
+        "median_seconds": (
+            float(np.median(selection_times)) if selection_times else None
+        ),
+        "p95_seconds": (
+            float(np.percentile(selection_times, 95)) if selection_times else None
+        ),
+    }
+    score_frame = pd.DataFrame(candidate_score_rows)
+    with open(
+        os.path.join(save_root, "evaluation_coverage.json"),
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        json.dump(run_manifest["coverage"], handle, indent=2)
+    with open(
+        os.path.join(save_root, "query_run_manifest.json"), "w", encoding="utf-8"
+    ) as f:
+        json.dump(run_manifest, f, indent=2)
     print(f"\nAll frames metrics saved to {output_path}")
     print(f"Candidate scores saved to {score_output_path}")
-    print(f"Appearance audit saved to {appearance_output_path}")
+    print(f"Candidate selection counts saved to {selection_count_path}")
+    print(selection_counts.to_string(index=False))
     print(f"\nEvaluated {len(evaluated_objects)}/{len(obj_list)} objects, "
           f"{obj_count} total frames")
     print("\nSaved data preview:")

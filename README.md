@@ -1,182 +1,173 @@
 # MGC-6D
 
-Official implementation of **Multi-Candidate Geometry Collaboration for
+Official inference code for **Multi-Candidate Geometry Collaboration for
 Single-Anchor 6-DoF Pose Estimation**.
 
-This release freezes the reproducible HO3D path. From one RGB-D anchor
-observation, it constructs RaySt3R, InstantMesh, and visible-patch fused
-geometries; estimates one anchor pose for each candidate; and selects a
-candidate independently in every query frame with the weighted score in the
-paper's Eq. (22).
+Given one RGB-D anchor observation, MGC-6D builds three geometry candidates
+with RaySt3R, InstantMesh, and visible-patch fusion. FoundationPose estimates a
+pose for each candidate, and the direct weighted score from Eq. (22) selects
+one candidate independently for every query frame. This repository contains
+the released HO3D, TOYL, and REAL275 evaluation pipelines only; it contains no
+MGC-6D training, fine-tuning, learned reranking, or scorer checkpoint.
 
-## Released HO3D protocol
+## Released protocol
 
-The main protocol is deliberately explicit:
-
-- anchor masks: dataset GT masks;
-- query masks: the precomputed XMem masks distributed with the HO3D setup;
-- geometry pool: `rayst3r,instantmesh,fused` only;
-- alignment: 24 deterministic inverse-paired initializations in each ICP
-  direction, followed by best-of-two direction selection;
-- fusion: topology-preserving visible-patch update in the RaySt3R anchor frame;
-- query selection: direct Eq. (22) weighted argmax, with
-  `alpha=0.4`, `beta=0.6`, and
+- candidates: `rayst3r,instantmesh,fused`;
+- alignment: deterministic 24-hypothesis ICP in both directions, with the
+  better valid direction retained;
+- appearance: `anchor_prior_hybrid`;
+- query score: `alpha=0.4`, `beta=0.6`, and
   `(w_depth,w_mask,w_geom)=(0.5,0.25,0.25)`;
-- appearance: `prior_transfer`;
-- inference-time GT symmetry adjustment and temporal smoothing: disabled;
-- external `obs` and legacy fallback candidates: disabled.
+- registration: the standard FoundationPose hypothesis generator and scorer
+  top-1, one run per candidate;
+- HO3D masks: dataset GT anchor mask and precomputed XMem query masks;
+- TOYL and REAL275 masks: dataset GT instance masks for anchor and query;
+- temporal smoothing, GT-assisted symmetry correction, fallback candidates,
+  and reference-conditioned selection: disabled.
 
-The reciprocal cycle error is a reported diagnostic. It is not used to choose
-the ICP direction, admit a fused candidate, or score a query candidate.
-`strict-both` is available only as the reviewer-requested ablation.
-
-## Reference validation
-
-The frozen protocol was checked on all 13 HO3D evaluation sequences with
-`running_stride=10`: 2,046 frames were sampled, 38 frames whose HO3D metadata
-has no object GT pose were explicitly skipped, and 2,008 valid-GT frames were
-evaluated:
-
-| ADD-S | ADD | AR | MSSD | MSPD | VSD |
-|---:|---:|---:|---:|---:|---:|
-| 98.7 | 45.1 | 47.7 | 53.1 | 37.4 | 52.5 |
-
-The selected candidates were InstantMesh 1,366 times, fused 566 times, and
-RaySt3R 76 times. The release verifier reproduced Eq. (22) from the saved score
-components with a maximum absolute residual below `2e-16` and found no winner
-mismatch. These values are a regression reference, not a promise of bitwise
-identity across different CUDA, driver, and dependency builds.
+The anchor registry records the Fitness/RMSE values from both independently
+optimized ICP directions, their pass/fail decisions, reciprocal cycle error,
+construction time, candidate paths, and candidate scores. Query results record
+the complete command/provenance, evaluated coverage, runtime, every Eq. (22)
+component, the selected candidate, and per-dataset selection frequencies.
 
 ## Installation
 
-The validated environment used Python 3.11.14, PyTorch 2.5.1+cu121,
-TorchVision 0.20.1+cu121, CUDA 12.1, and RTX 3090 GPUs.
+The validated setup uses Python 3.11, PyTorch 2.5.1+cu121, TorchVision
+0.20.1+cu121, CUDA 12.1, and RTX 3090 GPUs.
 
 ```bash
+git clone <repository-url> MGC-6D
+cd MGC-6D
 conda env create -f environment.yml
 conda activate mgc6d
-```
-
-`nvdiffrast` must be built from source after PyTorch is installed:
-
-```bash
 export CUDA_HOME=/usr/local/cuda-12.1
-export PATH="$CUDA_HOME/bin:$PATH"
-pip install --no-build-isolation \
-  "git+https://github.com/NVlabs/nvdiffrast@253ac4fcea7de5f396371124af597e6cc957bfae"
+bash scripts/install_revision_dependencies.sh
 ```
 
-Build the FoundationPose extension used by query registration:
+RaySt3R is an external dependency. Pin the validated commit and apply the
+included inference-only device patch:
 
 ```bash
-python -m pip install pybind11
-cd foundationpose/mycpp
-mkdir -p build
-cd build
-cmake .. -DPYTHON_EXECUTABLE="$(which python)" \
-  -Dpybind11_DIR="$(python -m pybind11 --cmakedir)"
-make -j"$(nproc)"
-cd ../../..
-```
-
-Install SAM2 and keep RaySt3R as a sibling checkout:
-
-```bash
-cd sam2
-pip install -e .
-cd ..
-
 git clone https://github.com/Duisterhof/rayst3r.git ../rayst3r
+cd ../rayst3r
+git checkout 2c93f81b696909695c6dd5367b81753225b7254e
+git apply ../MGC-6D/third_party/rayst3r_patches/device_eval.patch
+cd ../MGC-6D
 export RAYST3R_ROOT="$(realpath ../rayst3r)"
 ```
 
-The validated RaySt3R checkout was commit
-`2c93f81b696909695c6dd5367b81753225b7254e`, with the device-propagation
-compatibility change documented in
-`third_party/rayst3r_patches/device_eval.patch`. Apply it from the RaySt3R
-checkout with:
+The installer obtains nvdiffrast from commit
+`253ac4fcea7de5f396371124af597e6cc957bfae` rather than PyPI, pins PyTorch3D
+to `v0.7.8`, builds the query-time FoundationPose extension, and finishes with an
+import/build smoke test. See [docs/installation.md](docs/installation.md) for
+manual installation and troubleshooting.
+
+## Data and checkpoints
+
+Datasets, checkpoints, prepared anchor observations, and generated results are
+kept outside Git. Each prepared anchor object directory contains `color.png`,
+`depth.png`, `mask.png`, `K.txt`, and `<object>_gt_pose.txt`. The GT anchor pose
+is copied for final pose evaluation only; reconstruction, alignment, candidate
+scoring, and candidate selection do not use it. See
+[docs/datasets.md](docs/datasets.md) for layouts and mask provenance.
+
+FoundationPose weights belong under `foundationpose/weights/`, InstantMesh
+weights under `instantmesh/ckpts/`, and `RAYST3R_CKPT` points to the local
+RaySt3R checkpoint.
+
+## Run the three datasets
+
+All launchers resolve repository files relative to their own location and
+refuse to overwrite an existing anchor output. `ANCHOR_GPUS` must expose two
+GPUs: they become `cuda:0` for RaySt3R and `cuda:1` for InstantMesh inside the
+anchor process. Query evaluation starts only after the registry validator has
+confirmed all required anchor artifacts.
+
+### HO3D
 
 ```bash
-git checkout 2c93f81b696909695c6dd5367b81753225b7254e
-git apply /path/to/MGC-6D/third_party/rayst3r_patches/device_eval.patch
-```
-
-The other local RaySt3R training/data-loader experiments are not required by
-MGC-6D inference. See
-[`docs/installation.md`](docs/installation.md) for build checks and common
-failures.
-
-## Data preparation
-
-Keep datasets and checkpoints outside git. Required paths are supplied as
-environment variables:
-
-```bash
+export PYTHON_BIN=/path/to/mgc6d/python
+export RAYST3R_ROOT=/path/to/rayst3r
+export RAYST3R_CKPT=/path/to/rayst3r.pth
 export ANCHOR_SOURCE=/path/to/prepared/ho3d_anchor_observations
 export ANCHOR_OUT=/path/to/new/ho3d_anchor_results
-export HO3D_ROOT=/path/to/ho3d
+export HO3D_ROOT=/path/to/HO3D
 export YCB_MODEL_PATH="$HO3D_ROOT/YCB_Video_Models"
 export MODELS_INFO="$PWD/models_info.json"
-export RAYST3R_CKPT=/path/to/rayst3r.pth
-export PYTHON_BIN=/path/to/python
-```
-
-Each object under `ANCHOR_SOURCE` must contain `color.png`, `depth.png`,
-`mask.png`, `K.txt`, and its `<object>_gt_pose.txt`. The GT pose is copied for
-final pose evaluation only; reconstruction, anchor reliability, query scoring,
-and candidate selection do not read it. See
-[`docs/datasets.md`](docs/datasets.md) for the complete layout.
-
-## Run anchor and query
-
-Use two visible GPUs for anchor reconstruction and one for query evaluation.
-Inside the anchor process the two visible devices are addressed as `cuda:0`
-and `cuda:1`:
-
-```bash
-export ANCHOR_GPUS=0,2
-export QUERY_GPU=0
-export QUERY_NAME=ho3d_open_release_eq22_seed0
+export ANCHOR_GPUS=0,1
+export QUERY_GPU=1
+export SEED=0
+export QUERY_NAME=ho3d_mgc6d_seed0
 bash scripts/run_ho3d_full.sh
 ```
 
-The script refuses to overwrite a non-empty `ANCHOR_OUT`. To evaluate an
-existing registry without rebuilding anchors:
+For query-only reuse of a validated registry:
 
 ```bash
-export ANCHOR_RUN=/path/to/ho3d_anchor_results
-export QUERY_GPU=0
-export QUERY_NAME=ho3d_open_release_eq22_seed0
+export ANCHOR_RUN=/path/to/existing/ho3d_anchor_results
 bash scripts/run_ho3d_query.sh
 ```
 
-Outputs are written below `results/ho3d_results/$QUERY_NAME/`. Every run saves
-the CLI configuration, per-candidate Eq. (22) components, selected candidate,
-aggregate metrics, and evaluation coverage. No `Audit_*` or per-candidate GT
-metric is computed before selection.
-
-Validate a completed result folder with:
+### TOYL
 
 ```bash
-python scripts/verify_ho3d_result.py \
-  results/ho3d_results/ho3d_open_release_eq22_seed0/<timestamp>
+export PYTHON_BIN=/path/to/mgc6d/python
+export RAYST3R_ROOT=/path/to/rayst3r
+export RAYST3R_CKPT=/path/to/rayst3r.pth
+export ANCHOR_SOURCE=/path/to/prepared/toyl_anchor_observations
+export ANCHOR_OUT=/path/to/new/toyl_anchor_results
+export TOYL_ROOT=/path/to/TOYL
+export TOYL_MODELS="$TOYL_ROOT/models"
+export ANCHOR_GPUS=0,1
+export QUERY_GPU=1
+export SEED=0
+export QUERY_NAME=toyl_mgc6d_seed0
+bash scripts/run_toyl_full.sh
 ```
 
-## Reviewer ablations
+### REAL275
 
-The main command uses best-of-two and only reports reciprocal and independent
-cycle diagnostics. To construct the strict two-direction ablation, rerun the
-same anchor command from `scripts/run_ho3d_full.sh` in a new output directory
-and add `--align_strict_both`. Do not combine strict-both anchors with the main
-result name.
+```bash
+export PYTHON_BIN=/path/to/mgc6d/python
+export RAYST3R_ROOT=/path/to/rayst3r
+export RAYST3R_CKPT=/path/to/rayst3r.pth
+export ANCHOR_SOURCE=/path/to/prepared/real275_anchor_observations
+export ANCHOR_OUT=/path/to/new/real275_anchor_results
+export REAL_ROOT=/path/to/REAL275
+export MODELS_INFO="$PWD/real275_models_info.json"
+export ANCHOR_GPUS=0,1
+export QUERY_GPU=1
+export SEED=0
+export QUERY_NAME=real275_mgc6d_seed0
+bash scripts/run_real275_full.sh
+```
 
-The optional flags `--refine_mask`, `--obs_anchor_path`,
-`--symmetry_consistency_enable`, and `--anchor_symmetry_align` are ablations and
-are intentionally absent from the released main command.
+TOYL uses query stride 1; HO3D and REAL275 use stride 10. The shared optional
+environment variables `CANDIDATE_LABELS`, `CANDIDATE_COLOR_MODE`, `W_DEPTH`,
+`W_MASK`, `W_GEOM`, `SCORE_ALPHA`, and `SCORE_BETA` map directly to recorded
+CLI arguments. The commands above use the released values.
 
-## Scope
+## Validate outputs
 
-HO3D is the maintained reproduction path in this release. Dataset-specific
-REAL275 and Toyota-Light files remain experimental and are not invoked by the
-HO3D scripts. Generated results, checkpoints, datasets, and compiled extensions
-are excluded from version control.
+Query outputs are saved under `results/{ho3d,toyl,real275}_results/QUERY_NAME/`.
+The validators independently replay Eq. (22), verify one argmax winner per
+evaluated frame, check coverage and candidate labels, and report metrics,
+candidate frequencies, and runtime. They do not impose a hidden performance
+threshold.
+
+```bash
+python scripts/verify_ho3d_result.py RESULT_DIR
+python scripts/verify_paper_result.py --dataset toyl RESULT_DIR
+python scripts/verify_paper_result.py --dataset real275 RESULT_DIR
+```
+
+Run the repository checks before an experiment:
+
+```bash
+python scripts/smoke_imports.py
+pytest -q tests/test_paper_protocol.py tests/test_revision_protocol.py
+```
+
+Generated results, datasets, checkpoints, compiled extensions, and local
+experiment files are excluded from version control.

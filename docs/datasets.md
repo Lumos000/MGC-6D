@@ -1,9 +1,9 @@
-# HO3D data and assets
+# Dataset layouts and assets
 
 Datasets, generated anchors, model weights, and compiled extensions are kept
 outside version control.
 
-## Query dataset
+## HO3D query dataset
 
 The released evaluator expects the Any6D-style HO3D layout:
 
@@ -36,9 +36,9 @@ predicted masks, not GT masks. `models_info.json` in this repository supplies
 YCB object diameters and symmetry metadata for evaluation metrics. Symmetry
 metadata is not used to alter predictions in the main inference protocol.
 
-## Anchor observations
+## Prepared anchor observations
 
-Prepare one object folder per YCB object:
+Prepare one object folder per evaluated object. For HO3D the layout is:
 
 ```text
 $ANCHOR_SOURCE/
@@ -61,6 +61,10 @@ $ANCHOR_SOURCE/
 Depth can be millimetres or the prepared RaySt3R uint16 encoding; the released
 command tests both conversions and records the selected unit. `K.txt` is a 3x3
 camera intrinsic matrix.
+
+TOYL and REAL275 use the same five required files, with their dataset object
+folder names and model roots. Their query readers consume the original dataset
+scene files and GT instance masks; prepared query copies are not required.
 
 The anchor GT pose is copied to the result folder and is loaded only when the
 final query prediction is evaluated. It is not used by reconstruction,
@@ -85,5 +89,6 @@ foundationpose/weights/
 instantmesh/ckpts/
 ```
 
-SAM2 weights are needed only for the explicitly enabled mask-refinement
-ablation; the released GT-anchor-mask command does not enable `--refine_mask`.
+SAM2 is installed because it is an upstream component of the repository, but
+the released three-dataset commands use the mask sources listed above and do
+not run mask refinement.

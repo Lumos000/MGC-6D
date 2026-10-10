@@ -21,6 +21,7 @@ import argparse
 import copy
 import json
 import os
+import time
 
 import cv2
 import numpy as np
@@ -33,7 +34,6 @@ from pytorch_lightning import seed_everything
 from datetime import datetime
 
 from bop_toolkit_lib.pose_error_custom import mssd, mspd, vsd
-from bop_toolkit_lib.renderer_vispy import RendererVispy
 from estimater import Any6D, ScorePredictor, PoseRefinePredictor
 from foundationpose.datareader import Ho3dReader
 from foundationpose.Utils import (
@@ -46,10 +46,13 @@ from metrics import compute_add, compute_adds, compute_RT_distances
 from candidate_selection import (
     PAPER_CANDIDATE_LABELS,
     apply_candidate_appearance,
+    compute_anchor_reliability_components,
     derive_anchor_reliability_scores,
+    paper_registry_candidates,
     parse_candidate_labels,
     score_candidates,
 )
+from revision_protocol import runtime_provenance
 
 
 def _load_anchor_depth_meters(path: str, depth_unit: str) -> np.ndarray:
@@ -223,7 +226,7 @@ def compute_observation_consistency(
 ) -> tuple:
     """Compute query observation consistency score (Eq. 14).
 
-    Returns (L_depth, L_mask, L_geom) where lower is better.
+    Returns (L_depth, L_mask, L_geom, coverage).
     L_depth: pixel-level depth difference (normalized)
     L_mask : 1 - IoU between rendered and observed masks
     L_geom : bidirectional Chamfer distance between point clouds
@@ -246,7 +249,7 @@ def compute_observation_consistency(
         K=K, H=h, W=w, glctx=glctx,
     )
     if rendered is None:
-        return 1.0, 1.0, 1e3
+        return 1.0, 1.0, 1e3, 0.0
 
     rendered_depth = None
     if isinstance(rendered, tuple):
@@ -257,7 +260,7 @@ def compute_observation_consistency(
         # Backward-compatible path for packed outputs.
         rendered_depth = rendered[..., 3]
     if rendered_depth is None:
-        return 1.0, 1.0, 1e3
+        return 1.0, 1.0, 1e3, 0.0
     rd = rendered_depth[0] if getattr(rendered_depth, "ndim", 0) > 2 else rendered_depth
     if torch.is_tensor(rd):
         rd = rd.detach().cpu().numpy()
@@ -267,6 +270,7 @@ def compute_observation_consistency(
     ren_mask = rd > 1e-4
 
     overlap = obs_mask & ren_mask
+    coverage = float(overlap.sum()) / max(float(obs_mask.sum()), 1.0)
     if overlap.sum() > 10:
         depth_scale = max(float(np.mean(depth[overlap])), 1e-4)
         l_depth = float(np.mean(np.abs(depth[overlap] - rd[overlap])) / depth_scale)
@@ -280,7 +284,7 @@ def compute_observation_consistency(
     ren_pts = _backproject_depth_to_points(rd, K, ren_mask)
     l_geom = _chamfer_distance(ren_pts, obs_pts)
 
-    return l_depth, l_mask, l_geom
+    return l_depth, l_mask, l_geom, coverage
 
 
 def _to_symmetry_4x4_list(trans_disc: list) -> list:
@@ -404,9 +408,9 @@ if __name__ == "__main__":
     parser.add_argument("--w_geom", type=float, default=0.25,
                         help="w3: weight for L_geom (Chamfer) in s_query (Eq. 14)")
     # --- Total score balance (Eq. 2) ---
-    parser.add_argument("--score_alpha", type=float, default=0.3,
+    parser.add_argument("--score_alpha", type=float, default=0.4,
                         help="alpha: weight for s_anchor in total score (Eq. 2)")
-    parser.add_argument("--score_beta", type=float, default=0.7,
+    parser.add_argument("--score_beta", type=float, default=0.6,
                         help="beta: weight for s_query in total score (Eq. 2)")
     parser.add_argument(
         "--query_loss_normalization",
@@ -465,7 +469,6 @@ if __name__ == "__main__":
         choices=[
             "native",
             "prior_transfer",
-            "anchor_projected",
             "anchor_prior_hybrid",
             "uniform_gray",
         ],
@@ -526,14 +529,16 @@ if __name__ == "__main__":
             "metadata is otherwise used only by symmetry-aware evaluation metrics."
         ),
     )
-
     args = parser.parse_args()
+    args.w_appearance = 0.0
+    args.query_appearance_scale = 1.00
     seed_everything(args.seed)
     selected_candidate_labels = parse_candidate_labels(args.candidate_labels)
     score_weights = {
         "w_depth": args.w_depth,
         "w_mask": args.w_mask,
         "w_geom": args.w_geom,
+        "w_appearance": args.w_appearance,
         "score_alpha": args.score_alpha,
         "score_beta": args.score_beta,
     }
@@ -541,7 +546,9 @@ if __name__ == "__main__":
         raise ValueError(f"All scoring weights must be finite and non-negative: {score_weights}")
     if args.score_alpha + args.score_beta <= 0.0:
         raise ValueError("At least one of --score_alpha and --score_beta must be positive")
-    if args.w_depth + args.w_mask + args.w_geom <= 0.0:
+    if (
+        args.w_depth + args.w_mask + args.w_geom + args.w_appearance
+    ) <= 0.0:
         raise ValueError("At least one query-consistency weight must be positive")
     positive_scales = {
         "query_depth_scale": args.query_depth_scale,
@@ -567,10 +574,14 @@ if __name__ == "__main__":
     save_root = f"./results/ho3d_results/{name}/{date_str}"
     save_results_est_path = save_root
     os.makedirs(save_results_est_path, exist_ok=True)
-
     run_manifest = {
         "dataset": "HO3D",
+        "anchor_path": os.path.abspath(anchor_path),
         "mask_source": "precomputed_XMem_query_masks",
+        "mask_sources": {
+            "anchor": "dataset_ground_truth_instance_mask",
+            "query": "precomputed_XMem_mask",
+        },
         "selection_policy": args.selection_policy,
         "selection_formula": (
             "argmax_i alpha*S_anchor_norm(i) + beta*S_query(i), where "
@@ -595,6 +606,7 @@ if __name__ == "__main__":
                 "depth": args.query_depth_scale,
                 "mask": args.query_mask_scale,
                 "geom": args.query_geom_scale,
+                "appearance": args.query_appearance_scale,
             },
             "anchor_score_mode": args.anchor_score_mode,
             "anchor_fixed_scales": {
@@ -630,6 +642,7 @@ if __name__ == "__main__":
             "secondary_aggregation": "frame-weighted mean, saved separately",
             "add_adds_precision": "float64 stability fix; metric definition unchanged",
         },
+        "provenance": runtime_provenance(os.path.dirname(__file__)),
         "args": vars(args),
     }
     with open(
@@ -677,6 +690,7 @@ if __name__ == "__main__":
         obj: {
             "ADD": [], "ADD-S": [], "AR": [], "VSD": [], "MSSD": [], "MSPD": [],
             "R error": [], "T error": [], "cls_id": [], "instance_id": [],
+            "query_frame_index": [],
             "chosen_candidate": [],
             "selection_reason": [], "winning_score": [],
             "runner_up_candidate": [], "runner_up_score": [], "score_margin": [],
@@ -684,10 +698,11 @@ if __name__ == "__main__":
         for obj in obj_folder
     }
     candidate_score_rows = []
+    selection_times = []
     skipped_frame_rows = []
     planned_frame_count = 0
     all_frame_data = {
-        "Frame_ID": [], "Class": [],
+        "Frame_ID": [], "Query_Frame_Index": [], "Class": [],
         "ADD-S": [], "ADD": [], "AR": [],
         "MSSD": [], "MSPD": [], "VSD": [],
         "R_error": [], "T_error": [], "Chosen_Candidate": [],
@@ -706,6 +721,9 @@ if __name__ == "__main__":
         debug=0,
         glctx=glctx,
     )
+    # Import only for execution so ``--help`` and installation smoke tests do
+    # not require an initialized EGL display.
+    from bop_toolkit_lib.renderer_vispy import RendererVispy
 
     renderer = RendererVispy(640, 480, mode="depth")
     obj_count = 0
@@ -754,7 +772,11 @@ if __name__ == "__main__":
         hybrid_enabled = bool(hybrid_registry_folders)
         use_hybrid_registry = obj_f in hybrid_registry_folders
         force_fallback_only = args.fallback_only or (hybrid_enabled and not use_hybrid_registry)
-        obj_candidates = {} if force_fallback_only else obj_registry.get("candidates", {})
+        obj_candidates = (
+            {}
+            if force_fallback_only
+            else paper_registry_candidates(obj_registry.get("candidates", {}))
+        )
 
         obj_candidate_info_by_label = {}
         registry_meshes = {}
@@ -773,6 +795,9 @@ if __name__ == "__main__":
                     continue
                 registry_meshes[label] = trimesh.load(mesh_p)
                 obj_candidate_info_by_label[label] = dict(info)
+                obj_candidate_info_by_label[label]["shared_anchor_reliability"] = (
+                    compute_anchor_reliability_components(info, obj_registry)
+                )
 
                 pose_path = info.get("pose_path", "")
                 if os.path.exists(pose_path):
@@ -817,6 +842,7 @@ if __name__ == "__main__":
                 w_depth=args.w_depth,
                 w_mask=args.w_mask,
                 w_geom=args.w_geom,
+                w_appearance=args.w_appearance,
                 depth_scale=args.anchor_depth_scale,
                 mask_scale=args.anchor_mask_scale,
                 geom_scale=args.anchor_geom_scale,
@@ -828,7 +854,7 @@ if __name__ == "__main__":
             anchor_rgb = None
             anchor_mask = None
             anchor_depth = None
-            if args.candidate_color_mode in {"anchor_projected", "anchor_prior_hybrid"}:
+            if args.candidate_color_mode == "anchor_prior_hybrid":
                 obj_anchor_dir = os.path.join(anchor_path, obj_name)
                 anchor_bgr = cv2.imread(os.path.join(obj_anchor_dir, "color.png"))
                 anchor_mask = cv2.imread(
@@ -858,7 +884,8 @@ if __name__ == "__main__":
                 f"{obj_f}: appearance={appearance_summary.mode}, "
                 f"source={appearance_summary.source_label}, "
                 f"transferred={list(appearance_summary.transferred_labels)}, "
-                f"anchor_projected={dict(appearance_summary.projected_vertex_counts)}"
+                f"uniform={list(appearance_summary.uniform_labels)}, "
+                f"projected_vertex_counts={dict(appearance_summary.projected_vertex_counts)}"
             )
             for label, cand_mesh in registry_meshes.items():
                 score_row = anchor_score_by_label[label]
@@ -961,12 +988,14 @@ if __name__ == "__main__":
                 w_depth=args.w_depth,
                 w_mask=args.w_mask,
                 w_geom=args.w_geom,
+                w_appearance=args.w_appearance,
                 score_alpha=args.score_alpha,
                 score_beta=args.score_beta,
                 loss_normalization=args.query_loss_normalization,
                 depth_scale=args.query_depth_scale,
                 mask_scale=args.query_mask_scale,
                 geom_scale=args.query_geom_scale,
+                appearance_scale=args.query_appearance_scale,
             )
             static_object_winner = max(
                 static_rows, key=lambda row: row["total_score"]
@@ -978,7 +1007,7 @@ if __name__ == "__main__":
             color = cv2.cvtColor(cv2.imread(color_file), cv2.COLOR_BGR2RGB)
             depth = reader.get_depth(i)
             mask = reader.get_mask(i).astype(np.bool_)
-
+            selection_started = time.perf_counter()
             # ==============================================================
             # Multi-candidate pose registration (Eq. 11-13)
             # ==============================================================
@@ -999,6 +1028,7 @@ if __name__ == "__main__":
                 pred_pose_a = cand_anchor_poses.get(cache.label)
                 if pred_pose_a is None:
                     pred_pose_a = np.eye(4)
+                anchor_info = obj_candidate_info_by_label.get(cache.label, {})
 
                 pred_pose_q_k = est.register(
                     K=reader.K,
@@ -1025,14 +1055,13 @@ if __name__ == "__main__":
                 # ==========================================================
                 s_query = 0.0
                 if len(eval_caches) > 1 and args.per_frame_selection:
-                    l_depth, l_mask, l_geom = compute_observation_consistency(
+                    l_depth, l_mask, l_geom, rendered_coverage = compute_observation_consistency(
                         est=est, depth=depth, mask=mask,
                         K=reader.K, pred_pose=pred_pose_q_k, glctx=glctx,
                     )
                 else:
                     l_depth, l_mask, l_geom = 1.0, 1.0, 1.0
-
-                anchor_info = obj_candidate_info_by_label.get(cache.label, {})
+                    rendered_coverage = 0.0
 
                 candidate_results.append({
                     "label": cache.label,
@@ -1050,10 +1079,22 @@ if __name__ == "__main__":
                     "anchor_calibration_norm": float(
                         anchor_info.get("anchor_calibration_norm", 1.0)
                     ),
+                    "anchor_reliability": float(
+                        anchor_info.get("shared_anchor_reliability", {}).get(
+                            "score", cache.s_anchor
+                        )
+                    ),
+                    "anchor_low_reliability": bool(
+                        anchor_info.get("shared_anchor_reliability", {}).get(
+                            "low_reliability", False
+                        )
+                    ),
                     "s_anchor_norm": 1.0,
                     "l_depth": float(l_depth),
                     "l_mask": float(l_mask),
                     "l_geom": float(l_geom),
+                    "l_appearance": 1.0,
+                    "coverage": float(np.clip(rendered_coverage, 0.0, 1.0)),
                     "l_depth_norm": 1.0,
                     "l_mask_norm": 1.0,
                     "l_geom_norm": 1.0,
@@ -1065,12 +1106,14 @@ if __name__ == "__main__":
                     w_depth=args.w_depth,
                     w_mask=args.w_mask,
                     w_geom=args.w_geom,
+                    w_appearance=args.w_appearance,
                     score_alpha=args.score_alpha,
                     score_beta=args.score_beta,
                     loss_normalization=args.query_loss_normalization,
                     depth_scale=args.query_depth_scale,
                     mask_scale=args.query_mask_scale,
                     geom_scale=args.query_geom_scale,
+                    appearance_scale=args.query_appearance_scale,
                 )
                 for r in candidate_results:
                     r["selection_score"] = r["total_score"]
@@ -1083,12 +1126,14 @@ if __name__ == "__main__":
                     w_depth=args.w_depth,
                     w_mask=args.w_mask,
                     w_geom=args.w_geom,
+                    w_appearance=args.w_appearance,
                     score_alpha=args.score_alpha,
                     score_beta=args.score_beta,
                     loss_normalization=args.query_loss_normalization,
                     depth_scale=args.query_depth_scale,
                     mask_scale=args.query_mask_scale,
                     geom_scale=args.query_geom_scale,
+                    appearance_scale=args.query_appearance_scale,
                 )
                 r["selection_score"] = r["total_score"]
 
@@ -1104,9 +1149,15 @@ if __name__ == "__main__":
             )
             best_label = winner["label"]
             best_pred_pose_q = winner["pred_pose_q"]
+            selection_time_s = float(time.perf_counter() - selection_started)
 
+            # Keep the no-GT selection audit local until evaluation resources
+            # have been validated.  In particular, a query without GT must not
+            # enter the formal candidate-score table or reuse the next
+            # evaluated frame's Frame_ID.
+            frame_candidate_score_rows = []
             for rank, result in enumerate(candidate_results, start=1):
-                candidate_score_rows.append({
+                score_row = {
                     "Frame_ID": obj_count,
                     "Query_Frame_Index": i,
                     "Class": obj_f,
@@ -1117,16 +1168,24 @@ if __name__ == "__main__":
                     "S_anchor_raw": float(result["s_anchor_raw"]),
                     "Anchor_Observation_Quality": float(result["anchor_observation_quality"]),
                     "Anchor_Calibration_Norm": float(result["anchor_calibration_norm"]),
+                    "Anchor_Reliability": float(result.get("anchor_reliability", result["s_anchor"])),
+                    "Anchor_Low_Reliability": bool(result.get("anchor_low_reliability", False)),
                     "S_anchor_norm": float(result["s_anchor_norm"]),
                     "L_depth": float(result["l_depth"]),
                     "L_mask": float(result["l_mask"]),
                     "L_geom": float(result["l_geom"]),
+                    "L_appearance": float(result.get("l_appearance", 1.0)),
+                    "Coverage": float(result.get("coverage", 0.0)),
                     "L_depth_norm": float(result["l_depth_norm"]),
                     "L_mask_norm": float(result["l_mask_norm"]),
                     "L_geom_norm": float(result["l_geom_norm"]),
+                    "L_appearance_norm": float(result.get("l_appearance_norm", 0.0)),
                     "S_query": float(result["s_query"]),
                     "Selection_Score": float(result["selection_score"]),
-                })
+                    "Selection_Time_s": selection_time_s,
+                }
+                frame_candidate_score_rows.append(score_row)
+                result["audit_row"] = score_row
 
             # Load evaluation-only GT only after Eq. (22) has fixed the winner.
             # This ordering makes it impossible for GT pose annotations to
@@ -1149,9 +1208,25 @@ if __name__ == "__main__":
                     "Reason": "missing_anchor_gt_pose",
                 })
                 continue
+
+            # Only evaluated queries are part of the formal score audit and
+            # runtime summary.  Eq. (22) has already fixed the winner above, so
+            # this commit cannot leak GT into registration or selection.
+            candidate_score_rows.extend(frame_candidate_score_rows)
+            selection_times.append(selection_time_s)
             gt_pose_a_for_winner = np.loadtxt(gt_anchor_path)
             pose_aq = best_pred_pose_q @ np.linalg.inv(winner["pred_pose_a"])
             pred_q = pose_aq @ gt_pose_a_for_winner
+
+            gt_anchor_poses_for_diagnostics = {}
+            for result in candidate_results:
+                candidate_gt_anchor_path = cand_gt_anchor_pose_paths.get(
+                    result["label"], gt_pose_a_path
+                )
+                if os.path.exists(candidate_gt_anchor_path):
+                    gt_anchor_poses_for_diagnostics[result["label"]] = np.loadtxt(
+                        candidate_gt_anchor_path
+                    )
 
             # Swap the winning candidate back for visualization
             winning_cache = next(c for c in cand_caches if c.label == best_label)
@@ -1207,6 +1282,7 @@ if __name__ == "__main__":
             object_metrics[obj_f]["T error"].append(err_T.tolist()[0])
             object_metrics[obj_f]["cls_id"].append(obj_f)
             object_metrics[obj_f]["instance_id"].append(obj_count)
+            object_metrics[obj_f]["query_frame_index"].append(i)
             object_metrics[obj_f]["chosen_candidate"].append(best_label)
             object_metrics[obj_f]["selection_reason"].append(selection_diagnostics["selection_reason"])
             object_metrics[obj_f]["winning_score"].append(selection_diagnostics["winning_score"])
@@ -1234,6 +1310,7 @@ if __name__ == "__main__":
         # ==================================================================
         df_obj = pd.DataFrame({
             "Frame_ID": object_metrics[obj_f]["instance_id"],
+            "Query_Frame_Index": object_metrics[obj_f]["query_frame_index"],
             "Class": object_metrics[obj_f]["cls_id"],
             "ADD-S": object_metrics[obj_f]["ADD-S"],
             "ADD": object_metrics[obj_f]["ADD"],
@@ -1268,6 +1345,7 @@ if __name__ == "__main__":
 
         mean_row_df = pd.DataFrame({
             "Frame_ID": ["MEAN"],
+            "Query_Frame_Index": [""],
             "Class": [obj_f],
             "ADD-S": [f"{means_all['ADD-S']:.1f}"],
             "ADD": [f"{means_all['ADD']:.1f}"],
@@ -1297,6 +1375,9 @@ if __name__ == "__main__":
         df_obj.to_excel(f"{save_results_est_path}/{obj_f}_metrics_results.xlsx", index=False)
 
         all_frame_data["Frame_ID"].extend(object_metrics[obj_f]["instance_id"])
+        all_frame_data["Query_Frame_Index"].extend(
+            object_metrics[obj_f]["query_frame_index"]
+        )
         all_frame_data["Class"].extend(object_metrics[obj_f]["cls_id"])
         all_frame_data["ADD-S"].extend(object_metrics[obj_f]["ADD-S"])
         all_frame_data["ADD"].extend(object_metrics[obj_f]["ADD"])
@@ -1351,6 +1432,7 @@ if __name__ == "__main__":
 
     means_all_final = {
         "Frame_ID": "MEAN",
+        "Query_Frame_Index": "",
         "Class": "ALL",
         "ADD-S": f"{df_all_frames['ADD-S'].mean() * 100:.1f}",
         "ADD": f"{df_all_frames['ADD'].mean() * 100:.1f}",
@@ -1374,6 +1456,36 @@ if __name__ == "__main__":
     df_all_frames.to_excel(output_path, index=False)
     candidate_scores_path = f"{save_results_est_path}/0_all_candidate_scores.xlsx"
     pd.DataFrame(candidate_score_rows).to_excel(candidate_scores_path, index=False)
+
+    selection_counts = (
+        df_all_frames.loc[
+            df_all_frames["Frame_ID"].astype(str) != "MEAN", "Chosen_Candidate"
+        ]
+        .value_counts()
+        .rename_axis("Candidate")
+        .reset_index(name="Selected_Count")
+    )
+    evaluated_count = int(len(df_all_frames) - 1)
+    selection_counts["Selected_Fraction"] = (
+        selection_counts["Selected_Count"] / max(evaluated_count, 1)
+    )
+    selection_counts["Total_Frames"] = evaluated_count
+    selection_counts_path = (
+        f"{save_results_est_path}/0_candidate_selection_counts.xlsx"
+    )
+    selection_counts.to_excel(selection_counts_path, index=False)
+    selection_counts_json_path = (
+        f"{save_results_est_path}/0_candidate_selection_counts.json"
+    )
+    with open(selection_counts_json_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "total_frames": evaluated_count,
+                "overall": selection_counts.to_dict(orient="records"),
+            },
+            f,
+            indent=2,
+        )
     coverage = {
         "planned_query_frames": int(planned_frame_count),
         "evaluated_query_frames": int(obj_count),
@@ -1386,8 +1498,26 @@ if __name__ == "__main__":
     coverage_path = f"{save_results_est_path}/evaluation_coverage.json"
     with open(coverage_path, "w", encoding="utf-8") as f:
         json.dump(coverage, f, indent=2)
+    run_manifest["completed"] = True
+    run_manifest["runtime"] = {
+        "measurement": "candidate registration through Eq.22 winner selection",
+        "frames": int(len(selection_times)),
+        "median_seconds": (
+            float(np.median(selection_times)) if selection_times else None
+        ),
+        "p95_seconds": (
+            float(np.percentile(selection_times, 95)) if selection_times else None
+        ),
+    }
+    with open(
+        os.path.join(save_results_est_path, "query_run_manifest.json"),
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(run_manifest, f, indent=2)
     print(f"\nAll frames metrics saved to {output_path}")
     print(f"Per-candidate weighted scores saved to {candidate_scores_path}")
+    print(f"Candidate selection counts saved to {selection_counts_path}")
     print(
         "Evaluation coverage: "
         f"{coverage['evaluated_query_frames']}/{coverage['planned_query_frames']} "

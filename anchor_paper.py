@@ -28,6 +28,7 @@ from foundationpose.Utils import (
 )
 from sam2_rayst3r import running_sam_box
 from candidate_selection import derive_anchor_reliability_scores, score_candidates
+from revision_protocol import runtime_provenance
 
 
 OBJ_NUM_MAP = {
@@ -449,6 +450,15 @@ def main():
         help="Minimum ICP fitness to accept alignment",
     )
     parser.add_argument(
+        "--icp_rmse_threshold",
+        type=float,
+        default=0.02,
+        help=(
+            "Maximum ICP inlier RMSE (meters) accepted by each direction of "
+            "the strict-both gate"
+        ),
+    )
+    parser.add_argument(
         "--icp_multi_hypo",
         type=int,
         default=24,
@@ -738,6 +748,12 @@ def main():
             raise ValueError(f"--{name} must be finite and positive")
     if args.icp_max_corr_ratio <= 0.0:
         raise ValueError("--icp_max_corr_ratio must be positive")
+    if not np.isfinite(args.icp_fitness_threshold) or args.icp_fitness_threshold < 0.0:
+        raise ValueError("--icp_fitness_threshold must be finite and non-negative")
+    if not np.isfinite(args.icp_rmse_threshold) or args.icp_rmse_threshold < 0.0:
+        raise ValueError("--icp_rmse_threshold must be finite and non-negative")
+    if args.align_strict_both and not args.align_bidirectional_icp:
+        raise ValueError("--align_strict_both requires --align_bidirectional_icp")
     if args.rayst3r_crop_margin_ratio < 0.0:
         raise ValueError("--rayst3r_crop_margin_ratio must be non-negative")
     if not 0.0 <= args.rayst3r_min_component_area_ratio < 1.0:
@@ -830,6 +846,7 @@ def main():
         align_relaxed_rescue=args.align_relaxed_rescue,
         icp_max_iter=args.icp_max_iter,
         icp_fitness_threshold=args.icp_fitness_threshold,
+        align_rmse_penalty_threshold=args.icp_rmse_threshold,
         icp_multi_hypo=args.icp_multi_hypo,
         icp_reciprocal_pairing=args.icp_reciprocal_pairing,
         icp_init_sigma=args.icp_init_sigma,
@@ -889,6 +906,12 @@ def main():
         "bidirectional_alignment": {
             "selection_rule": "best_of_two",
             "strict_both_gate": bool(args.align_strict_both),
+            "strict_both_gate_source": "independent_directional_optima",
+            "strict_both_gate_definition": (
+                "both independent ICP directions satisfy Fitness>=tau_f and RMSE<=tau_r"
+            ),
+            "strict_tau_f": float(args.icp_fitness_threshold),
+            "strict_tau_r": float(args.icp_rmse_threshold),
             "cycle_role": (
                 "bounded_reliability_ablation"
                 if args.fusion_cycle_in_reliability
@@ -926,6 +949,7 @@ def main():
             "score_alpha": args.score_alpha,
             "score_beta": args.score_beta,
         },
+        "provenance": runtime_provenance(os.path.dirname(__file__)),
         "args": vars(args),
     }
     with open(os.path.join(result_root, "anchor_run_meta.json"), "w", encoding="utf-8") as f:
@@ -1293,6 +1317,9 @@ def main():
             "alignment_metadata": {
                 "selection_rule": "best_of_two",
                 "strict_both_gate": bool(args.align_strict_both),
+                "strict_both_gate_source": "independent_directional_optima",
+                "strict_tau_f": float(args.icp_fitness_threshold),
+                "strict_tau_r": float(args.icp_rmse_threshold),
                 "reciprocal_pairing": bool(args.icp_reciprocal_pairing),
                 "cycle_role": (
                     "bounded_reliability_ablation"

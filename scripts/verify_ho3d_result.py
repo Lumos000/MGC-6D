@@ -13,10 +13,11 @@ import pandas as pd
 
 REQUIRED_PROTOCOL = {
     "selection_policy": "weighted",
-    "candidate_color_mode": "prior_transfer",
+    "candidate_color_mode": "anchor_prior_hybrid",
     "w_depth": 0.5,
     "w_mask": 0.25,
     "w_geom": 0.25,
+    "w_appearance": 0.0,
     "score_alpha": 0.4,
     "score_beta": 0.6,
     "query_loss_normalization": "fixed_scale",
@@ -44,6 +45,8 @@ def main() -> None:
         raise FileNotFoundError(manifest_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     run_args = manifest.get("args", {})
+    if not manifest.get("completed", False):
+        raise RuntimeError("HO3D run manifest is not marked completed")
 
     mismatches = {
         key: {"expected": expected, "actual": run_args.get(key)}
@@ -72,7 +75,6 @@ def main() -> None:
     audit_columns = [column for column in scores.columns if str(column).startswith("Audit_")]
     if audit_columns:
         raise RuntimeError(f"GT candidate-audit columns are present: {audit_columns}")
-
     expected_score = (
         0.4 * scores["S_anchor_norm"].astype(float)
         + 0.6
@@ -107,6 +109,39 @@ def main() -> None:
         raise RuntimeError(f"Weighted-argmax winner mismatches: {winner_mismatches}")
 
     evaluated = frames[frames["Frame_ID"].astype(str) != "MEAN"].copy()
+    query_keys = ["Class", "Query_Frame_Index"]
+    missing_frame_keys = [key for key in query_keys if key not in evaluated.columns]
+    if missing_frame_keys:
+        raise RuntimeError(
+            "Frame table is missing stable query keys: "
+            + ", ".join(missing_frame_keys)
+        )
+    if evaluated.duplicated(query_keys).any():
+        raise RuntimeError("Duplicate evaluated HO3D query keys in frame table")
+    if scores.duplicated(query_keys + ["Candidate"]).any():
+        raise RuntimeError("Duplicate candidate/query rows in HO3D score table")
+
+    frame_keys = evaluated[query_keys].drop_duplicates()
+    score_keys = scores[query_keys].drop_duplicates()
+    key_check = frame_keys.merge(
+        score_keys, on=query_keys, how="outer", indicator=True
+    )
+    if not (key_check["_merge"] == "both").all():
+        counts = key_check["_merge"].value_counts().to_dict()
+        raise RuntimeError(
+            "Candidate-score queries differ from evaluated queries: "
+            + json.dumps(counts, sort_keys=True)
+        )
+
+    selected_per_query = (
+        scores.assign(_selected=scores["Selected"].astype(bool))
+        .groupby(query_keys, dropna=False)["_selected"]
+        .sum()
+    )
+    if not (selected_per_query == 1).all():
+        raise RuntimeError(
+            "Each evaluated HO3D query must have exactly one selected candidate"
+        )
     distribution = (
         evaluated["Chosen_Candidate"].value_counts().sort_index().to_dict()
     )
@@ -126,6 +161,36 @@ def main() -> None:
             raise RuntimeError(f"Incomplete evaluation coverage: {coverage}")
         if int(coverage.get("evaluated_query_frames", -1)) != len(evaluated):
             raise RuntimeError("Coverage count differs from the saved frame table")
+        if len(score_keys) != len(evaluated):
+            raise RuntimeError(
+                "Candidate-score query count differs from evaluated coverage"
+            )
+
+    runtime = manifest.get("runtime", {})
+    expected_measurement = "candidate registration through Eq.22 winner selection"
+    if runtime.get("measurement") != expected_measurement:
+        raise RuntimeError(
+            "Incorrect runtime measurement description: "
+            f"{runtime.get('measurement')!r}"
+        )
+    if int(runtime.get("frames", -1)) != len(evaluated):
+        raise RuntimeError("Runtime frame count differs from evaluated coverage")
+
+    count_json_path = root / "0_candidate_selection_counts.json"
+    count_xlsx_path = root / "0_candidate_selection_counts.xlsx"
+    if not count_json_path.is_file() or not count_xlsx_path.is_file():
+        raise RuntimeError("Missing HO3D candidate-selection count outputs")
+    count_payload = json.loads(count_json_path.read_text(encoding="utf-8"))
+    saved_distribution = {
+        str(row["Candidate"]): int(row["Selected_Count"])
+        for row in count_payload.get("overall", [])
+    }
+    if int(count_payload.get("total_frames", -1)) != len(evaluated):
+        raise RuntimeError("Saved candidate-selection total differs from coverage")
+    if saved_distribution != distribution:
+        raise RuntimeError(
+            "Saved candidate-selection distribution differs from frame table"
+        )
 
     report = {
         "result_dir": str(root),
@@ -136,6 +201,7 @@ def main() -> None:
         "weighted_argmax_mismatches": 0,
         "audit_columns": [],
         "coverage": coverage,
+        "runtime": runtime,
     }
     print(json.dumps(report, indent=2))
 

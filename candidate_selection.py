@@ -1,11 +1,9 @@
 """Shared, paper-aligned utilities for multi-candidate query evaluation.
 
-The helpers in this module intentionally avoid candidate-specific gates.  A
+The helpers in this module intentionally avoid candidate-specific gates. A
 candidate is selected only by the disclosed scalar score
 
-    alpha * S_anchor_norm
-    + beta * (-weighted_query_loss
-              + w_consensus * S_consensus).
+    alpha * S_anchor_norm + beta * (-weighted_query_loss).
 
 They also provide an optional appearance transfer from the RGB-conditioned
 InstantMesh candidate to the other geometries.  The transfer changes vertex
@@ -27,9 +25,72 @@ from scipy.spatial import cKDTree
 PAPER_CANDIDATE_LABELS = ("rayst3r", "instantmesh", "fused")
 
 
+def candidate_mesh_diameter(
+    vertices: np.ndarray,
+    mode: str,
+    *,
+    sampled_diameter_fn=None,
+) -> float:
+    """Compute the disclosed FoundationPose crop diameter deterministically.
+
+    ``bbox_diagonal`` is the validated v7 protocol. ``sampled_surface`` exists
+    only for an explicit A/B run and delegates to FoundationPose's legacy
+    sampled implementation.
+    """
+
+    points = np.asarray(vertices, dtype=np.float64).reshape(-1, 3)
+    if len(points) == 0 or not np.isfinite(points).all():
+        raise ValueError("Candidate vertices must be non-empty and finite")
+    if mode == "bbox_diagonal":
+        return float(np.linalg.norm(points.max(axis=0) - points.min(axis=0)))
+    if mode == "sampled_surface":
+        if sampled_diameter_fn is None:
+            raise ValueError("sampled_surface requires sampled_diameter_fn")
+        return float(sampled_diameter_fn(model_pts=points, n_sample=10000))
+    raise ValueError(f"Unsupported mesh diameter mode: {mode}")
+
+
 def parse_candidate_labels(raw: str) -> set[str] | None:
+    """Parse the frozen HO3D candidate filter without changing its API."""
+
     labels = {part.strip() for part in str(raw).split(",") if part.strip()}
     return labels or None
+
+
+def paper_registry_candidates(entries: Mapping[str, Mapping]) -> dict[str, dict]:
+    """Return paper candidates in stable order and reject experiment suffixes.
+
+    A missing geometry is allowed so one failed reconstruction does not abort an
+    entire dataset run. Extra labels are rejected because they would silently
+    reintroduce scale, appearance, or pose hypotheses into the formal protocol.
+    """
+
+    unexpected = sorted(set(entries) - set(PAPER_CANDIDATE_LABELS))
+    if unexpected:
+        raise ValueError(f"Unsupported candidate registry labels: {unexpected}")
+    return {
+        label: dict(entries[label])
+        for label in PAPER_CANDIDATE_LABELS
+        if label in entries
+    }
+
+
+def select_scored_candidate(candidates: list[dict]) -> dict:
+    """Select the Eq. (22) argmax before any GT/evaluation fields are attached."""
+
+    if not candidates:
+        raise ValueError("Cannot select from an empty candidate list")
+    forbidden = {
+        key
+        for candidate in candidates
+        for key in candidate
+        if key.startswith(("gt_", "audit_"))
+    }
+    if forbidden:
+        raise AssertionError(
+            f"Evaluation fields reached candidate selection: {sorted(forbidden)}"
+        )
+    return max(candidates, key=lambda row: float(row["total_score"]))
 
 
 def _minmax_loss(values: Iterable[float], eps: float = 1e-8) -> list[float]:
@@ -84,7 +145,13 @@ def score_candidates(
     if not candidates:
         return candidates
     weights = np.asarray(
-        [w_depth, w_mask, w_geom, w_appearance, w_consensus],
+        [
+            w_depth,
+            w_mask,
+            w_geom,
+            w_appearance,
+            w_consensus,
+        ],
         dtype=np.float64,
     )
     if not np.isfinite(weights).all() or (weights < 0).any() or float(weights.sum()) <= 0:
@@ -130,7 +197,6 @@ def score_candidates(
     consensus = np.clip(
         np.nan_to_num(consensus, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0
     )
-
     for candidate, ld, lm, lg, la, sc in zip(
         candidates,
         depth_norm,
@@ -227,6 +293,90 @@ def derive_anchor_reliability_scores(
             }
         )
     return candidates
+
+
+def compute_anchor_reliability_components(
+    candidate: Mapping,
+    object_metadata: Mapping | None = None,
+) -> dict:
+    """Compute the shared six-part anchor reliability without GT.
+
+    Older registries do not always contain every construction diagnostic.  A
+    missing component is omitted from the weighted mean instead of being
+    fabricated.  The output is therefore usable with existing v7 anchors and
+    becomes richer when a newly generated registry contains scale/cycle data.
+    """
+
+    obj = object_metadata or {}
+    depth_loss = max(float(candidate.get("l_depth", 1.0)), 0.0)
+    mask_loss = float(np.clip(candidate.get("l_mask", 1.0), 0.0, 1.0))
+    components: dict[str, float | None] = {
+        "visible_depth": float(np.exp(-depth_loss / 0.05)),
+        "silhouette": float(np.exp(-mask_loss / 0.50)),
+        "rgbd_coverage": float(np.clip(1.0 - mask_loss, 0.0, 1.0)),
+        "cycle_consistency": None,
+        "scale_margin": None,
+        "topology_preservation": None,
+    }
+
+    fusion = obj.get("fusion_metadata", obj.get("fusion_diagnostics", {})) or {}
+    bidirectional = obj.get("bidirectional_metadata", obj.get("bidirectional", {})) or {}
+    cycle = fusion.get("cycle_confidence", bidirectional.get("cycle_confidence"))
+    if cycle is None:
+        rotation = bidirectional.get("cycle_rotation_deg")
+        translation = bidirectional.get("cycle_translation_normalized")
+        if rotation is not None and translation is not None:
+            cycle = np.exp(-max(float(rotation), 0.0) / 90.0 - max(float(translation), 0.0))
+    if cycle is not None and np.isfinite(float(cycle)):
+        components["cycle_consistency"] = float(np.clip(cycle, 0.0, 1.0))
+
+    scale = candidate.get("scale_recovery", {}) or {}
+    margins = []
+    stack = [scale]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                if key in {"objective_margin", "scale_objective_margin"}:
+                    try:
+                        number = float(child)
+                    except (TypeError, ValueError):
+                        continue
+                    if np.isfinite(number):
+                        margins.append(max(number, 0.0))
+                elif isinstance(child, Mapping):
+                    stack.append(child)
+    if margins:
+        components["scale_margin"] = float(1.0 - np.exp(-min(margins) / 0.01))
+
+    topology_flag = fusion.get("topology_preserved")
+    if topology_flag is not None:
+        components["topology_preservation"] = 1.0 if bool(topology_flag) else 0.0
+    elif candidate.get("base_geometry") in {"instantmesh", "fused"}:
+        # These candidates retain the InstantMesh backbone by construction.
+        components["topology_preservation"] = 1.0
+
+    fixed_weights = {
+        "visible_depth": 0.20,
+        "silhouette": 0.15,
+        "rgbd_coverage": 0.20,
+        "cycle_consistency": 0.15,
+        "scale_margin": 0.15,
+        "topology_preservation": 0.15,
+    }
+    observed = {
+        key: float(value)
+        for key, value in components.items()
+        if value is not None and np.isfinite(float(value))
+    }
+    weight_sum = sum(fixed_weights[key] for key in observed)
+    score = sum(fixed_weights[key] * value for key, value in observed.items()) / max(weight_sum, 1e-8)
+    return {
+        "version": "shared_rgbd_reliability_v1",
+        "score": float(np.clip(score, 0.0, 1.0)),
+        "low_reliability": bool(score < 0.35),
+        "components": components,
+    }
 
 
 def _vertex_rgba(mesh: trimesh.Trimesh) -> np.ndarray | None:
@@ -391,7 +541,6 @@ def apply_candidate_appearance(
     if mode not in {
         "native",
         "prior_transfer",
-        "anchor_projected",
         "anchor_prior_hybrid",
         "uniform_gray",
     }:
@@ -420,7 +569,7 @@ def apply_candidate_appearance(
                 transferred.append(label)
     projected = []
     projected_counts = []
-    if mode in {"anchor_projected", "anchor_prior_hybrid"}:
+    if mode == "anchor_prior_hybrid":
         if anchor_rgb is None or anchor_mask is None or anchor_k is None:
             raise ValueError(
                 f"{mode} appearance requires anchor_rgb, anchor_mask, and anchor_k"

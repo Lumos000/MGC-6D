@@ -10,6 +10,7 @@ cd MGC-6D
 
 conda env create -f environment.yml
 conda activate mgc6d
+bash scripts/install_revision_dependencies.sh
 ```
 
 If you install with pip instead, install the CUDA-enabled PyTorch wheel first,
@@ -20,7 +21,11 @@ pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorc
 pip install -r requirements.txt
 ```
 
-FoundationPose contains C++/CUDA extensions. The most important one for
+The installer builds pinned nvdiffrast (commit `253ac4f`), PyTorch3D
+`v0.7.8`, SAM2, BOP toolkit, and the query-time FoundationPose `mycpp`
+extension. It ends
+with a full import/build smoke test. FoundationPose contains C++/CUDA
+extensions. The most important one for
 query-time pose refinement is `foundationpose/mycpp`; it provides
 `cluster_poses`, which is called when the Any6D estimator initializes its
 rotation grid. Build it after activating the environment:

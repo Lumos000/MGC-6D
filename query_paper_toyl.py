@@ -8,6 +8,7 @@ import copy
 import gc
 import json
 import os
+import time
 import warnings
 from datetime import datetime
 
@@ -21,28 +22,39 @@ from pytorch_lightning import seed_everything
 from tqdm import tqdm
 
 from bop_toolkit_lib.pose_error_custom import mspd, mssd, vsd
-from bop_toolkit_lib.renderer_vispy import RendererVispy
+from bop_toolkit_lib.misc import get_symmetry_transformations
 from estimater import Any6D, PoseRefinePredictor, ScorePredictor
 from foundationpose.Utils import nvdiffrast_render, visualize_frame_results_gt
 from metrics import compute_RT_distances, compute_add, compute_adds
-
-try:
-    from bop_toolkit_lib.misc import format_sym_set, get_symmetry_transformations
-except Exception:
-    format_sym_set = None
-    get_symmetry_transformations = None
+from candidate_selection import (
+    PAPER_CANDIDATE_LABELS,
+    apply_candidate_appearance,
+    compute_anchor_reliability_components,
+    derive_anchor_reliability_scores,
+    paper_registry_candidates,
+    score_candidates,
+    select_scored_candidate,
+)
+from revision_protocol import (
+    add_query_protocol_arguments,
+    runtime_provenance,
+    validate_query_protocol,
+)
 
 TOYL_OBJ_IDS = list(range(1, 22))
 MM_TO_M = 0.001
 
 
 class CandidateCache:
-    __slots__ = ("label", "mesh", "s_anchor")
+    __slots__ = ("label", "mesh", "s_anchor", "geometry", "scale", "appearance")
 
-    def __init__(self, label: str, mesh: trimesh.Trimesh, s_anchor: float = 1.0, use_bbox_diameter: bool = False, lazy_tensors: bool = False):
+    def __init__(self, label: str, mesh: trimesh.Trimesh, s_anchor: float = 1.0, use_bbox_diameter: bool = False, lazy_tensors: bool = False, *, geometry: str | None = None, scale: str = "registry", appearance: str = "configured"):
         self.label = label
         self.mesh = mesh
         self.s_anchor = float(s_anchor)
+        self.geometry = geometry or label
+        self.scale = scale
+        self.appearance = appearance
 
 
 def swap_candidate(est: Any6D, cache: CandidateCache):
@@ -101,7 +113,15 @@ def _chamfer_distance(pts_a: np.ndarray, pts_b: np.ndarray) -> float:
     return float((dists.min(dim=1).values.mean() + dists.min(dim=0).values.mean()).cpu().item())
 
 
-def compute_observation_consistency(est: Any6D, depth: np.ndarray, mask: np.ndarray, K: np.ndarray, pred_pose: np.ndarray, glctx) -> tuple[float, float, float]:
+def compute_observation_consistency(
+    est: Any6D,
+    rgb: np.ndarray,
+    depth: np.ndarray,
+    mask: np.ndarray,
+    K: np.ndarray,
+    pred_pose: np.ndarray,
+    glctx,
+) -> tuple[float, float, float, float, float]:
     h, w = depth.shape[:2]
     device = "cuda" if torch.cuda.is_available() else "cpu"
     pose_t = torch.as_tensor(pred_pose, device=device, dtype=torch.float32).unsqueeze(0)
@@ -113,10 +133,11 @@ def compute_observation_consistency(est: Any6D, depth: np.ndarray, mask: np.ndar
     ob_in_cams = pose_t @ torch.linalg.inv(tf)
     rendered = nvdiffrast_render(mesh=est.mesh, mesh_tensors=est.mesh_tensors, ob_in_cams=ob_in_cams, K=K, H=h, W=w, glctx=glctx)
     if rendered is None:
-        return 1.0, 1.0, 1e3
+        return 1.0, 1.0, 1e3, 1.0, 0.0
+    rendered_color = rendered[0] if isinstance(rendered, tuple) and len(rendered) >= 1 else None
     rendered_depth = rendered[1] if isinstance(rendered, tuple) and len(rendered) >= 2 else None
     if rendered_depth is None:
-        return 1.0, 1.0, 1e3
+        return 1.0, 1.0, 1e3, 1.0, 0.0
     rd = rendered_depth[0] if getattr(rendered_depth, "ndim", 0) > 2 else rendered_depth
     if torch.is_tensor(rd):
         rd = rd.detach().cpu().numpy()
@@ -124,6 +145,7 @@ def compute_observation_consistency(est: Any6D, depth: np.ndarray, mask: np.ndar
     obs_mask = (mask > 0) & (depth > 1e-4)
     ren_mask = rd > 1e-4
     overlap = obs_mask & ren_mask
+    coverage_ratio = float(overlap.sum()) / max(float(obs_mask.sum()), 1.0)
     if overlap.sum() > 10:
         depth_scale = max(float(np.mean(depth[overlap])), 1e-4)
         l_depth = float(np.mean(np.abs(depth[overlap] - rd[overlap])) / depth_scale)
@@ -132,7 +154,35 @@ def compute_observation_consistency(est: Any6D, depth: np.ndarray, mask: np.ndar
     union = obs_mask | ren_mask
     l_mask = float(1.0 - (obs_mask & ren_mask).sum() / max(float(union.sum()), 1.0))
     l_geom = _chamfer_distance(_backproject_depth_to_points(rd, K, ren_mask), _backproject_depth_to_points(depth, K, obs_mask))
-    return l_depth, l_mask, l_geom
+    l_appearance = 1.0
+    if rendered_color is not None and overlap.sum() > 10:
+        rc = rendered_color[0] if getattr(rendered_color, "ndim", 0) == 4 else rendered_color
+        if torch.is_tensor(rc):
+            rc = rc.detach().cpu().numpy()
+        rc = np.asarray(rc, dtype=np.float32)[..., :3]
+        observed_rgb = np.asarray(rgb, dtype=np.float32)[..., :3]
+        if observed_rgb.size and float(np.max(observed_rgb)) > 1.5:
+            observed_rgb = observed_rgb / 255.0
+        color_mask = overlap & (np.abs(depth - rd) <= 0.03)
+        if color_mask.sum() > 10:
+            rendered_pixels = np.clip(rc[color_mask], 0.0, 1.0)
+            observed_pixels = np.clip(observed_rgb[color_mask], 0.0, 1.0)
+            rendered_unit = rendered_pixels / np.maximum(
+                np.linalg.norm(rendered_pixels, axis=1, keepdims=True), 1e-6
+            )
+            observed_unit = observed_pixels / np.maximum(
+                np.linalg.norm(observed_pixels, axis=1, keepdims=True), 1e-6
+            )
+            chromatic_loss = np.mean(
+                1.0 - np.clip(np.sum(rendered_unit * observed_unit, axis=1), -1.0, 1.0)
+            )
+            intensity_loss = np.mean(
+                np.abs(rendered_pixels.mean(axis=1) - observed_pixels.mean(axis=1))
+            )
+            l_appearance = float(
+                np.clip(0.75 * chromatic_loss + 0.25 * intensity_loss, 0.0, 1.0)
+            )
+    return l_depth, l_mask, l_geom, l_appearance, coverage_ratio
 
 
 def _load_scene_json(scene_dir: str, filename: str) -> dict:
@@ -162,30 +212,18 @@ def _obj_name(obj_id: int) -> str:
 
 
 def _build_ho3d_style_trans_disc(model_info_entry: dict) -> list[dict]:
-    trans_disc = [{"R": np.eye(3), "t": np.array([[0.0, 0.0, 0.0]]).T}]
-    for sym in model_info_entry.get("symmetries_discrete", []):
-        sym_4x4 = np.reshape(sym, (4, 4))
-        trans_disc.append({"R": sym_4x4[:3, :3].astype(np.float64), "t": (sym_4x4[:3, 3].reshape((3, 1)) * MM_TO_M).astype(np.float64)})
-    return trans_disc
+    """Return the official BOP19 discrete + discretized continuous symmetries."""
 
-
-def _build_oryon_style_symmetry(model_info_entry: dict) -> np.ndarray:
-    if get_symmetry_transformations is not None and format_sym_set is not None:
-        sym_set = get_symmetry_transformations(model_info_entry, max_sym_disc_step=0.05)
-        return format_sym_set(sym_set)
-    has_sym = bool(model_info_entry.get("symmetries_discrete")) or bool(model_info_entry.get("symmetries_continuous"))
-    if has_sym:
-        return np.stack([np.eye(4, dtype=np.float64), np.eye(4, dtype=np.float64)])
-    return np.eye(4, dtype=np.float64)[None]
-
-
-def _get_oryon_add_diameter_m(obj_pts_mm: np.ndarray, model_info_entry: dict) -> float:
-    try:
-        from utils.pcd import get_diameter as oryon_get_diameter
-
-        return float(oryon_get_diameter(obj_pts_mm)) * MM_TO_M
-    except Exception:
-        return float(model_info_entry["diameter"]) * MM_TO_M
+    transforms = get_symmetry_transformations(
+        model_info_entry, max_sym_disc_step=0.01
+    )
+    return [
+        {
+            "R": np.asarray(tf["R"], dtype=np.float64).reshape(3, 3),
+            "t": np.asarray(tf["t"], dtype=np.float64).reshape(3, 1) * MM_TO_M,
+        }
+        for tf in transforms
+    ]
 
 
 def _parse_id_list(raw: str) -> list[int] | None:
@@ -230,7 +268,6 @@ def _append_zero_frame(object_metrics: dict, all_frame_data: dict, obj_name: str
     object_metrics[obj_name]["ADD"].append(0.0)
     object_metrics[obj_name]["ADD-S"].append(0.0)
     object_metrics[obj_name]["ADD(-S)"].append(0.0)
-    object_metrics[obj_name]["Oryon ADD(S)-0.1d"].append(0.0)
     object_metrics[obj_name]["AR"].append(0.0)
     object_metrics[obj_name]["VSD"].append(0.0)
     object_metrics[obj_name]["MSSD"].append(0.0)
@@ -252,13 +289,13 @@ def _append_zero_frame(object_metrics: dict, all_frame_data: dict, obj_name: str
     all_frame_data["ADD-S"].append(0.0)
     all_frame_data["ADD"].append(0.0)
     all_frame_data["ADD(-S)"].append(0.0)
-    all_frame_data["Oryon ADD(S)-0.1d"].append(0.0)
     all_frame_data["AR"].append(0.0)
     all_frame_data["MSSD"].append(0.0)
     all_frame_data["MSPD"].append(0.0)
     all_frame_data["VSD"].append(0.0)
     all_frame_data["R_error"].append(float("nan"))
     all_frame_data["T_error"].append(float("nan"))
+    all_frame_data["Selection_Time_s"].append(float("nan"))
 
 
 def _record_failed_frame(object_metrics: dict, all_frame_data: dict, obj_name: str, obj_id: int, im_id: int, obj_count: int, frame_count_this_obj: int, count_failures: bool, scene_id: int | None = None, anno_idx: int | None = None) -> tuple[int, int]:
@@ -274,111 +311,173 @@ def _nanmean_or_nan(values) -> float:
     return float("nan") if arr.size == 0 or np.isnan(arr).all() else float(np.nanmean(arr))
 
 
+def _evaluate_candidate_pose_metrics(
+    pred_pose: np.ndarray,
+    gt_pose: np.ndarray,
+    gt_vertices_m: np.ndarray,
+    gt_diameter_m: float,
+    gt_diameter_mm: float,
+    is_symmetric: bool,
+    symmetry_transforms: list,
+    intrinsic: np.ndarray,
+    depth_raw: np.ndarray,
+    depth_scale: float,
+    renderer,
+    obj_id: int,
+) -> dict[str, float]:
+    """Compute evaluation-only metrics for one geometry candidate pose."""
+
+    pred_pose = np.asarray(pred_pose, dtype=np.float64).reshape(4, 4)
+    gt_pose = np.asarray(gt_pose, dtype=np.float64).reshape(4, 4)
+    err_r, err_t = compute_RT_distances(pred_pose, gt_pose)
+    add_value = compute_add(gt_vertices_m, pred_pose, gt_pose)
+    adds_value = compute_adds(gt_vertices_m, pred_pose, gt_pose)
+    add_recall = float(add_value <= float(gt_diameter_m) * 0.1)
+    adds_recall = float(adds_value <= float(gt_diameter_m) * 0.1)
+    add_mix = adds_recall if is_symmetric else add_recall
+
+    mssd_error = (
+        mssd(
+            pose_est=pred_pose,
+            pose_gt=gt_pose,
+            pts=gt_vertices_m,
+            syms=symmetry_transforms,
+        )
+        * 1e3
+    )
+    mspd_error = mspd(
+        pose_est=pred_pose,
+        pose_gt=gt_pose,
+        pts=gt_vertices_m,
+        K=intrinsic,
+        syms=symmetry_transforms,
+    )
+    recall_grid = np.array(
+        [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50],
+        dtype=np.float64,
+    )
+    mean_mssd = float((mssd_error < recall_grid * float(gt_diameter_mm)).mean())
+    mean_mspd = float(
+        (mspd_error < np.array([5, 10, 15, 20, 25, 30, 35, 40, 45, 50])).mean()
+    )
+    pred_r = pred_pose[:3, :3]
+    pred_t = np.expand_dims(pred_pose[:3, 3], axis=1) * 1e3
+    gt_r = gt_pose[:3, :3]
+    gt_t = np.expand_dims(gt_pose[:3, 3], axis=1) * 1e3
+    try:
+        vsd_errors = np.asarray(
+            vsd(
+                pred_r,
+                pred_t,
+                gt_r,
+                gt_t,
+                depth_raw.astype(np.float32) * depth_scale,
+                intrinsic.reshape(3, 3),
+                15.0,
+                recall_grid.tolist(),
+                True,
+                gt_diameter_mm,
+                renderer,
+                obj_id,
+            )
+        )
+        mean_vsd = float(
+            np.stack([vsd_errors < threshold for threshold in recall_grid], axis=1).mean()
+        )
+    except Exception:
+        mean_vsd = 0.0
+    mean_ar = float((mean_mssd + mean_mspd + mean_vsd) / 3.0)
+    return {
+        "ADD": add_recall,
+        "ADD-S": adds_recall,
+        "ADD(-S)": add_mix,
+        "AR": mean_ar,
+        "MSSD": mean_mssd,
+        "MSPD": mean_mspd,
+        "VSD": mean_vsd,
+        "R_error": float(np.asarray(err_r).reshape(-1)[0]),
+        "T_error": float(np.asarray(err_t).reshape(-1)[0]),
+    }
+
+
 def main():
-    seed_everything(0)
     parser = argparse.ArgumentParser(description="TOYL query paper-style multi-candidate evaluation")
     parser.add_argument("--name", type=str, default="any6d_toyl_paper")
-    parser.add_argument("--anchor_path", type=str, default="/data/gst/Any6D/Any6D/results/anchor_results/toyl_paper/toyl")
-    parser.add_argument("--legacy_anchor_path", type=str, default="/data/gst/Any6D/Any6D/results/anchor_results/toyl")
-    parser.add_argument("--toyl_root", type=str, default="/data/gst/data/TOYL")
-    parser.add_argument("--toyl_model_path", type=str, default="/data/gst/data/TOYL/models")
+    parser.add_argument(
+        "--anchor_path",
+        type=str,
+        required=True,
+        help="Anchor result folder containing candidate_registry.json",
+    )
+    parser.add_argument("--toyl_root", type=str, required=True)
+    parser.add_argument("--toyl_model_path", type=str, required=True)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--running_stride", type=int, default=1)
     parser.add_argument("--register_iteration", type=int, default=5)
     parser.add_argument("--mask_type", type=str, default="mask_visib", choices=["mask_visib", "mask"])
     parser.add_argument("--obj_ids", type=str, default="")
     parser.add_argument("--scene_ids", type=str, default="")
-    parser.add_argument("--w_depth", type=float, default=0.5)
-    parser.add_argument("--w_mask", type=float, default=0.25)
-    parser.add_argument("--w_geom", type=float, default=0.25)
-    parser.add_argument("--score_alpha", type=float, default=0.3)
-    parser.add_argument("--score_beta", type=float, default=0.7)
-    parser.add_argument(
-        "--selection_hysteresis",
-        type=float,
-        default=0.02,
-        help="Per-frame winner switch margin; keep previous winner unless new score improves by this value",
-    )
-    parser.add_argument(
-        "--prefer_stable_over_fused",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Apply a small score penalty to fused candidate in per-frame selection",
-    )
-    parser.add_argument(
-        "--fused_penalty",
-        type=float,
-        default=0.08,
-        help="Extra score added to fused candidate (lower means weaker penalty)",
-    )
-    parser.add_argument(
-        "--query_multitry",
-        type=int,
-        default=2,
-        help="Per-candidate register retries; keep best observation-consistency trial",
-    )
-    parser.add_argument(
-        "--query_try_include_nocoarse",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument(
-        "--query_try_include_register",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument(
-        "--stable_query_mode",
-        type=str,
-        default="register_simple",
-        choices=["default", "register_simple", "any6d_nocoarse"],
-        help="Restrict TOYL query trials to a stable strategy; any6d_nocoarse disables coarse/refinement mesh resets",
-    )
-    parser.add_argument(
-        "--include_legacy_candidate",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Add the old stable single-anchor TOYL mesh/pose as a candidate safety baseline",
-    )
-    parser.add_argument(
-        "--legacy_candidate_label",
-        type=str,
-        default="legacy_single",
-    )
-    parser.add_argument(
-        "--legacy_guard_margin",
-        type=float,
-        default=0.08,
-        help="Keep legacy candidate unless the best non-legacy score improves by this margin",
-    )
-    parser.add_argument(
-        "--prefer_legacy_candidate",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument(
-        "--per_candidate_estimator",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Build an isolated Any6D estimator for each candidate attempt to avoid native reset_object state churn",
-    )
     parser.add_argument(
         "--candidate_error_log_limit",
         type=int,
         default=8,
         help="Maximum per-run candidate registration exceptions printed to stderr",
     )
-    parser.add_argument("--query_trial_depth_weight", type=float, default=0.25)
-    parser.add_argument("--query_trial_mask_weight", type=float, default=0.15)
-    parser.add_argument("--query_trial_geom_weight", type=float, default=0.60)
-    parser.add_argument("--per_frame_selection", dest="per_frame_selection", action="store_true")
-    parser.add_argument("--per_object_selection", dest="per_frame_selection", action="store_false")
-    parser.set_defaults(per_frame_selection=True)
     parser.add_argument("--use_bbox_diameter", action="store_true", default=False)
     parser.add_argument("--lazy_tensors", action="store_true", default=False)
     parser.add_argument("--save_visualizations", action="store_true")
     parser.add_argument("--count_failures", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--targets_path",
+        type=str,
+        default="",
+        help="BOP target JSON; empty uses <toyl_root>/tyol/test_targets_bop19.json.",
+    )
+    parser.add_argument(
+        "--anchor_color_depth_tolerance",
+        type=float,
+        default=0.03,
+        help=(
+            "Depth-consistency tolerance in meters for projecting anchor RGB "
+            "onto candidate meshes. The formal/v7 protocol uses 0.03."
+        ),
+    )
+    add_query_protocol_arguments(parser)
     args = parser.parse_args()
+    args.w_appearance = 0.0
+    args.query_loss_normalization = "fixed_scale"
+    args.query_depth_scale = 0.10
+    args.query_mask_scale = 1.00
+    args.query_geom_scale = 0.10
+    args.query_appearance_scale = 1.00
+    args.anchor_depth_scale = 0.05
+    args.anchor_mask_scale = 0.50
+    args.anchor_geom_scale = 0.05
+    args.anchor_calibration_weight = 0.15
+    score_weights = np.asarray(
+        [
+            args.w_depth,
+            args.w_mask,
+            args.w_geom,
+            args.w_appearance,
+        ],
+        dtype=np.float64,
+    )
+    if not np.isfinite(score_weights).all() or (score_weights < 0.0).any():
+        raise ValueError("All candidate-score weights must be finite and non-negative")
+    if (
+        args.w_depth + args.w_mask + args.w_geom + args.w_appearance
+    ) <= 0.0:
+        raise ValueError("At least one Eq. (22) observation weight must be positive")
+    if args.score_alpha < 0.0 or args.score_beta < 0.0:
+        raise ValueError("--score_alpha and --score_beta must be non-negative")
+    if args.score_alpha + args.score_beta <= 0.0:
+        raise ValueError("--score_alpha and --score_beta cannot both be zero")
+    if not np.isfinite(args.anchor_color_depth_tolerance) or args.anchor_color_depth_tolerance < 0.0:
+        raise ValueError("--anchor_color_depth_tolerance must be finite and non-negative")
+    seed_everything(int(args.seed))
+    selected_labels = validate_query_protocol(args)
 
     eval_obj_ids = _parse_id_list(args.obj_ids) or list(TOYL_OBJ_IDS)
     eval_scene_ids = _parse_id_list(args.scene_ids)
@@ -387,6 +486,21 @@ def main():
     if not scene_dirs:
         raise RuntimeError(f"No BOP scenes found under {test_dir}")
 
+    targets_path = args.targets_path or os.path.join(
+        args.toyl_root, "tyol", "test_targets_bop19.json"
+    )
+    official_targets = None
+    if os.path.exists(targets_path):
+        with open(targets_path, "r", encoding="utf-8") as f:
+            target_rows = json.load(f)
+        official_targets = {
+            (int(row["scene_id"]), int(row["im_id"]), int(row["obj_id"]))
+            for row in target_rows
+        }
+        print(f"Loaded {len(official_targets)} official BOP19 TOYL targets")
+    else:
+        warnings.warn(f"Official TOYL target list not found: {targets_path}")
+
     registry_path = os.path.join(args.anchor_path, "candidate_registry.json")
     candidate_registry = {}
     if os.path.exists(registry_path):
@@ -394,11 +508,58 @@ def main():
             candidate_registry = json.load(f)
         print(f"Loaded candidate registry with {len(candidate_registry)} objects")
     else:
-        print(f"WARNING: candidate_registry.json not found at {registry_path}")
+        raise FileNotFoundError(
+            f"Formal multi-candidate evaluation requires {registry_path}"
+        )
 
     date_str = f"{datetime.now():%Y-%m-%d_%H-%M-%S}"
     save_root = f"./results/toyl_results/{args.name}/{date_str}"
     os.makedirs(save_root, exist_ok=True)
+    run_manifest = {
+        "dataset": "TOYL",
+        "anchor_path": os.path.abspath(args.anchor_path),
+        "targets_path": os.path.abspath(targets_path),
+        "mask_type": args.mask_type,
+        "mask_sources": {
+            "anchor": "dataset_ground_truth_instance_mask",
+            "query": "dataset_ground_truth_instance_mask",
+        },
+        "seed": int(args.seed),
+        "candidate_labels": sorted(selected_labels or []),
+        "candidate_color_mode": args.candidate_color_mode,
+        "candidate_appearance": {
+            "mode": args.candidate_color_mode,
+            "depth_parameter_m": float(args.anchor_color_depth_tolerance),
+            "visibility_rule": "shared_candidate_selection_appearance_rule",
+            "uses_query": False,
+            "uses_gt_pose_or_cad": False,
+            "mask_source": "dataset_gt",
+        },
+        "selection": {
+            "rule": "direct weighted argmax; no default candidate or hard replacement gate",
+            "score_version": "paper_eq22_v1",
+            "formula": "alpha*S_anchor_norm+beta*(-wd*Ld-wm*Lm-wg*Lg)",
+            "eq22_main_score": True,
+            "appearance_role": "candidate coloring only; excluded from Eq. (22)",
+            "loss_normalization": args.query_loss_normalization,
+            "w_depth": args.w_depth,
+            "w_mask": args.w_mask,
+            "w_geom": args.w_geom,
+            "w_appearance": args.w_appearance,
+            "score_alpha": args.score_alpha,
+            "score_beta": args.score_beta,
+            "fixed_scales": {
+                "depth": args.query_depth_scale,
+                "mask": args.query_mask_scale,
+                "geom": args.query_geom_scale,
+                "appearance": args.query_appearance_scale,
+            },
+        },
+        "provenance": runtime_provenance(os.path.dirname(__file__)),
+        "args": vars(args),
+    }
+    with open(os.path.join(save_root, "query_run_manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(run_manifest, f, indent=2)
 
     with open(os.path.join(args.toyl_model_path, "models_info.json"), "r", encoding="utf-8") as f:
         model_info = json.load(f)
@@ -419,6 +580,9 @@ def main():
         est.to_device(device)
     shared_scorer = getattr(est, "scorer", None)
     shared_refiner = getattr(est, "refiner", None)
+    # Defer EGL initialization until after argument parsing.
+    from bop_toolkit_lib.renderer_vispy import RendererVispy
+
     renderer = RendererVispy(640, 480, mode="depth")
     candidate_error_count = 0
 
@@ -428,7 +592,6 @@ def main():
             "ADD": [],
             "ADD-S": [],
             "ADD(-S)": [],
-            "Oryon ADD(S)-0.1d": [],
             "AR": [],
             "VSD": [],
             "MSSD": [],
@@ -454,17 +617,21 @@ def main():
         "ADD-S": [],
         "ADD": [],
         "ADD(-S)": [],
-        "Oryon ADD(S)-0.1d": [],
         "AR": [],
         "MSSD": [],
         "MSPD": [],
         "VSD": [],
         "R_error": [],
         "T_error": [],
+        "Selection_Time_s": [],
     }
 
     obj_count = 0
     summary_data = []
+    candidate_score_rows = []
+    selection_times = []
+    sampled_frame_instances = 0
+    registration_failure_frames = 0
 
     for obj_id in tqdm(eval_obj_ids, desc="Evaluating Object"):
         obj_name = _obj_name(obj_id)
@@ -474,10 +641,48 @@ def main():
         if not (os.path.exists(anchor_gt_pose_path) and os.path.exists(anchor_K_path)):
             warnings.warn(f"Skip {obj_name}: missing anchor GT pose/K")
             continue
-        gt_pose_a = _gt_pose_to_meters(np.loadtxt(anchor_gt_pose_path))
+        anchor_k = np.loadtxt(anchor_K_path)
+        anchor_color_bgr = cv2.imread(os.path.join(obj_anchor_dir, "color.png"))
+        anchor_mask_raw = cv2.imread(
+            os.path.join(obj_anchor_dir, "mask.png"), cv2.IMREAD_UNCHANGED
+        )
+        anchor_depth_raw = cv2.imread(
+            os.path.join(obj_anchor_dir, "depth.png"), cv2.IMREAD_UNCHANGED
+        )
+        if anchor_color_bgr is None or anchor_mask_raw is None:
+            warnings.warn(f"Skip {obj_name}: missing saved anchor RGB/mask")
+            continue
+        anchor_rgb = cv2.cvtColor(anchor_color_bgr, cv2.COLOR_BGR2RGB)
+        anchor_mask = (
+            np.any(anchor_mask_raw > 0, axis=2)
+            if anchor_mask_raw.ndim == 3 else anchor_mask_raw > 0
+        )
+        anchor_depth = (
+            anchor_depth_raw.astype(np.float32) * MM_TO_M
+            if anchor_depth_raw is not None else None
+        )
 
         obj_registry = candidate_registry.get(obj_name, {})
-        obj_candidates = obj_registry.get("candidates", {})
+        anchor_appearance_mode = obj_registry.get("appearance_metadata", {}).get(
+            "mode"
+        )
+        if (
+            args.candidate_color_mode == "anchor_prior_hybrid"
+            and anchor_appearance_mode is not None
+            and anchor_appearance_mode != args.candidate_color_mode
+        ):
+            raise RuntimeError(
+                f"{obj_name}: anchor appearance={anchor_appearance_mode!r} but "
+                f"query requested {args.candidate_color_mode!r}; use one contract"
+            )
+        obj_candidates = paper_registry_candidates(
+            obj_registry.get("candidates", {})
+        )
+        obj_candidates = {
+            label: info
+            for label, info in obj_candidates.items()
+            if label in selected_labels
+        }
         cand_caches = []
         cand_anchor_poses = {}
         cand_info = {}
@@ -494,76 +699,116 @@ def main():
                 cache = CandidateCache(label=label, mesh=mesh, s_anchor=float(info.get("s_anchor", 1.0)), use_bbox_diameter=args.use_bbox_diameter, lazy_tensors=args.lazy_tensors)
                 cand_caches.append(cache)
                 cand_info[label] = info
+                cand_info[label]["shared_anchor_reliability"] = (
+                    compute_anchor_reliability_components(info, obj_registry)
+                )
+                mesh_frame = info.get("mesh_frame")
+                pose_frame = info.get("pose_frame")
+                if (
+                    mesh_frame is not None
+                    and pose_frame is not None
+                    and mesh_frame != pose_frame
+                ):
+                    raise RuntimeError(
+                        f"Registry mesh/pose frame mismatch for {obj_name}/{label}: "
+                        f"mesh_frame={mesh_frame}, pose_frame={pose_frame}"
+                    )
                 pose_path = info.get("pose_path", "")
                 if os.path.exists(pose_path):
                     cand_anchor_poses[label] = np.loadtxt(pose_path)
 
-        if args.include_legacy_candidate:
-            legacy_dir = os.path.join(args.legacy_anchor_path, obj_name)
-            legacy_mesh = os.path.join(legacy_dir, f"final_mesh_{obj_name}.obj")
-            legacy_pose = os.path.join(legacy_dir, f"{obj_name}_initial_pose.txt")
-            if os.path.exists(legacy_mesh) and os.path.exists(legacy_pose):
-                mesh = trimesh.load(legacy_mesh)
-                if isinstance(mesh, trimesh.Scene):
-                    mesh = trimesh.util.concatenate([g for g in mesh.geometry.values() if isinstance(g, trimesh.Trimesh)])
-                label = str(args.legacy_candidate_label)
-                cand_caches.append(CandidateCache(label=label, mesh=mesh, s_anchor=1.0, use_bbox_diameter=args.use_bbox_diameter, lazy_tensors=args.lazy_tensors))
-                cand_anchor_poses[label] = np.loadtxt(legacy_pose)
-                cand_info[label] = {"l_depth": 1.0, "l_mask": 1.0, "l_geom": 1.0, "s_anchor": 1.0, "legacy": True}
-            else:
-                warnings.warn(f"Legacy candidate missing for {obj_name}: {legacy_mesh} / {legacy_pose}")
-
         if not cand_caches:
-            fallback_mesh = os.path.join(obj_anchor_dir, f"final_mesh_{obj_name}.obj")
-            fallback_pose = os.path.join(obj_anchor_dir, f"{obj_name}_initial_pose.txt")
-            if not (os.path.exists(fallback_mesh) and os.path.exists(fallback_pose)):
-                warnings.warn(f"Skip {obj_name}: no candidate meshes found")
-                continue
-            mesh = trimesh.load(fallback_mesh)
-            if isinstance(mesh, trimesh.Scene):
-                mesh = trimesh.util.concatenate([g for g in mesh.geometry.values() if isinstance(g, trimesh.Trimesh)])
-            cand_caches = [CandidateCache(label="fallback", mesh=mesh, s_anchor=1.0, use_bbox_diameter=args.use_bbox_diameter, lazy_tensors=False)]
-            cand_anchor_poses["fallback"] = np.loadtxt(fallback_pose)
-            cand_info["fallback"] = {"l_depth": 1.0, "l_mask": 1.0, "l_geom": 1.0, "s_anchor": 1.0}
+            warnings.warn(
+                f"Skip {obj_name}: none of the requested formal registry candidates exist"
+            )
+            continue
+
+        anchor_rows = []
+        registry_is_bounded = True
+        for cache in cand_caches:
+            info = cand_info[cache.label]
+            registry_is_bounded &= (
+                info.get("anchor_score_version")
+                == "bounded_observation_calibrated_v1"
+            )
+            anchor_rows.append(
+                {
+                    "label": cache.label,
+                    "s_anchor": float(info.get("s_anchor", 1.0)),
+                    "l_depth": float(info.get("l_depth", args.anchor_depth_scale)),
+                    "l_mask": float(info.get("l_mask", args.anchor_mask_scale)),
+                    "l_geom": float(info.get("l_geom", args.anchor_geom_scale)),
+                }
+            )
+        if not registry_is_bounded:
+            derive_anchor_reliability_scores(
+                anchor_rows,
+                w_depth=args.w_depth,
+                w_mask=args.w_mask,
+                w_geom=args.w_geom,
+                depth_scale=args.anchor_depth_scale,
+                mask_scale=args.anchor_mask_scale,
+                geom_scale=args.anchor_geom_scale,
+                calibration_weight=args.anchor_calibration_weight,
+            )
+        bounded_anchor = {row["label"]: row for row in anchor_rows}
+        for cache in cand_caches:
+            cache.s_anchor = float(bounded_anchor[cache.label]["s_anchor"])
+
+        appearance_poses = cand_anchor_poses
+        appearance_meshes, appearance_summary = apply_candidate_appearance(
+            {cache.label: cache.mesh for cache in cand_caches},
+            appearance_poses,
+            args.candidate_color_mode,
+            anchor_rgb=anchor_rgb,
+            anchor_mask=anchor_mask,
+            anchor_k=anchor_k,
+            anchor_depth=anchor_depth,
+            anchor_depth_tolerance_m=args.anchor_color_depth_tolerance,
+        )
+        for cache in cand_caches:
+            cache.mesh = appearance_meshes[cache.label]
+        print(
+            f"{obj_name}: {len(cand_caches)} candidate(s), appearance={appearance_summary.mode}, "
+            f"color_source={appearance_summary.source_label}, "
+            f"transferred={list(appearance_summary.transferred_labels)}, "
+            f"projected={dict(appearance_summary.projected_vertex_counts)}"
+        )
 
         gt_ply_path = os.path.join(args.toyl_model_path, f"obj_{obj_id:06d}.ply")
-        gt_mesh_mm = trimesh.load(gt_ply_path)
-        if isinstance(gt_mesh_mm, trimesh.Scene):
-            gt_mesh_mm = trimesh.util.concatenate([g for g in gt_mesh_mm.geometry.values() if isinstance(g, trimesh.Trimesh)])
-        gt_mesh_m = gt_mesh_mm.copy()
-        gt_mesh_m.vertices = gt_mesh_mm.vertices * MM_TO_M
-        gt_diameter_mm = float(model_info[str(obj_id)]["diameter"])
-        gt_diameter_m = gt_diameter_mm * MM_TO_M
-        gt_mesh_dict = {"pts": np.asarray(gt_mesh_mm.vertices, dtype=np.float64), "normals": np.asarray(gt_mesh_mm.face_normals, dtype=np.float64), "faces": np.asarray(gt_mesh_mm.faces, dtype=np.int32)}
-        renderer.my_add_object(gt_mesh_dict, obj_id)
-        model_info_entry = model_info.get(str(obj_id), {})
-        trans_disc = _build_ho3d_style_trans_disc(model_info_entry)
-        is_symmetric = bool(model_info_entry.get("symmetries_discrete"))
-        oryon_obj_sym = _build_oryon_style_symmetry(model_info_entry)
-        oryon_add_diameter_m = _get_oryon_add_diameter_m(gt_mesh_dict["pts"], model_info_entry)
+        gt_mesh_mm = None
+        gt_mesh_m = None
+        gt_diameter_mm = None
+        gt_diameter_m = None
+        trans_disc = None
+        is_symmetric = None
 
-        static_winner = None
-        prev_winner_label = None
-        if len(cand_caches) > 1 and not args.per_frame_selection:
-            valid_l_depth = [float(cand_info[c.label].get("l_depth", 1.0)) for c in cand_caches if c.label in cand_info]
-            valid_l_mask = [float(cand_info[c.label].get("l_mask", 1.0)) for c in cand_caches if c.label in cand_info]
-            valid_l_geom = [float(cand_info[c.label].get("l_geom", 1.0)) for c in cand_caches if c.label in cand_info]
-            min_l_depth = min(valid_l_depth) if valid_l_depth else 1.0
-            min_l_mask = min(valid_l_mask) if valid_l_mask else 1.0
-            min_l_geom = min(valid_l_geom) if valid_l_geom else 1.0
-            max_s_anchor = max(float(c.s_anchor) for c in cand_caches)
-            scores = {}
-            for c in cand_caches:
-                info = cand_info.get(c.label, {})
-                s_query = (
-                    args.w_depth * (float(info.get("l_depth", min_l_depth)) / max(min_l_depth, 1e-8))
-                    + args.w_mask * (float(info.get("l_mask", min_l_mask)) / max(min_l_mask, 1e-8))
-                    + args.w_geom * (float(info.get("l_geom", min_l_geom)) / max(min_l_geom, 1e-8))
+        def load_object_evaluation_resources():
+            nonlocal gt_mesh_mm, gt_mesh_m, gt_diameter_mm, gt_diameter_m
+            nonlocal trans_disc, is_symmetric
+            if gt_mesh_m is not None:
+                return
+            gt_mesh_mm = trimesh.load(gt_ply_path)
+            if isinstance(gt_mesh_mm, trimesh.Scene):
+                gt_mesh_mm = trimesh.util.concatenate(
+                    [g for g in gt_mesh_mm.geometry.values() if isinstance(g, trimesh.Trimesh)]
                 )
-                s_anchor_norm = float(c.s_anchor) / max(max_s_anchor, 1e-8)
-                score = -args.score_alpha * s_anchor_norm + args.score_beta * s_query
-                scores[c.label] = score
-            static_winner = min(scores.items(), key=lambda kv: kv[1])[0]
+            gt_mesh_m = gt_mesh_mm.copy()
+            gt_mesh_m.vertices = gt_mesh_mm.vertices * MM_TO_M
+            gt_diameter_mm = float(model_info[str(obj_id)]["diameter"])
+            gt_diameter_m = gt_diameter_mm * MM_TO_M
+            gt_mesh_dict = {
+                "pts": np.asarray(gt_mesh_mm.vertices, dtype=np.float64),
+                "normals": np.asarray(gt_mesh_mm.face_normals, dtype=np.float64),
+                "faces": np.asarray(gt_mesh_mm.faces, dtype=np.int32),
+            }
+            renderer.my_add_object(gt_mesh_dict, obj_id)
+            model_info_entry = model_info.get(str(obj_id), {})
+            trans_disc = _build_ho3d_style_trans_disc(model_info_entry)
+            is_symmetric = bool(
+                model_info_entry.get("symmetries_discrete")
+                or model_info_entry.get("symmetries_continuous")
+            )
 
         query_instances = []
         for scene_id, scene_dir in scene_dirs:
@@ -571,6 +816,12 @@ def main():
             scene_camera = _load_scene_json(scene_dir, "scene_camera.json")
             frame_keys = sorted(scene_gt.keys(), key=lambda x: int(x))[:: args.running_stride]
             for frame_id_str in frame_keys:
+                if official_targets is not None and (
+                    scene_id,
+                    int(frame_id_str),
+                    obj_id,
+                ) not in official_targets:
+                    continue
                 gt_list = scene_gt.get(frame_id_str, [])
                 for anno_idx, gt_entry in _find_obj_annos(gt_list, obj_id):
                     query_instances.append(
@@ -579,18 +830,17 @@ def main():
                             "scene_dir": scene_dir,
                             "im_id": int(frame_id_str),
                             "anno_idx": anno_idx,
-                            "gt_entry": gt_entry,
                             "cam_entry": scene_camera.get(frame_id_str),
                         }
                     )
 
         frame_count_this_obj = 0
+        sampled_frame_instances += len(query_instances)
         for query in tqdm(query_instances, desc=f"{obj_name} instances", leave=False):
             scene_id = query["scene_id"]
             scene_dir = query["scene_dir"]
             im_id = query["im_id"]
             anno_idx = query["anno_idx"]
-            gt_entry = query["gt_entry"]
             cam_entry = query["cam_entry"]
             if cam_entry is None:
                 obj_count, frame_count_this_obj = _record_failed_frame(object_metrics, all_frame_data, obj_name, obj_id, im_id, obj_count, frame_count_this_obj, args.count_failures, scene_id=scene_id, anno_idx=anno_idx)
@@ -609,217 +859,225 @@ def main():
                 obj_count, frame_count_this_obj = _record_failed_frame(object_metrics, all_frame_data, obj_name, obj_id, im_id, obj_count, frame_count_this_obj, args.count_failures, scene_id=scene_id, anno_idx=anno_idx)
                 continue
             K = _parse_bop_K(cam_entry)
-            gt_pose_q = _gt_pose_to_meters(_parse_bop_pose(gt_entry))
-
-            eval_caches = cand_caches if static_winner is None else [c for c in cand_caches if c.label == static_winner]
+            selection_started = time.perf_counter()
+            eval_caches = cand_caches
             candidate_results = []
             for cache in eval_caches:
-                cur_est = est
-                if args.per_candidate_estimator:
-                    cur_est = None
-                    try:
-                        cur_est = Any6D(
-                            mesh=cache.mesh,
-                            scorer=shared_scorer or ScorePredictor(),
-                            refiner=shared_refiner or PoseRefinePredictor(),
-                            debug_dir=save_root,
-                            debug=0,
-                            glctx=glctx,
-                        )
-                        if hasattr(cur_est, "to_device"):
-                            cur_est.to_device(device)
-                    except Exception as exc:
-                        if candidate_error_count < int(args.candidate_error_log_limit):
-                            warnings.warn(f"Candidate estimator init failed for {obj_name}/{cache.label}: {type(exc).__name__}: {exc}")
-                        candidate_error_count += 1
-                        _cuda_cleanup()
-                        continue
-                else:
-                    swap_candidate(cur_est, cache)
-                pred_pose_a = cand_anchor_poses.get(cache.label, np.eye(4))
-                if args.stable_query_mode == "register_simple":
-                    trial_strategies = [
-                        {"name": "register_simple", "use_any6d": False, "axis_align": False, "coarse_est": False, "refinement": False},
-                    ]
-                elif args.stable_query_mode == "any6d_nocoarse":
-                    trial_strategies = [
-                        {"name": "any6d_nocoarse_stable", "use_any6d": True, "axis_align": False, "coarse_est": False, "refinement": False},
-                    ]
-                else:
-                    trial_strategies = [
-                        {"name": "any6d_coarse_aa", "use_any6d": True, "axis_align": True, "coarse_est": True, "refinement": True},
-                        {"name": "any6d_coarse_noaa", "use_any6d": True, "axis_align": False, "coarse_est": True, "refinement": True},
-                    ]
-                    if args.query_try_include_nocoarse:
-                        trial_strategies.append({"name": "any6d_nocoarse", "use_any6d": True, "axis_align": False, "coarse_est": False, "refinement": True})
-                    if args.query_try_include_register:
-                        trial_strategies.append({"name": "register_simple", "use_any6d": False, "axis_align": False, "coarse_est": False, "refinement": False})
-
+                cur_est = None
                 try:
-                    best_trial = None
-                    for strat_idx, strat in enumerate(trial_strategies):
-                        for try_i in range(max(1, int(args.query_multitry))):
-                            trial_seed = int(obj_id * 100003 + im_id * 313 + anno_idx * 17 + strat_idx * 53 + try_i * 7919)
-                            np.random.seed(trial_seed % (2**32 - 1))
-                            torch.manual_seed(trial_seed)
-                            if torch.cuda.is_available():
-                                torch.cuda.manual_seed_all(trial_seed)
-                            try:
-                                if strat["use_any6d"]:
-                                    pred_pose_q = cur_est.register_any6d(
-                                        K=K,
-                                        rgb=color,
-                                        depth=depth_m,
-                                        ob_mask=mask,
-                                        iteration=int(args.register_iteration),
-                                        refinement=bool(strat.get("refinement", True)),
-                                        axis_align=bool(strat["axis_align"]),
-                                        coarse_est=bool(strat["coarse_est"]),
-                                        name=obj_name,
-                                    )
-                                else:
-                                    pred_pose_q = cur_est.register(
-                                        K=K, rgb=color, depth=depth_m, ob_mask=mask,
-                                        iteration=int(args.register_iteration), name=obj_name
-                                    )
-                            except Exception as exc:
-                                if candidate_error_count < int(args.candidate_error_log_limit):
-                                    warnings.warn(
-                                        f"Candidate register failed for {obj_name}/{cache.label} "
-                                        f"scene={scene_id} im={im_id} anno={anno_idx} "
-                                        f"strategy={strat['name']}: {type(exc).__name__}: {exc}"
-                                    )
-                                candidate_error_count += 1
-                                _cuda_cleanup()
-                                continue
-                            if not _is_valid_pose(pred_pose_q):
-                                continue
-                            try:
-                                pred_q = (pred_pose_q @ np.linalg.inv(pred_pose_a)) @ gt_pose_a
-                            except np.linalg.LinAlgError:
-                                continue
-                            if not _is_valid_pose(pred_q):
-                                continue
-                            if len(eval_caches) > 1 and args.per_frame_selection:
-                                l_depth, l_mask, l_geom = compute_observation_consistency(
-                                    est=cur_est, depth=depth_m, mask=mask, K=K, pred_pose=pred_pose_q, glctx=glctx
+                    cur_est = Any6D(
+                        mesh=cache.mesh,
+                        scorer=shared_scorer or ScorePredictor(),
+                        refiner=shared_refiner or PoseRefinePredictor(),
+                        debug_dir=save_root,
+                        debug=0,
+                        glctx=glctx,
+                    )
+                    if hasattr(cur_est, "to_device"):
+                        cur_est.to_device(device)
+                except Exception as exc:
+                    if candidate_error_count < int(args.candidate_error_log_limit):
+                        warnings.warn(f"Candidate estimator init failed for {obj_name}/{cache.label}: {type(exc).__name__}: {exc}")
+                    candidate_error_count += 1
+                    _cuda_cleanup()
+                    continue
+                pred_pose_a = cand_anchor_poses.get(cache.label, np.eye(4))
+                try:
+                    pred_pose_q = cur_est.register(
+                        K=K,
+                        rgb=color,
+                        depth=depth_m,
+                        ob_mask=mask,
+                        iteration=int(args.register_iteration),
+                        name=obj_name,
+                    )
+                    if not _is_valid_pose(pred_pose_q):
+                        continue
+                    l_depth, l_mask, l_geom, _rendered_appearance, rendered_coverage = compute_observation_consistency(
+                        est=cur_est,
+                        rgb=color,
+                        depth=depth_m,
+                        mask=mask,
+                        K=K,
+                        pred_pose=pred_pose_q,
+                        glctx=glctx,
+                    )
+                    anchor_info = cand_info.get(cache.label, {})
+                    candidate_results.append(
+                        {
+                            "label": cache.label,
+                            "pred_pose_q": pred_pose_q,
+                            "pred_pose_a": pred_pose_a,
+                            "s_anchor": float(cache.s_anchor),
+                            "s_anchor_raw": float(
+                                anchor_info.get("s_anchor_raw", cache.s_anchor)
+                            ),
+                            "anchor_observation_quality": float(
+                                anchor_info.get(
+                                    "anchor_observation_quality", cache.s_anchor
                                 )
-                            else:
-                                l_depth, l_mask, l_geom = 1.0, 1.0, 1.0
-                            trial_score = (
-                                float(args.query_trial_depth_weight) * float(l_depth)
-                                + float(args.query_trial_mask_weight) * float(l_mask)
-                                + float(args.query_trial_geom_weight) * float(l_geom)
-                            )
-                            if best_trial is None or trial_score < best_trial["trial_score"]:
-                                best_trial = {
-                                    "pred_pose_q": pred_pose_q,
-                                    "pred_q": pred_q,
-                                    "l_depth": float(l_depth),
-                                    "l_mask": float(l_mask),
-                                    "l_geom": float(l_geom),
-                                    "trial_score": float(trial_score),
-                                }
-                    if best_trial is not None:
-                        candidate_results.append(
-                            {
-                                "label": cache.label,
-                                "pred_pose_q": best_trial["pred_pose_q"],
-                                "pred_q": best_trial["pred_q"],
-                                "s_anchor": float(cache.s_anchor),
-                                "l_depth": float(best_trial["l_depth"]),
-                                "l_mask": float(best_trial["l_mask"]),
-                                "l_geom": float(best_trial["l_geom"]),
-                                "total_score": 0.0,
-                            }
+                            ),
+                            "anchor_calibration_norm": float(
+                                anchor_info.get("anchor_calibration_norm", 1.0)
+                            ),
+                            "anchor_reliability": float(
+                                anchor_info.get("shared_anchor_reliability", {}).get(
+                                    "score", cache.s_anchor
+                                )
+                            ),
+                            "anchor_low_reliability": bool(
+                                anchor_info.get("shared_anchor_reliability", {}).get(
+                                    "low_reliability", False
+                                )
+                            ),
+                            "l_depth": float(l_depth),
+                            "l_mask": float(l_mask),
+                            "l_geom": float(l_geom),
+                            "l_appearance": 1.0,
+                            "coverage": float(np.clip(rendered_coverage, 0.0, 1.0)),
+                            "total_score": 0.0,
+                        }
+                    )
+                except Exception as exc:
+                    if candidate_error_count < int(args.candidate_error_log_limit):
+                        warnings.warn(
+                            f"Candidate register failed for {obj_name}/{cache.label} "
+                            f"scene={scene_id} im={im_id} anno={anno_idx}: "
+                            f"{type(exc).__name__}: {exc}"
                         )
+                    candidate_error_count += 1
+                    _cuda_cleanup()
                 finally:
-                    if args.per_candidate_estimator:
+                    if cur_est is not None:
                         del cur_est
                         _cuda_cleanup()
 
             if not candidate_results:
+                registration_failure_frames += 1
                 obj_count, frame_count_this_obj = _record_failed_frame(object_metrics, all_frame_data, obj_name, obj_id, im_id, obj_count, frame_count_this_obj, args.count_failures, scene_id=scene_id, anno_idx=anno_idx)
                 continue
 
-            if len(candidate_results) > 1 and args.per_frame_selection:
-                min_l_depth = min(r["l_depth"] for r in candidate_results)
-                min_l_mask = min(r["l_mask"] for r in candidate_results)
-                min_l_geom = min(r["l_geom"] for r in candidate_results)
-                max_s_anchor = max(float(r["s_anchor"]) for r in candidate_results)
-                for r in candidate_results:
-                    s_query = (
-                        args.w_depth * (r["l_depth"] / max(min_l_depth, 1e-8))
-                        + args.w_mask * (r["l_mask"] / max(min_l_mask, 1e-8))
-                        + args.w_geom * (r["l_geom"] / max(min_l_geom, 1e-8))
-                    )
-                    s_anchor_norm = float(r["s_anchor"]) / max(max_s_anchor, 1e-8)
-                    score = float(-args.score_alpha * s_anchor_norm + args.score_beta * s_query)
-                    if bool(args.prefer_stable_over_fused) and r["label"] == "fused":
-                        score += float(args.fused_penalty)
-                    r["total_score"] = score
-            elif len(candidate_results) == 1:
-                candidate_results[0]["total_score"] = 0.0
+            score_candidates(
+                candidate_results,
+                w_depth=args.w_depth,
+                w_mask=args.w_mask,
+                w_geom=args.w_geom,
+                w_appearance=args.w_appearance,
+                score_alpha=args.score_alpha,
+                score_beta=args.score_beta,
+                loss_normalization=args.query_loss_normalization,
+                depth_scale=args.query_depth_scale,
+                mask_scale=args.query_mask_scale,
+                geom_scale=args.query_geom_scale,
+                appearance_scale=args.query_appearance_scale,
+            )
 
-            candidate_results.sort(key=lambda x: x["total_score"])
-            winner = candidate_results[0]
-            if args.prefer_legacy_candidate and len(candidate_results) > 1:
-                legacy_item = next((r for r in candidate_results if r["label"] == str(args.legacy_candidate_label)), None)
-                if legacy_item is not None and winner["label"] != str(args.legacy_candidate_label):
-                    if (legacy_item["total_score"] - winner["total_score"]) < float(args.legacy_guard_margin):
-                        winner = legacy_item
-            if (
-                args.per_frame_selection
-                and prev_winner_label is not None
-                and len(candidate_results) > 1
-            ):
-                prev_item = next((r for r in candidate_results if r["label"] == prev_winner_label), None)
-                if prev_item is not None:
-                    if (prev_item["total_score"] - winner["total_score"]) < float(args.selection_hysteresis):
-                        winner = prev_item
+            candidate_results.sort(key=lambda x: x["total_score"], reverse=True)
+            winner = select_scored_candidate(candidate_results)
             best_label = winner["label"]
-            prev_winner_label = best_label
-            pred_q = winner["pred_q"].astype(np.float64)
             pred_pose_q = winner["pred_pose_q"]
+            selection_time_s = float(time.perf_counter() - selection_started)
+            selection_times.append(selection_time_s)
+            # Pose/CAD evaluation begins only after the winner is immutable.
+            load_object_evaluation_resources()
+            gt_pose_a = _gt_pose_to_meters(np.loadtxt(anchor_gt_pose_path))
+            scene_gt_after_selection = _load_scene_json(scene_dir, "scene_gt.json")
+            gt_entries_after_selection = scene_gt_after_selection.get(str(im_id), [])
+            if anno_idx >= len(gt_entries_after_selection):
+                obj_count, frame_count_this_obj = _record_failed_frame(
+                    object_metrics, all_frame_data, obj_name, obj_id, im_id,
+                    obj_count, frame_count_this_obj, args.count_failures,
+                    scene_id=scene_id, anno_idx=anno_idx,
+                )
+                continue
+            gt_pose_q = _gt_pose_to_meters(
+                _parse_bop_pose(gt_entries_after_selection[anno_idx])
+            )
+            for result in candidate_results:
+                result["pred_q"] = (
+                    result["pred_pose_q"]
+                    @ np.linalg.inv(result.get("pred_pose_a", cand_anchor_poses.get(
+                        result.get("candidate_label", result["label"]), np.eye(4)
+                    )))
+                    @ gt_pose_a
+                )
             gt_eval = gt_pose_q.astype(np.float64)
 
-            err_R, err_T = compute_RT_distances(pred_q, gt_eval)
-            add_val = compute_add(gt_mesh_m.vertices, pred_q, gt_eval)
-            adds_val = compute_adds(gt_mesh_m.vertices, pred_q, gt_eval)
-            add_thres = float(add_val <= gt_diameter_m * 0.1)
-            adds_thres = float(adds_val <= gt_diameter_m * 0.1)
-            add_mix_thres = adds_thres if is_symmetric else add_thres
-            if np.asarray(oryon_obj_sym).shape[0] > 1:
-                oryon_add_val = compute_adds(gt_mesh_dict["pts"] * MM_TO_M, pred_q, gt_eval)
-            else:
-                oryon_add_val = compute_add(gt_mesh_dict["pts"] * MM_TO_M, pred_q, gt_eval)
-            oryon_adds_thres = float(oryon_add_val <= oryon_add_diameter_m * 0.1)
-            mssd_err = mssd(pose_est=pred_q, pose_gt=gt_eval, pts=gt_mesh_m.vertices, syms=trans_disc) * 1e3
-            mspd_err = mspd(pose_est=pred_q, pose_gt=gt_eval, pts=gt_mesh_m.vertices, K=K, syms=trans_disc)
-            pred_r = pred_q[:3, :3]
-            pred_t = np.expand_dims(pred_q[:3, 3], axis=1) * 1e3
-            gt_r = gt_eval[:3, :3]
-            gt_t = np.expand_dims(gt_eval[:3, 3], axis=1) * 1e3
-            try:
-                vsd_errs = np.asarray(vsd(pred_r, pred_t, gt_r, gt_t, depth_raw.astype(np.float32) * depth_scale, K.reshape(3, 3), 15.0, [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5], True, gt_diameter_mm, renderer, obj_id))
-                mean_vsd = float(np.stack([vsd_errs < rec for rec in np.array([0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5])], axis=1).mean())
-            except Exception:
-                mean_vsd = 0.0
-            mssd_cur_rec = np.array([0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]) * gt_diameter_mm
-            mean_mssd = float((mssd_err < mssd_cur_rec).mean())
-            mean_mspd = float((mspd_err < np.array([5, 10, 15, 20, 25, 30, 35, 40, 45, 50])).mean())
-            mean_ar = (mean_mssd + mean_mspd + mean_vsd) / 3.0
+            metrics_by_label = {}
+            for result in [winner]:
+                metrics_by_label[result["label"]] = _evaluate_candidate_pose_metrics(
+                    pred_pose=result["pred_q"],
+                    gt_pose=gt_eval,
+                    gt_vertices_m=gt_mesh_m.vertices,
+                    gt_diameter_m=gt_diameter_m,
+                    gt_diameter_mm=gt_diameter_mm,
+                    is_symmetric=is_symmetric,
+                    symmetry_transforms=trans_disc,
+                    intrinsic=K,
+                    depth_raw=depth_raw,
+                    depth_scale=depth_scale,
+                    renderer=renderer,
+                    obj_id=obj_id,
+                )
+
+            for result in candidate_results:
+                score_row = {
+                        "Scene": f"{scene_id:06d}",
+                        "Image_ID": im_id,
+                        "Anno_ID": anno_idx,
+                        "Class": obj_name,
+                        "Candidate": result["label"],
+                        "Selected": result is winner,
+                        "S_anchor": result["s_anchor"],
+                        "S_anchor_norm": result.get("s_anchor_norm", 1.0),
+                        "S_anchor_raw": result.get("s_anchor_raw", result["s_anchor"]),
+                        "Anchor_Observation_Quality": result.get(
+                            "anchor_observation_quality", result["s_anchor"]
+                        ),
+                        "Anchor_Calibration_Norm": result.get(
+                            "anchor_calibration_norm", 1.0
+                        ),
+                        "Anchor_Reliability": result.get("anchor_reliability", result["s_anchor"]),
+                        "Anchor_Low_Reliability": result.get("anchor_low_reliability", False),
+                        "L_depth": result["l_depth"],
+                        "L_mask": result["l_mask"],
+                        "L_geom": result["l_geom"],
+                        "L_appearance": result.get("l_appearance", 1.0),
+                        "Coverage": result.get("coverage", 0.0),
+                        "L_depth_norm": result.get("l_depth_norm", 0.0),
+                        "L_mask_norm": result.get("l_mask_norm", 0.0),
+                        "L_geom_norm": result.get("l_geom_norm", 0.0),
+                        "L_appearance_norm": result.get("l_appearance_norm", 0.0),
+                        "Appearance_Mode": args.candidate_color_mode,
+                        "S_query": result.get("s_query", 0.0),
+                        "Observation_Quality": result.get(
+                            "observation_quality", result.get("s_query", 0.0)
+                        ),
+                        "Total_Score": result["total_score"],
+                        "Selection_Time_s": selection_time_s,
+                    }
+                candidate_score_rows.append(score_row)
+
+            winner_metrics = metrics_by_label[winner["label"]]
+            add_thres = winner_metrics["ADD"]
+            adds_thres = winner_metrics["ADD-S"]
+            add_mix_thres = winner_metrics["ADD(-S)"]
+            mean_ar = winner_metrics["AR"]
+            mean_mssd = winner_metrics["MSSD"]
+            mean_mspd = winner_metrics["MSPD"]
+            mean_vsd = winner_metrics["VSD"]
+            err_R = winner_metrics["R_error"]
+            err_T = winner_metrics["T_error"]
 
             object_metrics[obj_name]["ADD"].append(add_thres)
             object_metrics[obj_name]["ADD-S"].append(adds_thres)
             object_metrics[obj_name]["ADD(-S)"].append(add_mix_thres)
-            object_metrics[obj_name]["Oryon ADD(S)-0.1d"].append(oryon_adds_thres)
             object_metrics[obj_name]["AR"].append(mean_ar)
             object_metrics[obj_name]["VSD"].append(mean_vsd)
             object_metrics[obj_name]["MSSD"].append(mean_mssd)
             object_metrics[obj_name]["MSPD"].append(mean_mspd)
-            object_metrics[obj_name]["R error"].append(float(np.asarray(err_R).reshape(-1)[0]))
-            object_metrics[obj_name]["T error"].append(float(np.asarray(err_T).reshape(-1)[0]))
+            object_metrics[obj_name]["R error"].append(float(err_R))
+            object_metrics[obj_name]["T error"].append(float(err_T))
             object_metrics[obj_name]["chosen_candidate"].append(best_label)
             object_metrics[obj_name]["cls_id"].append(obj_name)
             object_metrics[obj_name]["instance_id"].append(obj_count)
@@ -836,16 +1094,19 @@ def main():
             all_frame_data["ADD-S"].append(adds_thres)
             all_frame_data["ADD"].append(add_thres)
             all_frame_data["ADD(-S)"].append(add_mix_thres)
-            all_frame_data["Oryon ADD(S)-0.1d"].append(oryon_adds_thres)
             all_frame_data["AR"].append(mean_ar)
             all_frame_data["MSSD"].append(mean_mssd)
             all_frame_data["MSPD"].append(mean_mspd)
             all_frame_data["VSD"].append(mean_vsd)
-            all_frame_data["R_error"].append(float(np.asarray(err_R).reshape(-1)[0]))
-            all_frame_data["T_error"].append(float(np.asarray(err_T).reshape(-1)[0]))
+            all_frame_data["R_error"].append(float(err_R))
+            all_frame_data["T_error"].append(float(err_T))
+            all_frame_data["Selection_Time_s"].append(selection_time_s)
 
             if args.save_visualizations:
-                winning_cache = next((c for c in cand_caches if c.label == best_label), None)
+                winning_candidate_label = winner.get("candidate_label", best_label)
+                winning_cache = next(
+                    (c for c in cand_caches if c.label == winning_candidate_label), None
+                )
                 vis_est = est
                 if winning_cache is not None:
                     swap_candidate(vis_est, winning_cache)
@@ -879,7 +1140,6 @@ def main():
             "ADD-S": np.mean(object_metrics[obj_name]["ADD-S"]) * 100,
             "ADD": np.mean(object_metrics[obj_name]["ADD"]) * 100,
             "ADD(-S)": np.mean(object_metrics[obj_name]["ADD(-S)"]) * 100,
-            "Oryon ADD(S)-0.1d": np.mean(object_metrics[obj_name]["Oryon ADD(S)-0.1d"]) * 100,
             "AR": np.mean(object_metrics[obj_name]["AR"]) * 100,
             "MSSD": np.mean(object_metrics[obj_name]["MSSD"]) * 100,
             "MSPD": np.mean(object_metrics[obj_name]["MSPD"]) * 100,
@@ -895,7 +1155,6 @@ def main():
                 "ADD-S": f"{class_means['ADD-S']:.1f}",
                 "ADD": f"{class_means['ADD']:.1f}",
                 "ADD(-S)": f"{class_means['ADD(-S)']:.1f}",
-                "Oryon ADD(S)-0.1d": f"{class_means['Oryon ADD(S)-0.1d']:.1f}",
                 "AR": f"{class_means['AR']:.1f}",
                 "MSSD": f"{class_means['MSSD']:.1f}",
                 "MSPD": f"{class_means['MSPD']:.1f}",
@@ -913,7 +1172,6 @@ def main():
         "ADD-S": np.mean([np.mean(object_metrics[o]["ADD-S"]) for o in evaluated_objs]) * 100,
         "ADD": np.mean([np.mean(object_metrics[o]["ADD"]) for o in evaluated_objs]) * 100,
         "ADD(-S)": np.mean([np.mean(object_metrics[o]["ADD(-S)"]) for o in evaluated_objs]) * 100,
-        "Oryon ADD(S)-0.1d": np.mean([np.mean(object_metrics[o]["Oryon ADD(S)-0.1d"]) for o in evaluated_objs]) * 100,
         "AR": np.mean([np.mean(object_metrics[o]["AR"]) for o in evaluated_objs]) * 100,
         "MSSD": np.mean([np.mean(object_metrics[o]["MSSD"]) for o in evaluated_objs]) * 100,
         "MSPD": np.mean([np.mean(object_metrics[o]["MSPD"]) for o in evaluated_objs]) * 100,
@@ -927,7 +1185,6 @@ def main():
             "ADD-S": f"{overall_means['ADD-S']:.1f}",
             "ADD": f"{overall_means['ADD']:.1f}",
             "ADD(-S)": f"{overall_means['ADD(-S)']:.1f}",
-            "Oryon ADD(S)-0.1d": f"{overall_means['Oryon ADD(S)-0.1d']:.1f}",
             "AR": f"{overall_means['AR']:.1f}",
             "MSSD": f"{overall_means['MSSD']:.1f}",
             "MSPD": f"{overall_means['MSPD']:.1f}",
@@ -938,6 +1195,60 @@ def main():
     )
     pd.DataFrame(summary_data).to_excel(f"{save_root}/0_mean_all_metrics_classes_results.xlsx", index=False)
     df_all = pd.DataFrame(all_frame_data)
+    # Counts come from the actual Eq. (22) winner on every evaluated frame.
+    requested_candidate_order = list(PAPER_CANDIDATE_LABELS)
+    selected_series = df_all["Chosen_Candidate"].astype(str)
+    overall_counts = selected_series.value_counts()
+    selection_rows = []
+    count_labels = list(dict.fromkeys(requested_candidate_order + overall_counts.index.tolist()))
+    total_selected = max(int(len(df_all)), 1)
+    for label in count_labels:
+        count = int(overall_counts.get(label, 0))
+        selection_rows.append(
+            {
+                "Candidate": label,
+                "Selected_Count": count,
+                "Selected_Fraction": float(count / total_selected),
+                "Total_Frames": int(len(df_all)),
+            }
+        )
+    selection_overall_df = pd.DataFrame(selection_rows)
+    selection_by_object_df = (
+        df_all.groupby(["Class", "Chosen_Candidate"], as_index=False)
+        .size()
+        .rename(columns={"size": "Selected_Count"})
+    )
+    object_totals = df_all.groupby("Class").size().rename("Total_Frames")
+    selection_by_object_df = selection_by_object_df.join(
+        object_totals, on="Class"
+    )
+    selection_by_object_df["Selected_Fraction"] = (
+        selection_by_object_df["Selected_Count"]
+        / selection_by_object_df["Total_Frames"].clip(lower=1)
+    )
+    selection_counts_path = f"{save_root}/0_candidate_selection_counts.xlsx"
+    with pd.ExcelWriter(selection_counts_path) as writer:
+        selection_overall_df.to_excel(writer, index=False, sheet_name="overall")
+        selection_by_object_df.to_excel(
+            writer, index=False, sheet_name="by_object"
+        )
+    with open(
+        f"{save_root}/0_candidate_selection_counts.json", "w", encoding="utf-8"
+    ) as f:
+        json.dump(
+            {
+                "total_frames": int(len(df_all)),
+                "overall": selection_rows,
+            },
+            f,
+            indent=2,
+        )
+    print("\nCandidate selection counts (Eq. 22):")
+    for row in selection_rows:
+        print(
+            f"  {row['Candidate']}: {row['Selected_Count']}/"
+            f"{row['Total_Frames']} ({100.0 * row['Selected_Fraction']:.2f}%)"
+        )
     means_all_row = {
         "Frame_ID": "MEAN",
         "Scene": "ALL",
@@ -948,18 +1259,52 @@ def main():
         "ADD-S": f"{df_all['ADD-S'].mean() * 100:.1f}",
         "ADD": f"{df_all['ADD'].mean() * 100:.1f}",
         "ADD(-S)": f"{df_all['ADD(-S)'].mean() * 100:.1f}",
-        "Oryon ADD(S)-0.1d": f"{df_all['Oryon ADD(S)-0.1d'].mean() * 100:.1f}",
         "AR": f"{df_all['AR'].mean() * 100:.1f}",
         "MSSD": f"{df_all['MSSD'].mean() * 100:.1f}",
         "MSPD": f"{df_all['MSPD'].mean() * 100:.1f}",
         "VSD": f"{df_all['VSD'].mean() * 100:.1f}",
         "R_error": f"{df_all['R_error'].mean(skipna=True):.1f}",
         "T_error": f"{df_all['T_error'].mean(skipna=True):.1f}",
+        "Selection_Time_s": f"{df_all['Selection_Time_s'].mean(skipna=True):.3f}",
     }
     df_all = pd.concat([df_all, pd.DataFrame([means_all_row])], ignore_index=True)
     all_frames_path = f"{save_root}/0_all_frames_metrics_results.xlsx"
     df_all.to_excel(all_frames_path, index=False)
+    candidate_scores_path = f"{save_root}/0_all_candidate_scores.xlsx"
+    candidate_scores_df = pd.DataFrame(candidate_score_rows)
+    candidate_scores_df.to_excel(candidate_scores_path, index=False)
+    run_manifest["completed"] = True
+    run_manifest["evaluated_frames"] = int(obj_count)
+    run_manifest["evaluated_objects"] = list(evaluated_objs)
+    run_manifest["coverage"] = {
+        "sampled_frame_instances": int(sampled_frame_instances),
+        "evaluated_frame_instances": int(obj_count),
+        "skipped_frame_instances": int(max(sampled_frame_instances - obj_count, 0)),
+        "registration_failure_frames": int(registration_failure_frames),
+    }
+    run_manifest["runtime"] = {
+        "measurement": "registration through Eq.22 winner selection",
+        "frames": int(len(selection_times)),
+        "median_seconds": (
+            float(np.median(selection_times)) if selection_times else None
+        ),
+        "p95_seconds": (
+            float(np.percentile(selection_times, 95)) if selection_times else None
+        ),
+    }
+    with open(
+        os.path.join(save_root, "evaluation_coverage.json"),
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        json.dump(run_manifest["coverage"], handle, indent=2)
+    with open(
+        os.path.join(save_root, "query_run_manifest.json"), "w", encoding="utf-8"
+    ) as f:
+        json.dump(run_manifest, f, indent=2)
     print(f"All frames metrics saved to: {all_frames_path}")
+    print(f"Per-candidate weighted scores saved to: {candidate_scores_path}")
+    print(f"Candidate selection counts saved to: {selection_counts_path}")
     print(f"Total evaluated: {obj_count} frame-object pairs across {len(evaluated_objs)} objects")
     print(f"Results directory: {save_root}")
 

@@ -36,3 +36,7 @@ dependencies:
       - pycocotools
       - gdown
       - pybind11
+      - iopath==0.1.10
+      - vispy==0.15.2
+      - PyOpenGL==3.1.0
+      - pytest==8.4.2

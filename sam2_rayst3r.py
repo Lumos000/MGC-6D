@@ -3,7 +3,6 @@ setup_project_paths()
 
 import os
 import shutil
-import sys
 import tempfile
 from pathlib import Path
 from typing import Optional, Tuple
@@ -19,6 +18,27 @@ SAM2_ROOT = PROJECT_ROOT / "sam2"
 SAM2_PKG_ROOT = SAM2_ROOT / "sam2"
 DEFAULT_SAM2_CKPT = str(PROJECT_ROOT / "sam2" / "checkpoints" / "sam2.1_hiera_large.pt")
 DEFAULT_SAM2_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
+
+
+def _load_local_dinov2(device: str):
+    """Load RaySt3R's DINOv2 dependency without a GitHub request."""
+
+    hub_root = Path(torch.hub.get_dir())
+    configured = os.environ.get("MGC6D_DINOV2_REPO", "").strip()
+    candidates = [Path(configured)] if configured else sorted(
+        hub_root.glob("facebookresearch_dinov2_*")
+    )
+    repo = next((path for path in candidates if (path / "hubconf.py").is_file()), None)
+    weights = hub_root / "checkpoints" / "dinov2_vitl14_reg4_pretrain.pth"
+    if repo is None or not weights.is_file():
+        raise FileNotFoundError(
+            "Local DINOv2 repository/weights are required for RaySt3R: "
+            f"repo={repo}, weights={weights}"
+        )
+    model = torch.hub.load(
+        str(repo), "dinov2_vitl14_reg", source="local", pretrained=True
+    )
+    return model.eval().to(device)
 
 
 def _import_rayst3r():
@@ -161,9 +181,7 @@ class Rayst3RRunner:
 
         EvalWrapper, _ = _import_rayst3r()
         self.model = EvalWrapper(checkpoint_path, distributed=False, device=device, dtype=dtype)
-        self.dino_model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitl14_reg")
-        self.dino_model.eval()
-        self.dino_model.to(device)
+        self.dino_model = _load_local_dinov2(device)
 
     def reconstruct_from_arrays(
         self,

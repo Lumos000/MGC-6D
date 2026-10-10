@@ -13,9 +13,11 @@
 # limitations under the License.
 
 
+import os
+
 import torch.nn as nn
 from transformers import ViTImageProcessor
-from einops import rearrange, repeat
+from einops import rearrange
 from .dino import ViTModel
 
 
@@ -48,7 +50,6 @@ class DinoWrapper(nn.Module):
             do_resize=False,
         ).to(self.model.device).to(dtype)
         # embed camera
-        N = camera.shape[1]
         camera_embeddings = self.camera_embedder(camera)
         camera_embeddings = rearrange(camera_embeddings, 'b n d -> (b n) d')
         embeddings = camera_embeddings
@@ -58,23 +59,49 @@ class DinoWrapper(nn.Module):
         return last_hidden_states
 
     def _freeze(self):
-        print(f"======== Freezing DinoWrapper ========")
+        print("======== Freezing DinoWrapper ========")
         self.model.eval()
         for name, param in self.model.named_parameters():
             param.requires_grad = False
 
     @staticmethod
-    def _build_dino(model_name: str, proxy_error_retries: int = 3, proxy_error_cooldown: int = 5):
-        import requests
-        try:
-            model = ViTModel.from_pretrained(model_name, add_pooling_layer=False)
-            processor = ViTImageProcessor.from_pretrained(model_name)
-            return model, processor
-        except requests.exceptions.ProxyError as err:
-            if proxy_error_retries > 0:
-                print(f"Huggingface ProxyError: Retrying in {proxy_error_cooldown} seconds...")
-                import time
-                time.sleep(proxy_error_cooldown)
-                return DinoWrapper._build_dino(model_name, proxy_error_retries - 1, proxy_error_cooldown)
-            else:
-                raise err
+    def _build_dino(model_name: str):
+        """Load DINO from a verified local snapshot only.
+
+        ``MGC6D_DINO_LOCAL_PATH`` may override the configured value.  When the
+        configuration contains a Hugging Face repository id, resolve it from
+        the existing cache with ``local_files_only=True``.  This prevents an
+        accidental network request halfway through a long anchor run while
+        keeping the formal launchers self-contained on a prepared machine.
+        """
+        local_path = os.environ.get("MGC6D_DINO_LOCAL_PATH", "").strip()
+        resolved = local_path or model_name
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        expanded = os.path.expanduser(resolved)
+        if os.path.exists(expanded):
+            resolved = os.path.realpath(expanded)
+        else:
+            try:
+                from huggingface_hub import snapshot_download
+
+                resolved = snapshot_download(
+                    repo_id=resolved,
+                    local_files_only=True,
+                )
+            except Exception as exc:
+                raise FileNotFoundError(
+                    "InstantMesh DINO must be available offline. Set "
+                    "MGC6D_DINO_LOCAL_PATH to a local facebook/dino-vitb16 "
+                    f"snapshot (configured value: {model_name!r})."
+                ) from exc
+        model = ViTModel.from_pretrained(
+            resolved,
+            add_pooling_layer=False,
+            local_files_only=True,
+        )
+        processor = ViTImageProcessor.from_pretrained(
+            resolved,
+            local_files_only=True,
+        )
+        return model, processor

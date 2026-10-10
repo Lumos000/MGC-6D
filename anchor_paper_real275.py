@@ -20,11 +20,14 @@ from tqdm import tqdm
 from construction import ReconstructionConfig, run_construction
 from estimater import Any6D
 from foundationpose.Utils import (
-    calculate_chamfer_distance_gt_mesh,
     nvdiffrast_render,
-    visualize_frame_results,
 )
-from candidate_selection import derive_anchor_reliability_scores, score_candidates
+from candidate_selection import (
+    derive_anchor_reliability_scores,
+    score_candidates,
+)
+from candidate_admission import is_genuine_fusion, is_instantmesh_only
+from revision_protocol import runtime_provenance
 
 
 def _release_cuda_memory():
@@ -52,32 +55,27 @@ def _parse_object_number_from_source_frame(obj_dir: str) -> int:
     return -1
 
 
-def _extract_pure_rotation_pose(nocs_gt_pose: np.ndarray) -> np.ndarray:
-    s_r = nocs_gt_pose[:3, :3]
-    u, _s, vt = np.linalg.svd(s_r)
-    r_pure = u @ vt
-    if np.linalg.det(r_pure) < 0:
-        r_pure = -r_pure
-    pose = np.eye(4, dtype=np.float64)
-    pose[:3, :3] = r_pure
-    pose[:3, 3] = nocs_gt_pose[:3, 3]
-    return pose
-
-
-def _nocs_scale_from_pose(nocs_gt_pose: np.ndarray) -> float:
-    _, s, _ = np.linalg.svd(nocs_gt_pose[:3, :3])
-    return float(s.mean())
-
-
 def _as_trimesh(mesh_obj) -> trimesh.Trimesh:
     if isinstance(mesh_obj, trimesh.Scene):
-        return trimesh.util.concatenate(
-            [g for g in mesh_obj.geometry.values() if isinstance(g, trimesh.Trimesh)]
-        )
+        meshes = [
+            geometry
+            for geometry in mesh_obj.geometry.values()
+            if isinstance(geometry, trimesh.Trimesh)
+        ]
+        if not meshes:
+            raise ValueError("Loaded scene contains no triangle mesh")
+        return trimesh.util.concatenate(meshes)
+    if not isinstance(mesh_obj, trimesh.Trimesh):
+        raise TypeError(f"Expected Trimesh or Scene, got {type(mesh_obj).__name__}")
     return mesh_obj
 
 
-def _backproject_depth_to_points(depth: np.ndarray, k: np.ndarray, valid_mask: np.ndarray, max_points: int = 5000):
+def _backproject_depth_to_points(
+    depth: np.ndarray,
+    k: np.ndarray,
+    valid_mask: np.ndarray,
+    max_points: int = 5000,
+) -> np.ndarray:
     ys, xs = np.where(valid_mask)
     if ys.size == 0:
         return np.zeros((0, 3), dtype=np.float32)
@@ -86,92 +84,105 @@ def _backproject_depth_to_points(depth: np.ndarray, k: np.ndarray, valid_mask: n
     cx, cy = float(k[0, 2]), float(k[1, 2])
     x = (xs.astype(np.float32) - cx) * z / max(fx, 1e-8)
     y = (ys.astype(np.float32) - cy) * z / max(fy, 1e-8)
-    pts = np.stack([x, y, z], axis=1)
-    if pts.shape[0] > max_points:
-        idx = np.random.choice(pts.shape[0], size=max_points, replace=False)
-        pts = pts[idx]
-    return pts
+    points = np.stack([x, y, z], axis=1)
+    if points.shape[0] > max_points:
+        indices = np.random.choice(points.shape[0], size=max_points, replace=False)
+        points = points[indices]
+    return points
 
 
-def _chamfer_distance_pointcloud(pts_a: np.ndarray, pts_b: np.ndarray) -> float:
-    if pts_a.shape[0] == 0 or pts_b.shape[0] == 0:
+def _chamfer_distance_pointcloud(points_a: np.ndarray, points_b: np.ndarray) -> float:
+    if points_a.shape[0] == 0 or points_b.shape[0] == 0:
         return 1e3
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    a = torch.as_tensor(pts_a, dtype=torch.float32, device=device)
-    b = torch.as_tensor(pts_b, dtype=torch.float32, device=device)
-    dists = torch.cdist(a.unsqueeze(0), b.unsqueeze(0), p=2.0).squeeze(0)
-    ch = dists.min(dim=1).values.mean() + dists.min(dim=0).values.mean()
-    return float(ch.detach().cpu().item())
+    tensor_a = torch.as_tensor(points_a, dtype=torch.float32, device=device)
+    tensor_b = torch.as_tensor(points_b, dtype=torch.float32, device=device)
+    distances = torch.cdist(tensor_a.unsqueeze(0), tensor_b.unsqueeze(0), p=2.0).squeeze(0)
+    chamfer = distances.min(dim=1).values.mean() + distances.min(dim=0).values.mean()
+    return float(chamfer.detach().cpu().item())
 
 
-def _compute_self_supervised_losses(est, depth: np.ndarray, mask: np.ndarray, k: np.ndarray, pred_pose: np.ndarray, glctx):
-    h, w = depth.shape[:2]
+def _compute_self_supervised_losses(
+    est,
+    depth: np.ndarray,
+    mask: np.ndarray,
+    k: np.ndarray,
+    pred_pose: np.ndarray,
+    glctx,
+) -> tuple[float, float, float]:
+    height, width = depth.shape[:2]
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    pose_tensor = torch.as_tensor(pred_pose, device=device, dtype=torch.float32).unsqueeze(0)
-    tf = est.get_tf_to_centered_mesh()
-    if torch.is_tensor(tf):
-        tf = tf.to(device=pose_tensor.device, dtype=torch.float32).unsqueeze(0)
+    pose_tensor = torch.as_tensor(
+        pred_pose, device=device, dtype=torch.float32
+    ).unsqueeze(0)
+    tf_to_centered = est.get_tf_to_centered_mesh()
+    if torch.is_tensor(tf_to_centered):
+        tf_to_centered = tf_to_centered.to(
+            device=pose_tensor.device, dtype=torch.float32
+        ).unsqueeze(0)
     else:
-        tf = torch.as_tensor(tf, device=pose_tensor.device, dtype=torch.float32).unsqueeze(0)
-    ob_in_cams = pose_tensor @ torch.linalg.inv(tf)
+        tf_to_centered = torch.as_tensor(
+            tf_to_centered, device=pose_tensor.device, dtype=torch.float32
+        ).unsqueeze(0)
+    ob_in_cams = pose_tensor @ torch.linalg.inv(tf_to_centered)
     rendered = nvdiffrast_render(
         mesh=est.mesh,
         mesh_tensors=est.mesh_tensors,
         ob_in_cams=ob_in_cams,
         K=k,
-        H=h,
-        W=w,
+        H=height,
+        W=width,
         glctx=glctx,
     )
     if rendered is None:
         return 1.0, 1.0, 1e3
 
     rendered_depth = None
-    if isinstance(rendered, tuple):
-        if len(rendered) >= 2:
-            rendered_depth = rendered[1]
+    if isinstance(rendered, tuple) and len(rendered) >= 2:
+        rendered_depth = rendered[1]
     elif hasattr(rendered, "shape") and rendered.shape[-1] > 3:
         rendered_depth = rendered[..., 3]
     if rendered_depth is None:
         return 1.0, 1.0, 1e3
-    rd = rendered_depth[0] if getattr(rendered_depth, "ndim", 0) > 2 else rendered_depth
-    if torch.is_tensor(rd):
-        rd = rd.detach().cpu().numpy()
-    rd = rd.astype(np.float32)
+    rendered_depth = (
+        rendered_depth[0]
+        if getattr(rendered_depth, "ndim", 0) > 2
+        else rendered_depth
+    )
+    if torch.is_tensor(rendered_depth):
+        rendered_depth = rendered_depth.detach().cpu().numpy()
+    rendered_depth = rendered_depth.astype(np.float32)
 
-    obs_mask = (mask > 0) & (depth > 1e-4)
-    ren_mask = rd > 1e-4
-
-    overlap = obs_mask & ren_mask
+    observed_mask = (mask > 0) & (depth > 1e-4)
+    rendered_mask = rendered_depth > 1e-4
+    overlap = observed_mask & rendered_mask
     if overlap.sum() > 10:
         depth_scale = max(float(np.mean(depth[overlap])), 1e-4)
-        l_depth = float(np.mean(np.abs(depth[overlap] - rd[overlap])) / depth_scale)
+        depth_loss = float(
+            np.mean(np.abs(depth[overlap] - rendered_depth[overlap])) / depth_scale
+        )
     else:
-        l_depth = 1.0
+        depth_loss = 1.0
 
-    union = obs_mask | ren_mask
+    union = observed_mask | rendered_mask
     if union.sum() > 0:
-        iou = float((obs_mask & ren_mask).sum()) / float(union.sum())
-        l_mask = float(1.0 - iou)
+        iou = float((observed_mask & rendered_mask).sum()) / float(union.sum())
+        mask_loss = float(1.0 - iou)
     else:
-        l_mask = 1.0
+        mask_loss = 1.0
 
-    obs_pts = _backproject_depth_to_points(depth, k, obs_mask)
-    ren_pts = _backproject_depth_to_points(rd, k, ren_mask)
-    l_geom = _chamfer_distance_pointcloud(ren_pts, obs_pts)
-    return l_depth, l_mask, l_geom
+    observed_points = _backproject_depth_to_points(depth, k, observed_mask)
+    rendered_points = _backproject_depth_to_points(
+        rendered_depth, k, rendered_mask
+    )
+    geometry_loss = _chamfer_distance_pointcloud(rendered_points, observed_points)
+    return depth_loss, mask_loss, geometry_loss
 
 
 def _exported_mesh_pose(
     est: Any6D, returned_pose: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return a pose mapping the exact exported ``est.mesh`` to the camera.
-
-    ``register`` returns a pose for the mesh before Any6D's internal centering,
-    whereas this anchor exports the centered internal mesh.  Applying the
-    inverse centering transform once here gives anchor and query the same
-    explicit mesh/pose frame contract.
-    """
+    """Map the exact centered mesh exported by Any6D into the camera frame."""
 
     tf_to_centered = est.get_tf_to_centered_mesh()
     if torch.is_tensor(tf_to_centered):
@@ -199,11 +210,9 @@ def _compute_anchor_calibration_score(
             scale_meta.get("instantmesh", {}),
         ]
         scale_values = [
-            (
-                float(entry.get("reliability", 0.0))
-                if bool(entry.get("valid", False))
-                else 0.0
-            )
+            float(entry.get("reliability", 0.0))
+            if bool(entry.get("valid", False))
+            else 0.0
             for entry in scale_entries
             if bool(entry.get("enabled", False))
         ]
@@ -211,24 +220,18 @@ def _compute_anchor_calibration_score(
     else:
         scale_entry = scale_meta.get(label, {})
         scale_reliability = (
-            (
-                float(scale_entry.get("reliability", 0.0))
-                if bool(scale_entry.get("valid", False))
-                else 0.0
-            )
+            float(scale_entry.get("reliability", 0.0))
             if bool(scale_entry.get("enabled", False))
-            else 1.0
+            and bool(scale_entry.get("valid", False))
+            else (0.0 if bool(scale_entry.get("enabled", False)) else 1.0)
         )
-    # Self-supervised scale quality is continuous and bounded to a 20% range;
-    # it cannot act as an undisclosed candidate gate.
     scale_factor = float(np.clip(0.8 + 0.2 * scale_reliability, 0.8, 1.0))
     if label in ("rayst3r", "instantmesh"):
         return base_score * scale_factor
 
     fitness = meta.get("align_fitness", -1.0)
     rmse = meta.get("align_rmse", float("inf"))
-    consistency_ok = (fitness >= tau_inlier) and (rmse <= tau_rmse)
-    if label == "fused" and consistency_ok:
+    if fitness >= tau_inlier and rmse <= tau_rmse:
         weight_sum = max(float(w_inlier) + float(w_rmse), 1e-8)
         rmse_quality = float(
             np.exp(-max(float(rmse), 0.0) / max(float(tau_rmse), 1e-8))
@@ -238,7 +241,9 @@ def _compute_anchor_calibration_score(
             + float(w_rmse) * rmse_quality
         ) / weight_sum
         fusion_quality = float(
-            meta.get("fusion_diagnostics", {}).get("reliability", alignment_quality)
+            meta.get("fusion_diagnostics", {}).get(
+                "reliability", alignment_quality
+            )
         )
         return base_score * scale_factor * float(
             np.clip(0.5 * alignment_quality + 0.5 * fusion_quality, 0.0, 1.0)
@@ -271,41 +276,6 @@ def _convert_depth(depth_raw: np.ndarray, depth_unit: str) -> np.ndarray:
     raise ValueError(f"Unsupported depth_unit: {depth_unit}")
 
 
-def _recover_existing_candidates_from_disk(obj_dir: str, obj: str, c_base: float) -> dict:
-    recovered = {}
-    labels = ["rayst3r", "instantmesh", "fused"]
-    for label in labels:
-        mesh_out = os.path.join(obj_dir, f"final_mesh_{obj}_{label}.obj")
-        pose_out = os.path.join(obj_dir, f"{obj}_initial_pose_{label}.txt")
-        if not (os.path.exists(mesh_out) and os.path.exists(pose_out)):
-            continue
-        try:
-            mesh_local = _as_trimesh(trimesh.load(mesh_out, process=False))
-            pred_pose = np.loadtxt(pose_out)
-        except Exception:
-            continue
-        l_depth_path = os.path.join(obj_dir, f"{obj}_ldepth_{label}.txt")
-        l_mask_path = os.path.join(obj_dir, f"{obj}_lmask_{label}.txt")
-        l_geom_path = os.path.join(obj_dir, f"{obj}_cd_{label}.txt")
-        l_depth = float(np.loadtxt(l_depth_path)) if os.path.exists(l_depth_path) else 1.0
-        l_mask = float(np.loadtxt(l_mask_path)) if os.path.exists(l_mask_path) else 1.0
-        l_geom = float(np.loadtxt(l_geom_path)) if os.path.exists(l_geom_path) else 1.0
-        recovered[label] = {
-            "pred_pose": pred_pose,
-            "est_mesh": mesh_local.copy(),
-            "mesh_path": mesh_out,
-            "raw_mesh_path": os.path.abspath(mesh_out),
-            "pose_path": pose_out,
-            "l_depth": l_depth,
-            "l_mask": l_mask,
-            "l_geom": l_geom,
-            "s_anchor": float(c_base),
-            "chamfer_gt": float(l_geom),
-            "model_center": np.asarray(mesh_local.vertices.mean(axis=0)).reshape(-1).tolist(),
-        }
-    return recovered
-
-
 def _run_single_trial(
     mesh_template: trimesh.Trimesh,
     save_path: str,
@@ -332,8 +302,8 @@ def _run_single_trial(
         debug_dir=save_path,
         debug=0,
         glctx=glctx,
-        grid_n_views=args.strategy_grid_n_views,
-        grid_inplane_step=args.strategy_grid_inplane_step,
+        grid_n_views=40,
+        grid_inplane_step=60,
     )
     pred_pose = est.register(
         K=intrinsic,
@@ -352,12 +322,7 @@ def main():
     parser.add_argument(
         "--anchor_folder",
         type=str,
-        default="/data/gst/MGC-6D/results/anchor_results/real275_paper/real275_reference_view",
-    )
-    parser.add_argument(
-        "--real_model_path",
-        type=str,
-        default="/data/gst/data/REAL275/obj_models/real_test",
+        required=True,
     )
     parser.add_argument("--depth_unit", type=str, default="auto", choices=["auto", "mm", "rayst3r_uint16", "meters"])
     parser.add_argument("--depth_unit_try_both", action="store_true")
@@ -402,10 +367,20 @@ def main():
     parser.add_argument(
         "--icp_multi_hypo",
         type=int,
-        default=1,
+        default=24,
         help=(
             "Number of deterministic ICP initial hypotheses; values up to 24 "
             "enumerate proper axis rotations about the object centroid."
+        ),
+    )
+    parser.add_argument(
+        "--icp_reciprocal_pairing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Report cycle consistency by refining the inverse of the selected "
+            "best-of-two transform in the reverse direction. This diagnostic "
+            "does not change either main directional ICP search."
         ),
     )
     parser.add_argument("--icp_init_sigma", type=float, default=0.01)
@@ -468,6 +443,54 @@ def main():
     parser.add_argument("--fusion_max_extent_ratio", type=float, default=1.35)
     parser.add_argument("--fusion_max_center_offset_ratio", type=float, default=0.15)
     parser.add_argument(
+        "--fusion_max_update_ratio",
+        type=float,
+        default=0.04,
+        help="Maximum visible-surface vertex displacement as an object-diameter ratio.",
+    )
+    parser.add_argument(
+        "--fusion_min_normal_cosine",
+        type=float,
+        default=0.15,
+        help="Minimum absolute prior/RaySt3R normal cosine for a local update.",
+    )
+    parser.add_argument(
+        "--fusion_smooth_iterations",
+        type=int,
+        default=3,
+        help="Topology-neighbour smoothing iterations for bounded Phi displacement.",
+    )
+    parser.add_argument(
+        "--fusion_min_update_fraction",
+        type=float,
+        default=0.01,
+        help=(
+            "Minimum prior-vertex fraction changed by visible-patch Phi before "
+            "the fused mesh is admitted as a distinct candidate."
+        ),
+    )
+    parser.add_argument(
+        "--fusion_min_visible_depth_gain",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum anchor visible-depth residual improvement in metres for "
+            "fused-candidate admission; this uses anchor RGB-D only."
+        ),
+    )
+    parser.add_argument(
+        "--fusion_global_scale_min",
+        type=float,
+        default=0.88,
+        help="Lower bound for the no-GT Ray/prior envelope scale correction.",
+    )
+    parser.add_argument(
+        "--fusion_global_scale_max",
+        type=float,
+        default=1.12,
+        help="Upper bound for the no-GT Ray/prior envelope scale correction.",
+    )
+    parser.add_argument(
         "--fusion_cycle_in_reliability",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -518,39 +541,6 @@ def main():
     parser.add_argument("--score_alpha", type=float, default=0.4)
     parser.add_argument("--score_beta", type=float, default=0.6)
     parser.add_argument("--summary_filename", type=str, default="chamfer_distances.xlsx")
-    parser.add_argument(
-        "--strategy_trials_enable",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Deprecated ablation switch. The paper-aligned REAL275 main method "
-            "uses one FoundationPose register call per geometry."
-        ),
-    )
-    parser.add_argument(
-        "--strategy_n_seeds",
-        type=int,
-        default=1,
-        help="Number of random seeds for each strategy trial.",
-    )
-    parser.add_argument(
-        "--strategy_grid_n_views",
-        type=int,
-        default=40,
-        help="FoundationPose rotation-grid view count (match query default).",
-    )
-    parser.add_argument(
-        "--strategy_grid_inplane_step",
-        type=int,
-        default=60,
-        help="FoundationPose in-plane rotation step (match query default).",
-    )
-    parser.add_argument(
-        "--allow_stale_recovery",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Debug-only recovery from pre-existing final_mesh files after a live failure.",
-    )
     args = parser.parse_args()
 
     anchor_scales = (
@@ -569,11 +559,6 @@ def main():
         parser.error("anchor score weights must be non-negative and not all zero")
     if not 0.0 <= args.anchor_calibration_weight <= 1.0:
         parser.error("--anchor_calibration_weight must lie in [0, 1]")
-    if args.strategy_trials_enable or args.strategy_n_seeds != 1:
-        parser.error(
-            "REAL275 main flow no longer performs outer anchor strategy selection; "
-            "use --no-strategy_trials_enable --strategy_n_seeds 1"
-        )
     if args.register_iteration < 1:
         parser.error("--register_iteration must be positive")
     if args.rgbd_scale_grid_steps < 1 or args.rgbd_scale_z_offset_steps < 1:
@@ -582,6 +567,22 @@ def main():
         parser.error("--rgbd_scale_multiplier_min must be positive")
     if args.rgbd_scale_multiplier_min > args.rgbd_scale_multiplier_max:
         parser.error("RGB-D scale multiplier bounds are reversed")
+    if not 0.0 < args.fusion_max_update_ratio <= 0.25:
+        parser.error("--fusion_max_update_ratio must lie in (0, 0.25]")
+    if not 0.0 <= args.fusion_min_normal_cosine < 1.0:
+        parser.error("--fusion_min_normal_cosine must lie in [0, 1)")
+    if args.fusion_smooth_iterations < 0:
+        parser.error("--fusion_smooth_iterations must be non-negative")
+    if not 0.0 <= args.fusion_min_update_fraction <= 1.0:
+        parser.error("--fusion_min_update_fraction must lie in [0, 1]")
+    if args.fusion_global_scale_min <= 0.0:
+        parser.error("--fusion_global_scale_min must be positive")
+    if args.fusion_global_scale_min > 1.0:
+        parser.error("--fusion_global_scale_min must not exceed 1")
+    if args.fusion_global_scale_max < 1.0:
+        parser.error("--fusion_global_scale_max must be at least 1")
+    if args.fusion_global_scale_min > args.fusion_global_scale_max:
+        parser.error("fusion global scale bounds are reversed")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -640,6 +641,7 @@ def main():
         icp_max_iter=args.icp_max_iter,
         icp_fitness_threshold=args.icp_fitness_threshold,
         icp_multi_hypo=args.icp_multi_hypo,
+        icp_reciprocal_pairing=args.icp_reciprocal_pairing,
         icp_init_sigma=args.icp_init_sigma,
         icp_max_corr_ratio=args.icp_max_corr_ratio,
         icp_voxel_size=args.icp_voxel_size,
@@ -662,8 +664,21 @@ def main():
         fusion_min_extent_ratio=args.fusion_min_extent_ratio,
         fusion_max_extent_ratio=args.fusion_max_extent_ratio,
         fusion_max_center_offset_ratio=args.fusion_max_center_offset_ratio,
+        fusion_max_update_ratio=args.fusion_max_update_ratio,
+        fusion_min_normal_cosine=args.fusion_min_normal_cosine,
+        fusion_smooth_iterations=args.fusion_smooth_iterations,
+        fusion_global_scale_min=args.fusion_global_scale_min,
+        fusion_global_scale_max=args.fusion_global_scale_max,
         fusion_cycle_in_reliability=args.fusion_cycle_in_reliability,
         rgbd_scale_recovery=args.rgbd_scale_recovery,
+        rgbd_scale_visible_sim3=False,
+        rgbd_scale_min_margin=0.002,
+        rgbd_rotation_min_margin=0.002,
+        rgbd_scale_min_reciprocal_fraction=0.0,
+        rgbd_scale_silhouette_weight=0.0,
+        rgbd_scale_min_silhouette_quality=0.0,
+        rgbd_scale_ambiguity_fallback=False,
+        rgbd_scale_sim3_iterations=5,
         rgbd_scale_grid_steps=args.rgbd_scale_grid_steps,
         rgbd_scale_multiplier_min=args.rgbd_scale_multiplier_min,
         rgbd_scale_multiplier_max=args.rgbd_scale_multiplier_max,
@@ -709,8 +724,7 @@ def main():
         mask_img = cv2.imread(os.path.join(obj_dir, "mask.png"), cv2.IMREAD_GRAYSCALE)
         k_path = os.path.join(obj_dir, "K.txt")
         gt_pose_path = os.path.join(obj_dir, f"{obj}_gt_pose.txt")
-        gt_mesh_path = os.path.join(args.real_model_path, f"{obj}.obj")
-        if any(not os.path.exists(p) for p in [k_path, gt_pose_path, gt_mesh_path]):
+        if any(not os.path.exists(p) for p in [k_path, gt_pose_path]):
             print(f"Skip {obj}: missing required files")
             continue
         if color_bgr is None or depth_raw is None or mask_img is None:
@@ -718,78 +732,113 @@ def main():
             continue
 
         color = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
+        reconstruction = recon_results[obj]
+        meta_path = reconstruction.get("meta")
         recon_meta = {}
-        meta_path = recon_results[obj].get("meta")
         if meta_path and os.path.exists(meta_path):
-            with open(meta_path, "r", encoding="utf-8") as f:
-                recon_meta = json.load(f)
+            with open(meta_path, "r", encoding="utf-8") as handle:
+                recon_meta = json.load(handle)
+
+        depth_unit_candidates = recon_meta.get("depth_unit_candidates", {})
+        if isinstance(depth_unit_candidates, dict):
+            mismatch_messages = [
+                str(value.get("error", ""))
+                for value in depth_unit_candidates.values()
+                if isinstance(value, dict)
+                and "Expected all tensors to be on the same device"
+                in str(value.get("error", ""))
+            ]
+            if mismatch_messages:
+                device_mismatch_fail_count += 1
+
+        mesh_paths = {}
+        instant_path = reconstruction.get("mesh_instant")
+        ray_path = reconstruction.get("mesh_rayst3r")
+        fused_path = reconstruction.get("mesh_fused")
+        instantmesh_only = is_instantmesh_only(recon_meta)
+        if instant_path and os.path.exists(instant_path):
+            mesh_paths["instantmesh"] = instant_path
+        if not instantmesh_only and ray_path and os.path.exists(ray_path):
+            mesh_paths["rayst3r"] = ray_path
+
+        fusion_admission = {
+            "admitted": False,
+            "uses_query": False,
+            "uses_gt_pose_or_cad": False,
+            "mask_source": "dataset_gt",
+            "min_update_fraction": float(args.fusion_min_update_fraction),
+            "min_visible_depth_gain": float(args.fusion_min_visible_depth_gain),
+        }
+        if not instantmesh_only and fused_path and os.path.exists(fused_path):
+            fusion_diagnostics = recon_meta.get("fusion_diagnostics", {})
+            update_fraction = float(
+                fusion_diagnostics.get("prior_vertex_update_ratio", 0.0)
+            )
+            depth_gain = float(
+                fusion_diagnostics.get("visible_depth_gain", float("nan"))
+            )
+            align_direction = str(recon_meta.get("align_direction", ""))
+            align_pass = bool(
+                not align_direction.startswith("none")
+                and recon_meta.get("align_fitness", -1.0)
+                >= args.anchor_tau_inlier
+                and recon_meta.get("align_rmse", float("inf"))
+                <= args.anchor_tau_rmse
+            )
+            quality_pass = bool(
+                align_pass
+                and update_fraction >= args.fusion_min_update_fraction
+                and np.isfinite(depth_gain)
+                and depth_gain >= args.fusion_min_visible_depth_gain
+            )
+            fused_ok = is_genuine_fusion(
+                recon_meta, instantmesh_only=instantmesh_only
+            )
+            fusion_admission.update(
+                {
+                    "admitted": fused_ok,
+                    "quality_pass": quality_pass,
+                    "align_pass": align_pass,
+                    "construction_output_valid": bool(
+                        fusion_diagnostics.get("output_valid", False)
+                    ),
+                    "fallback_used": bool(
+                        fusion_diagnostics.get("fallback_used", False)
+                    ),
+                    "prior_vertex_update_ratio": update_fraction,
+                    "visible_depth_gain": (
+                        depth_gain if np.isfinite(depth_gain) else None
+                    ),
+                }
+            )
+            if fused_ok:
+                mesh_paths["fused"] = fused_path
+
+        if not mesh_paths:
+            print(f"Skip {obj}: no reconstruction candidate")
+            continue
+        candidate_meshes = {
+            label: _as_trimesh(trimesh.load(path, process=False))
+            for label, path in mesh_paths.items()
+        }
         chosen_depth_unit = recon_meta.get("depth_unit", args.depth_unit)
         if chosen_depth_unit == "auto":
             chosen_depth_unit = _detect_depth_unit(depth_raw.astype(np.float32))
         depth = _convert_depth(depth_raw.astype(np.float32), chosen_depth_unit)
         mask = (mask_img > 0).astype(np.bool_)
         intrinsic = np.loadtxt(k_path)
-        gt_pose_nocs = np.loadtxt(gt_pose_path)
-        gt_pose = _extract_pure_rotation_pose(gt_pose_nocs)
-        _ = _nocs_scale_from_pose(gt_pose_nocs)
-
-        gt_mesh = _as_trimesh(trimesh.load(gt_mesh_path, process=False))
-        ray_path = recon_results[obj].get("mesh_rayst3r")
-        inst_path = recon_results[obj].get("mesh_instant")
-        fused_path = recon_results[obj].get("mesh_fused")
-        align_direction = recon_meta.get("align_direction", "")
-        depth_unit_candidates = recon_meta.get("depth_unit_candidates", {})
-        ray_failed_all = False
-        if isinstance(depth_unit_candidates, dict) and depth_unit_candidates:
-            aligns = [str(v.get("align", "")) for v in depth_unit_candidates.values() if isinstance(v, dict)]
-            ray_failed_all = bool(aligns) and all(a in {"rayst3r_failed", "rayst3r_empty"} for a in aligns)
-            mismatch_msgs = [
-                str(v.get("error", ""))
-                for v in depth_unit_candidates.values()
-                if isinstance(v, dict) and "Expected all tensors to be on the same device" in str(v.get("error", ""))
-            ]
-            if mismatch_msgs:
-                device_mismatch_fail_count += 1
-        candidate_mesh_paths = {}
-        instantmesh_only = (align_direction == "instantmesh_only_fallback") or ray_failed_all
-        if inst_path and os.path.exists(inst_path):
-            candidate_mesh_paths["instantmesh"] = inst_path
-        if not instantmesh_only:
-            if ray_path and os.path.exists(ray_path):
-                candidate_mesh_paths["rayst3r"] = ray_path
-            if fused_path and os.path.exists(fused_path):
-                fusion_diag = recon_meta.get("fusion_diagnostics", {})
-                fused_ok = (
-                    not str(align_direction).startswith("none")
-                    and recon_meta.get("align_fitness", -1.0) >= args.anchor_tau_inlier
-                    and recon_meta.get("align_rmse", float("inf")) <= args.anchor_tau_rmse
-                    and not bool(fusion_diag.get("fallback_used", False))
-                    and bool(fusion_diag.get("output_valid", False))
-                )
-                if fused_ok:
-                    candidate_mesh_paths["fused"] = fused_path
-        elif "instantmesh" in candidate_mesh_paths:
-            print(f"[INFO] {obj}: RaySt3R reconstruction invalid; keep instantmesh-only candidate for registry.")
-
         candidates = {}
-        for label, mesh_path in candidate_mesh_paths.items():
-            mesh_local = _as_trimesh(trimesh.load(mesh_path, process=False))
-            s_anchor_raw = _compute_anchor_calibration_score(
-                meta=recon_meta,
-                label=label,
-                c_base=args.anchor_c_base,
-                w_inlier=args.anchor_w_inlier,
-                w_rmse=args.anchor_w_rmse,
-                tau_inlier=args.anchor_tau_inlier,
-                tau_rmse=args.anchor_tau_rmse,
-            )
+        for label in ("rayst3r", "instantmesh", "fused"):
+            if label not in candidate_meshes:
+                continue
             registration_name = "foundationpose_register"
             trial_seed = _stable_trial_seed(
                 args.seed, obj, label, registration_name, 0
             )
+            estimator = None
             try:
-                pred_pose_returned, est = _run_single_trial(
-                    mesh_template=mesh_local,
+                pred_pose_returned, estimator = _run_single_trial(
+                    mesh_template=candidate_meshes[label],
                     save_path=obj_dir,
                     glctx=glctx,
                     args=args,
@@ -800,11 +849,8 @@ def main():
                     name=f"{obj}_{label}_{registration_name}",
                     random_seed=trial_seed,
                 )
-                # Losses are evaluated in the estimator's own pre-centering
-                # contract.  The exported pose below maps the exact exported
-                # centered mesh to the same camera frame.
                 l_depth, l_mask, l_geom = _compute_self_supervised_losses(
-                    est=est,
+                    est=estimator,
                     depth=depth,
                     mask=mask,
                     k=intrinsic,
@@ -812,67 +858,53 @@ def main():
                     glctx=glctx,
                 )
                 pred_pose_exported, tf_to_centered = _exported_mesh_pose(
-                    est, pred_pose_returned
+                    estimator, pred_pose_returned
                 )
-                est_mesh = est.mesh.copy()
-                precenter_offset = np.asarray(est.model_center, dtype=np.float64).reshape(3)
+                est_mesh = estimator.mesh.copy()
+                precenter_offset = np.asarray(
+                    estimator.model_center, dtype=np.float64
+                ).reshape(3)
             except Exception as exc:
-                print(f"{obj} [{label}/{registration_name}] anchor pose failed: {exc}")
-                _release_cuda_memory()
+                print(f"{obj} [{label}] anchor pose failed: {exc}")
                 continue
+            finally:
+                if estimator is not None:
+                    del estimator
+                _release_cuda_memory()
 
-            scaled_registration_loss = (
-                args.select_depth_weight
-                * min(max(float(l_depth) / args.anchor_depth_scale, 0.0), 1.0)
-                + args.select_mask_weight
-                * min(max(float(l_mask) / args.anchor_mask_scale, 0.0), 1.0)
-                + args.select_geom_weight
-                * min(max(float(l_geom) / args.anchor_geom_scale, 0.0), 1.0)
-            )
-            with open(
-                os.path.join(obj_dir, f"{obj}_anchor_trials_{label}.json"),
-                "w",
-                encoding="utf-8",
-            ) as f:
-                json.dump(
-                    [
-                        {
-                            "strategy": registration_name,
-                            "seed_index": 0,
-                            "seed": int(trial_seed),
-                            "l_depth": float(l_depth),
-                            "l_mask": float(l_mask),
-                            "l_geom": float(l_geom),
-                            "scaled_trial_loss": float(scaled_registration_loss),
-                            "selection_role": "single_registration_audit_only",
-                        }
-                    ],
-                    f,
-                    indent=2,
-                )
-            chamfer_gt = float(
-                calculate_chamfer_distance_gt_mesh(
-                    gt_pose, gt_mesh, pred_pose_exported, est_mesh
-                )
+            s_anchor_raw = _compute_anchor_calibration_score(
+                meta=recon_meta,
+                label=label,
+                c_base=args.anchor_c_base,
+                w_inlier=args.anchor_w_inlier,
+                w_rmse=args.anchor_w_rmse,
+                tau_inlier=args.anchor_tau_inlier,
+                tau_rmse=args.anchor_tau_rmse,
             )
             mesh_out = os.path.join(obj_dir, f"final_mesh_{obj}_{label}.obj")
             pose_out = os.path.join(obj_dir, f"{obj}_initial_pose_{label}.txt")
             est_mesh.export(mesh_out)
             np.savetxt(pose_out, pred_pose_exported)
-            np.savetxt(os.path.join(obj_dir, f"{obj}_ldepth_{label}.txt"), [l_depth])
-            np.savetxt(os.path.join(obj_dir, f"{obj}_lmask_{label}.txt"), [l_mask])
-            np.savetxt(os.path.join(obj_dir, f"{obj}_cd_{label}.txt"), [l_geom])
+            np.savetxt(
+                os.path.join(obj_dir, f"{obj}_ldepth_{label}.txt"), [l_depth]
+            )
+            np.savetxt(
+                os.path.join(obj_dir, f"{obj}_lmask_{label}.txt"), [l_mask]
+            )
+            np.savetxt(
+                os.path.join(obj_dir, f"{obj}_cd_{label}.txt"), [l_geom]
+            )
             candidates[label] = {
+                "base_geometry": label,
                 "pred_pose": pred_pose_exported,
                 "est_mesh": est_mesh,
                 "mesh_path": mesh_out,
-                "raw_mesh_path": os.path.abspath(mesh_path),
+                "raw_mesh_path": os.path.abspath(mesh_paths[label]),
                 "pose_path": pose_out,
                 "l_depth": float(l_depth),
                 "l_mask": float(l_mask),
                 "l_geom": float(l_geom),
                 "s_anchor": float(s_anchor_raw),
-                "chamfer_gt": chamfer_gt,
                 "model_center": [0.0, 0.0, 0.0],
                 "any6d_precenter_offset": precenter_offset.tolist(),
                 "tf_to_centered": tf_to_centered.tolist(),
@@ -881,22 +913,14 @@ def main():
                 "anchor_pose_strategy": registration_name,
                 "anchor_pose_trial_count": 1,
                 "anchor_pose_seed": int(trial_seed),
+                "reconstruction_meta": recon_meta,
+                "reconstruction_meta_path": meta_path,
+                "fusion_admission": fusion_admission,
             }
-            del est
-            _release_cuda_memory()
 
         if not candidates:
-            recovered = (
-                _recover_existing_candidates_from_disk(obj_dir, obj, args.anchor_c_base)
-                if args.allow_stale_recovery
-                else {}
-            )
-            if recovered:
-                print(f"[WARN] {obj}: live candidate eval failed, recovered {len(recovered)} candidate(s) from disk artifacts.")
-                candidates = recovered
-            else:
-                print(f"Skip {obj}: no valid candidate")
-                continue
+            print(f"Skip {obj}: no valid candidate")
+            continue
 
         anchor_rows = []
         for label, info in candidates.items():
@@ -959,39 +983,19 @@ def main():
         chosen_label = scored_rows[0]["label"]
 
         chosen = candidates[chosen_label]
+        recon_meta = chosen["reconstruction_meta"]
+        meta_path = chosen["reconstruction_meta_path"]
+        fusion_admission = chosen["fusion_admission"]
         np.savetxt(os.path.join(obj_dir, f"{obj}_initial_pose.txt"), chosen["pred_pose"])
         chosen["est_mesh"].export(os.path.join(obj_dir, f"final_mesh_{obj}.obj"))
         np.savetxt(os.path.join(obj_dir, f"{obj}_cd.txt"), [chosen["l_geom"]])
         np.savetxt(os.path.join(obj_dir, f"{obj}_model_center.txt"), np.asarray(chosen["model_center"], dtype=np.float64))
-
-        try:
-            est_vis = Any6D(symmetry_tfs=None, mesh=chosen["est_mesh"].copy(), debug_dir=obj_dir, debug=0, glctx=glctx)
-            visualize_frame_results(
-                color=color,
-                gt_mesh=gt_mesh,
-                est=est_vis,
-                K=intrinsic,
-                gt_pose=gt_pose,
-                pred_pose=chosen["pred_pose"],
-                metric=None,
-                obj_f=obj,
-                frame_idx=0,
-                save_path=obj_dir,
-                glctx=glctx,
-                name="demo_data",
-                mesh_index=0,
-                init=False,
-                save_on_folder=True,
-            )
-        except Exception:
-            pass
 
         results.append(
             {
                 "Object": obj,
                 "Object_Number": _parse_object_number_from_source_frame(obj_dir),
                 "Chamfer_Distance": float(chosen["l_geom"]),
-                "Chamfer_GT": float(chosen["chamfer_gt"]),
                 "Chosen_Mesh": chosen_label,
             }
         )
@@ -1009,19 +1013,25 @@ def main():
         )
 
         obj_candidates_info = {}
-        scale_recovery_meta = recon_meta.get("scale_recovery", {})
         for label, info in candidates.items():
-            if label == "fused":
+            base_geometry = info.get("base_geometry", label)
+            info_scale_recovery = info.get("reconstruction_meta", {}).get(
+                "scale_recovery", {}
+            )
+            if base_geometry == "fused":
                 candidate_scale_meta = {
-                    "rayst3r": scale_recovery_meta.get("rayst3r", {}),
-                    "instantmesh": scale_recovery_meta.get("instantmesh", {}),
+                    "rayst3r": info_scale_recovery.get("rayst3r", {}),
+                    "instantmesh": info_scale_recovery.get("instantmesh", {}),
                 }
             else:
-                candidate_scale_meta = scale_recovery_meta.get(label, {})
+                candidate_scale_meta = info_scale_recovery.get(base_geometry, {})
             obj_candidates_info[label] = {
+                "base_geometry": base_geometry,
                 "mesh_path": os.path.abspath(info["mesh_path"]),
                 "raw_mesh_path": info["raw_mesh_path"],
                 "pose_path": os.path.abspath(info["pose_path"]),
+                "source_provenance": f"reconstruction:{base_geometry}",
+                "is_fallback_alias": False,
                 "s_anchor": float(info["s_anchor"]),
                 "anchor_score_version": "bounded_observation_calibrated_v1",
                 "s_anchor_raw": float(info["s_anchor_raw"]),
@@ -1058,22 +1068,30 @@ def main():
             "geometry_units": "meters_after_rgbd_self_supervised_scale_recovery",
             "candidate_mesh_frame": "any6d_internal_centered",
             "scale_metadata": {
+                "mode": "rgbd_extent_depth_single_scale",
                 "depth_unit": recon_meta.get("depth_unit", chosen_depth_unit),
                 "rayst3r_metric_scale": recon_meta.get("rayst3r_metric_scale", 1.0),
                 "instantmesh_metric_scale": recon_meta.get(
                     "instantmesh_metric_scale", 1.0
                 ),
-                "rgbd_self_supervised": scale_recovery_meta,
+                "rgbd_self_supervised": recon_meta.get("scale_recovery", {}),
                 "construction_transform": recon_meta.get("transform"),
                 "mesh_statistics": recon_meta.get("mesh_statistics", {}),
             },
             "fusion_diagnostics": recon_meta.get("fusion_diagnostics", {}),
             "fusion_metadata": recon_meta.get("fusion_diagnostics", {}),
+            "fusion_admission": fusion_admission,
             "bidirectional": recon_meta.get("bidirectional", {}),
             "bidirectional_metadata": recon_meta.get("bidirectional", {}),
             "alignment_metadata": {
                 "selection_rule": "best_of_two",
                 "strict_both_gate": bool(args.align_strict_both),
+                "reciprocal_pairing": bool(args.icp_reciprocal_pairing),
+                "cycle_role": (
+                    "bounded_reliability_ablation"
+                    if args.fusion_cycle_in_reliability
+                    else "diagnostic_only"
+                ),
                 "direction": recon_meta.get("align_direction"),
                 "fitness": recon_meta.get("align_fitness"),
                 "rmse": recon_meta.get("align_rmse"),
@@ -1102,19 +1120,25 @@ def main():
     run_meta = {
         "anchor_folder": os.path.realpath(args.anchor_folder),
         "output_root": result_root,
-        "real_model_path": args.real_model_path,
         "mask_source": "dataset_gt",
         "geometry_units": "meters_after_rgbd_self_supervised_scale_recovery",
-        "reconstruction_method": (
-            "rgbd_self_supervised_visible_prior_patch_phi_v4_ray_frame"
-            if args.fusion_mode == "visible_patch"
-            else "rgbd_self_supervised_visible_prior_poisson_phi_v3_ray_frame"
-        ),
+        "appearance_contract": {
+            "anchor": "native_reconstruction_colors",
+            "query": "anchor_prior_hybrid",
+            "geometry_changed": False,
+        },
+        "reconstruction_method": "rgbd_extent_depth_single_scale",
         "frame_contract": {
             "mesh_frame": "any6d_internal_centered",
             "pose_frame": "any6d_internal_centered_to_anchor_camera",
             "registration": "FoundationPose.register shared by anchor and query",
             "outer_axis_alignment_selection": False,
+        },
+        "gt_usage": {
+            "anchor_candidate_construction": False,
+            "anchor_candidate_scoring": False,
+            "gt_cad_pose_audit_enabled": False,
+            "gt_anchor_pose_copied_for_query_evaluation_only": True,
         },
         "bidirectional_alignment": {
             "selection_rule": "best_of_two",
@@ -1125,6 +1149,12 @@ def main():
                 else "diagnostic_only"
             ),
             "icp_hypotheses_per_direction": int(args.icp_multi_hypo),
+            "reciprocal_pairing": bool(args.icp_reciprocal_pairing),
+            "cycle_definition": (
+                "selected_transform_inverse_refinement_round_trip"
+                if args.icp_reciprocal_pairing
+                else "independent_directional_optima"
+            ),
         },
         "selection": {
             "select_depth_weight": args.select_depth_weight,
@@ -1144,6 +1174,7 @@ def main():
             "score_alpha": args.score_alpha,
             "score_beta": args.score_beta,
         },
+        "provenance": runtime_provenance(os.path.dirname(__file__)),
         "args": vars(args),
     }
     with open(os.path.join(result_root, "anchor_run_meta.json"), "w", encoding="utf-8") as f:

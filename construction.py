@@ -24,6 +24,8 @@ from sam2_rayst3r import (
     pointcloud_to_mesh,
 )
 from pose_utils import preprocess_depth, guess_translation
+from cuda_retry import run_cudnn_stream_retry
+from revision_protocol import icp_direction_passes
 
 
 @dataclass
@@ -98,6 +100,7 @@ class ReconstructionConfig:
     rgbd_scale_recovery: bool = False
     rgbd_scale_visible_sim3: bool = False
     rgbd_scale_min_margin: float = 0.002
+    rgbd_rotation_min_margin: float = 0.002
     rgbd_scale_min_reciprocal_fraction: float = 0.0
     rgbd_scale_silhouette_weight: float = 0.0
     rgbd_scale_min_silhouette_quality: float = 0.0
@@ -493,6 +496,19 @@ def _rayst3r_reconstruct(
     )
     mesh = _clean_rayst3r_mesh(mesh, points, cfg)
     return points, mesh
+
+
+def _run_rayst3r_with_stream_retry(build, reset_runner, device: str):
+    """Retry the known cuDNN stream failure once without hiding other errors.
+
+    Long multi-object anchor jobs have observed cuDNN retaining an invalid
+    stream association after several RaySt3R forwards.  Existing frozen cache
+    entries bypass this path.  A missing entry gets one normal attempt and, for
+    this exact cuDNN failure only, one fresh-runner attempt on the default CUDA
+    stream with cuDNN disabled.
+    """
+
+    return run_cudnn_stream_retry(build, reset_runner, device, torch)
 
 
 def _clean_rayst3r_mesh(
@@ -933,6 +949,8 @@ def _visible_surface_sim3_scale_recovery(
         )
         total_scale = _similarity_scale(transform)
         multiplier = total_scale / max(initial_scale, 1e-12)
+        recovered_scale = _similarity_scale(transform)
+        recovered_rotation = transform[:3, :3] / max(recovered_scale, 1e-12)
         return {
             "transform": transform,
             "score": score,
@@ -945,6 +963,7 @@ def _visible_surface_sim3_scale_recovery(
             "silhouette_quality": silhouette_quality,
             "projected_mask_support": projected_mask_support,
             "silhouette_size_error": silhouette_size_error,
+            "rotation": recovered_rotation,
         }
 
     def _search(lower: float, upper: float, iterations: int):
@@ -967,23 +986,54 @@ def _visible_surface_sim3_scale_recovery(
         diagnostics["reason"] = "no_finite_visible_sim3_hypothesis"
         return mesh.copy(), identity, diagnostics
 
-    def _margin(best_record, candidates) -> float:
-        distinct = [
+    def _hypothesis_margins(best_record, candidates) -> Tuple[float, float]:
+        scale_distinct = [
             record["score"]
             for record in candidates[1:]
             if abs(np.log(max(record["scale"], 1e-12) / max(best_record["scale"], 1e-12)))
             >= 0.02
         ]
-        runner_up = max(distinct) if distinct else 0.0
-        return max(float(best_record["score"]) - float(runner_up), 0.0)
+        best_rotation = np.asarray(best_record["rotation"], dtype=np.float64)
+        rotation_distinct = []
+        for record in candidates[1:]:
+            rotation = np.asarray(record["rotation"], dtype=np.float64)
+            relative = best_rotation @ rotation.T
+            angle = float(
+                np.degrees(
+                    np.arccos(np.clip((np.trace(relative) - 1.0) * 0.5, -1.0, 1.0))
+                )
+            )
+            # This explicitly keeps same-scale/different-rotation competitors;
+            # the old scale-only margin silently discarded them.
+            same_scale = bool(
+                abs(
+                    np.log(
+                        max(record["scale"], 1e-12)
+                        / max(best_record["scale"], 1e-12)
+                    )
+                )
+                < 0.02
+            )
+            if same_scale and angle >= 15.0:
+                rotation_distinct.append(record["score"])
+        scale_runner = max(scale_distinct) if scale_distinct else 0.0
+        rotation_runner = max(rotation_distinct) if rotation_distinct else 0.0
+        return (
+            max(float(best_record["score"]) - float(scale_runner), 0.0),
+            max(float(best_record["score"]) - float(rotation_runner), 0.0),
+        )
 
     best = records[0]
-    margin = _margin(best, records)
+    scale_margin, rotation_margin = _hypothesis_margins(best, records)
     boundary = bool(
         np.isclose(best["multiplier"], lower, atol=0.01)
         or np.isclose(best["multiplier"], upper, atol=0.01)
     )
-    reestimated = bool(boundary or margin < float(cfg.rgbd_scale_min_margin))
+    reestimated = bool(
+        boundary
+        or scale_margin < float(cfg.rgbd_scale_min_margin)
+        or rotation_margin < float(cfg.rgbd_rotation_min_margin)
+    )
     if reestimated:
         expanded_lower = max(0.35, 0.80 * lower)
         expanded_upper = min(2.50, 1.20 * upper)
@@ -996,7 +1046,7 @@ def _visible_surface_sim3_scale_recovery(
             records = expanded
             best = expanded[0]
             lower, upper = expanded_lower, expanded_upper
-            margin = _margin(best, records)
+            scale_margin, rotation_margin = _hypothesis_margins(best, records)
             boundary = bool(
                 np.isclose(best["multiplier"], lower, atol=0.01)
                 or np.isclose(best["multiplier"], upper, atol=0.01)
@@ -1012,7 +1062,8 @@ def _visible_surface_sim3_scale_recovery(
     )
     rejected = bool(
         boundary
-        or margin < float(cfg.rgbd_scale_min_margin)
+        or scale_margin < float(cfg.rgbd_scale_min_margin)
+        or rotation_margin < float(cfg.rgbd_rotation_min_margin)
         or weak_reciprocal
         or weak_silhouette
     )
@@ -1022,7 +1073,9 @@ def _visible_surface_sim3_scale_recovery(
             "chosen_scale": float(best["scale"]),
             "chosen_multiplier": float(best["multiplier"]),
             "objective": float(best["score"]),
-            "objective_margin": float(margin),
+            "objective_margin": float(min(scale_margin, rotation_margin)),
+            "scale_objective_margin": float(scale_margin),
+            "rotation_objective_margin": float(rotation_margin),
             "symmetric_visible_distance": float(best["symmetric_distance"]),
             "observed_support": float(best["support"]),
             "reciprocal_pair_fraction": float(best["reciprocal_fraction"]),
@@ -1050,8 +1103,10 @@ def _visible_surface_sim3_scale_recovery(
     if rejected:
         if boundary:
             diagnostics["reason"] = "boundary_solution"
-        elif margin < float(cfg.rgbd_scale_min_margin):
+        elif scale_margin < float(cfg.rgbd_scale_min_margin):
             diagnostics["reason"] = "low_scale_objective_margin"
+        elif rotation_margin < float(cfg.rgbd_rotation_min_margin):
+            diagnostics["reason"] = "low_rotation_objective_margin"
         elif weak_reciprocal:
             diagnostics["reason"] = "low_reciprocal_pair_fraction"
         else:
@@ -1063,7 +1118,21 @@ def _visible_surface_sim3_scale_recovery(
     reliability = float(
         np.clip(
             best["score"]
-            * (0.80 + 0.20 * min(margin / max(float(cfg.rgbd_scale_min_margin) * 5.0, 1e-6), 1.0)),
+            * (
+                0.70
+                + 0.15
+                * min(
+                    scale_margin
+                    / max(float(cfg.rgbd_scale_min_margin) * 5.0, 1e-6),
+                    1.0,
+                )
+                + 0.15
+                * min(
+                    rotation_margin
+                    / max(float(cfg.rgbd_rotation_min_margin) * 5.0, 1e-6),
+                    1.0,
+                )
+            ),
             0.0,
             1.0,
         )
@@ -1137,6 +1206,12 @@ def _rgbd_self_supervised_scale_recovery(
                     "fallback_reason": primary_attempt.get("reason", "ambiguous_sim3"),
                     "chosen_scale": fallback_scale,
                     "reliability": 0.50,
+                    "scale_objective_margin": primary_attempt.get(
+                        "scale_objective_margin"
+                    ),
+                    "rotation_objective_margin": primary_attempt.get(
+                        "rotation_objective_margin"
+                    ),
                     "primary_attempt": primary_attempt,
                 }
                 fallback.metadata["rgbd_scale_recovery"] = diagnostics
@@ -1155,6 +1230,12 @@ def _rgbd_self_supervised_scale_recovery(
             "fallback_reason": primary_attempt.get("reason", "ambiguous_sim3"),
             "chosen_scale": 1.0,
             "reliability": 0.50,
+            "scale_objective_margin": primary_attempt.get(
+                "scale_objective_margin"
+            ),
+            "rotation_objective_margin": primary_attempt.get(
+                "rotation_objective_margin"
+            ),
             "primary_attempt": primary_attempt,
         }
         native = mesh.copy()
@@ -1255,6 +1336,7 @@ def _rgbd_self_supervised_scale_recovery(
 
     best = None
     all_scores: List[float] = []
+    search_records: List[Dict[str, float]] = []
     for multiplier in multipliers:
         scale = float(initial_scale * multiplier)
         model_diameter = max(2.0 * source_radius * scale, observed_diameter)
@@ -1315,6 +1397,13 @@ def _rgbd_self_supervised_scale_recovery(
                 "support": support,
                 "silhouette_quality": silhouette_quality,
             }
+            search_records.append(
+                {
+                    key: float(value)
+                    for key, value in record.items()
+                    if key != "target_center"
+                }
+            )
             if best is None or score > best["score"]:
                 best = record
 
@@ -2648,17 +2737,17 @@ def _bidirectional_diagnostics(
 
     inst_fitness, inst_rmse = _values(reg_inst_to_ray)
     ray_fitness, ray_rmse = _values(reg_ray_to_inst)
-    inst_pass = (
-        np.isfinite(inst_fitness)
-        and np.isfinite(inst_rmse)
-        and inst_fitness >= cfg.icp_fitness_threshold
-        and inst_rmse <= cfg.align_rmse_penalty_threshold
+    inst_pass = icp_direction_passes(
+        inst_fitness,
+        inst_rmse,
+        tau_f=cfg.icp_fitness_threshold,
+        tau_r=cfg.align_rmse_penalty_threshold,
     )
-    ray_pass = (
-        np.isfinite(ray_fitness)
-        and np.isfinite(ray_rmse)
-        and ray_fitness >= cfg.icp_fitness_threshold
-        and ray_rmse <= cfg.align_rmse_penalty_threshold
+    ray_pass = icp_direction_passes(
+        ray_fitness,
+        ray_rmse,
+        tau_f=cfg.icp_fitness_threshold,
+        tau_r=cfg.align_rmse_penalty_threshold,
     )
     rotation_deg = float("nan")
     translation_norm = float("nan")
@@ -2717,6 +2806,13 @@ def _bidirectional_diagnostics(
         "ray_to_inst_rmse": ray_rmse,
         "ray_to_inst_pass": bool(ray_pass),
         "strict_both_pass": bool(inst_pass and ray_pass),
+        "strict_both_gate_source": "independent_directional_optima",
+        "strict_both_gate_definition": (
+            "fitness_inst_to_ray>=tau_f and rmse_inst_to_ray<=tau_r and "
+            "fitness_ray_to_inst>=tau_f and rmse_ray_to_inst<=tau_r"
+        ),
+        "strict_tau_f": float(cfg.icp_fitness_threshold),
+        "strict_tau_r": float(cfg.align_rmse_penalty_threshold),
         "cycle_rotation_deg": rotation_deg,
         "cycle_translation_normalized": translation_norm,
         "cycle_translation_raw_column_normalized": raw_translation_norm,
@@ -2802,8 +2898,17 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
     checkpoint_path = cfg.rayst3r_checkpoint
     if checkpoint_path:
         checkpoint_path = os.path.realpath(checkpoint_path)
-    runner = Rayst3RRunner(checkpoint_path=checkpoint_path, device=cfg.rayst3r_device)
+    runner_holder = [None]
 
+    def _get_rayst3r_runner():
+        if runner_holder[0] is None:
+            runner_holder[0] = Rayst3RRunner(
+                checkpoint_path=checkpoint_path, device=cfg.rayst3r_device
+            )
+        return runner_holder[0]
+
+    def _reset_rayst3r_runner():
+        runner_holder[0] = None
     results: Dict[str, Dict[str, str]] = {}
     obj_list = sorted(
         d for d in os.listdir(anchor_root) if os.path.isdir(os.path.join(anchor_root, d))
@@ -2895,8 +3000,18 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
 
             work_dir = os.path.join(out_dir, "rayst3r_input")
             try:
-                points, mesh_ray = _rayst3r_reconstruct(
-                    runner, color, depth_m, mask, intrinsic, obj_cfg, work_dir
+                points, mesh_ray = _run_rayst3r_with_stream_retry(
+                    lambda: _rayst3r_reconstruct(
+                        _get_rayst3r_runner(),
+                        color,
+                        depth_m,
+                        mask,
+                        intrinsic,
+                        obj_cfg,
+                        work_dir,
+                    ),
+                    _reset_rayst3r_runner,
+                    obj_cfg.rayst3r_device,
                 )
             except Exception as exc:
                 candidate_scores[depth_unit] = {
@@ -3402,9 +3517,12 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
             best = {
                 "depth_unit": str(depth_candidates[0]) if depth_candidates else str(obj_cfg.depth_unit),
                 "points": np.asarray(fallback_points, dtype=np.float64),
-                "mesh_ray": mesh_inst_fallback.copy(),
+                # Do not manufacture independent RaySt3R/fused candidates
+                # from the InstantMesh fallback.  Downstream registries only
+                # expose geometries that were actually reconstructed.
+                "mesh_ray": None,
                 "mesh_inst": mesh_inst_fallback.copy(),
-                "mesh_fused": mesh_inst_fallback.copy(),
+                "mesh_fused": None,
                 "align_direction": "instantmesh_only_fallback",
                 "fitness": -1.0,
                 "rmse": float("inf"),
@@ -3431,6 +3549,7 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
                         "instantmesh_metric_scale", 1.0
                     )
                 ),
+                "bidirectional": {},
             }
 
         points = best["points"]
@@ -3446,9 +3565,27 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
         mesh_fused_path = os.path.join(out_dir, f"mesh_fused_{obj_name}.obj")
 
         trimesh.PointCloud(points).export(pointcloud_path)
-        mesh_ray.export(mesh_ray_path)
+        if mesh_ray is not None:
+            mesh_ray.export(mesh_ray_path)
         mesh_inst_aligned.export(mesh_inst_path)
-        mesh_fused.export(mesh_fused_path)
+        if mesh_fused is not None:
+            mesh_fused.export(mesh_fused_path)
+
+        output_paths = {
+            "pointcloud": pointcloud_path,
+            "mesh_rayst3r": mesh_ray_path if mesh_ray is not None else None,
+            "mesh_instant": mesh_inst_path,
+            "mesh_fused": mesh_fused_path if mesh_fused is not None else None,
+        }
+
+        def _mesh_stats(mesh):
+            if mesh is None:
+                return {"available": False, "vertices": 0, "faces": 0}
+            return {
+                "available": True,
+                "vertices": int(len(mesh.vertices)),
+                "faces": int(len(mesh.faces)),
+            }
 
         meta = {
             "object": obj_name,
@@ -3473,30 +3610,13 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
             "instantmesh_metric_scale": best.get("instantmesh_metric_scale", 1.0),
             "scale_recovery": best.get("scale_recovery", {}),
             "fusion_diagnostics": best.get("fusion_diagnostics", {}),
-            "bidirectional": best.get(
-                "bidirectional",
-                _bidirectional_diagnostics(None, None, mesh_ray, mesh_inst_aligned, obj_cfg),
-            ),
+            "bidirectional": best.get("bidirectional", {}),
             "object_overrides": obj_overrides,
-            "outputs": {
-                "pointcloud": pointcloud_path,
-                "mesh_rayst3r": mesh_ray_path,
-                "mesh_instant": mesh_inst_path,
-                "mesh_fused": mesh_fused_path,
-            },
+            "outputs": output_paths,
             "mesh_statistics": {
-                "rayst3r": {
-                    "vertices": int(len(mesh_ray.vertices)),
-                    "faces": int(len(mesh_ray.faces)),
-                },
-                "instantmesh": {
-                    "vertices": int(len(mesh_inst_aligned.vertices)),
-                    "faces": int(len(mesh_inst_aligned.faces)),
-                },
-                "fused": {
-                    "vertices": int(len(mesh_fused.vertices)),
-                    "faces": int(len(mesh_fused.faces)),
-                },
+                "rayst3r": _mesh_stats(mesh_ray),
+                "instantmesh": _mesh_stats(mesh_inst_aligned),
+                "fused": _mesh_stats(mesh_fused),
             },
             "transform": transform.tolist() if transform is not None else None,
             "config": asdict(obj_cfg),
@@ -3512,13 +3632,16 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
             f"fitness={best['fitness']:.3f} rmse={best['rmse']:.6f}"
         )
 
-        results[obj_name] = {
+        object_results = {
             "pointcloud": pointcloud_path,
-            "mesh_rayst3r": mesh_ray_path,
             "mesh_instant": mesh_inst_path,
-            "mesh_fused": mesh_fused_path,
             "meta": meta_path,
         }
+        if mesh_ray is not None:
+            object_results["mesh_rayst3r"] = mesh_ray_path
+        if mesh_fused is not None:
+            object_results["mesh_fused"] = mesh_fused_path
+        results[obj_name] = object_results
 
     return results
 
