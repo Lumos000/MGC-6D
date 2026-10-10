@@ -31,6 +31,10 @@ logs/
 wandb/
 data/
 datasets/
+# FoundationPose imports these dataset structures during inference.  Keep the
+# vendored runtime modules even though top-level experiment datasets are local.
+!foundationpose/learning/datasets/
+!foundationpose/learning/datasets/*.py
 demo_data/*
 !demo_data/.gitkeep
 
