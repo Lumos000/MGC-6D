@@ -36,6 +36,12 @@ def test_common_query_arguments_and_validation() -> None:
         "fused",
     }
     assert args.candidate_color_mode == "anchor_prior_hybrid"
+    assert args.save_candidate_metrics is False
+    assert parser.parse_args(["--save_candidate_metrics"]).save_candidate_metrics is True
+    assert (
+        parser.parse_args(["--no-save_candidate_metrics"]).save_candidate_metrics
+        is False
+    )
 
 
 def test_invalid_candidate_and_weights_are_rejected() -> None:

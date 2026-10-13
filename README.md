@@ -143,6 +143,58 @@ export QUERY_NAME=real275_mgc6d_seed0
 bash scripts/run_real275_full.sh
 ```
 
+## Official Oryon 2K pair protocol
+
+For comparisons with Oryon, Any6D, CoordAR, and One2Any, use the official
+Oryon pair lists rather than the fixed-anchor commands above. The launchers
+download only the pair-list member from Oryon's data archive, verify its
+SHA-256, prepare one anchor observation per unique reference, construct that
+reference's own candidate pool, evaluate all 2,000 ordered pairs, and keep
+failed pairs in the denominator with zero metrics.
+
+- REAL275: 2,000 cross-scene pairs and 1,447 unique references;
+- TOYL: 2,000 different-frame pairs and 890 unique references. TOYL's released
+  rows use the same object scene on both sides despite the archive directory
+  being named `cross_scene_test`.
+
+Run REAL275 2K:
+
+```bash
+export PYTHON_BIN=/path/to/mgc6d/python
+export RAYST3R_ROOT=/path/to/rayst3r
+export RAYST3R_CKPT=/path/to/rayst3r.pth
+export REAL_ROOT=/path/to/REAL275
+export MODELS_INFO="$PWD/real275_models_info.json"
+export ANCHOR_GPUS=0,1
+export QUERY_GPU=1
+export SEED=0
+export RUN_TAG=real275_oryon_2k_seed0
+bash scripts/run_real275_oryon_2k.sh
+```
+
+Run TOYL 2K:
+
+```bash
+export PYTHON_BIN=/path/to/mgc6d/python
+export RAYST3R_ROOT=/path/to/rayst3r
+export RAYST3R_CKPT=/path/to/rayst3r.pth
+export TOYL_ROOT=/path/to/TOYL
+export TOYL_MODELS="$TOYL_ROOT/models"
+export ANCHOR_GPUS=0,1
+export QUERY_GPU=1
+export SEED=0
+export RUN_TAG=toyl_oryon_2k_seed0
+bash scripts/run_toyl_oryon_2k.sh
+```
+
+Set `RUN_FETCH=0`, `RUN_PREPARE=0`, or `RUN_ANCHOR=0` to reuse the
+corresponding completed stage. REAL275 anchor construction supports atomic
+per-reference resume after a native crash. TOYL reconstructs the 890 unique
+references in 21 resumable object batches. `SAVE_CANDIDATE_METRICS=1` adds
+evaluation-only metrics for every candidate; it does not affect Eq. (22)
+selection. See [docs/oryon_2k.md](docs/oryon_2k.md) for exact output contracts,
+query-only examples, and validation commands.
+
 TOYL uses query stride 1; HO3D and REAL275 use stride 10. The shared optional
 environment variables `CANDIDATE_LABELS`, `CANDIDATE_COLOR_MODE`, `W_DEPTH`,
 `W_MASK`, `W_GEOM`, `SCORE_ALPHA`, and `SCORE_BETA` map directly to recorded
@@ -167,6 +219,8 @@ Run the repository checks before an experiment:
 ```bash
 python scripts/smoke_imports.py
 pytest -q tests/test_paper_protocol.py tests/test_revision_protocol.py
+pytest -q tests/test_anchor_resume.py tests/test_oryon_real275_protocol.py \
+  tests/test_oryon_toyl_protocol.py
 ```
 
 Generated results, datasets, checkpoints, compiled extensions, and local

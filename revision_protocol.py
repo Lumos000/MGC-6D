@@ -95,6 +95,16 @@ def add_query_protocol_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--w_geom", type=float, default=0.25)
     parser.add_argument("--score_alpha", type=float, default=0.40)
     parser.add_argument("--score_beta", type=float, default=0.60)
+    parser.add_argument(
+        "--save_candidate_metrics",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Evaluate and save metrics for every registered candidate in "
+            "addition to the online Eq. (22) winner. Candidate metrics are "
+            "evaluation-only and never affect scoring or selection."
+        ),
+    )
 
 
 def parse_candidate_labels(raw: str) -> set[str]:

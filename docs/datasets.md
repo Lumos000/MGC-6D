@@ -92,3 +92,16 @@ instantmesh/ckpts/
 SAM2 is installed because it is an upstream component of the repository, but
 the released three-dataset commands use the mask sources listed above and do
 not run mask refinement.
+
+## Oryon 2K pair lists
+
+The 2K launchers obtain the official pair-list files from Oryon's v1.0.0 data
+release and reject any file whose SHA-256 differs from the pinned value. The
+large Oryon archive is not stored in this repository. Prepared reference RGB
+and depth files are symlinks into the local TOYL or REAL275 dataset; masks,
+intrinsics, source metadata, and evaluation-only GT poses are written below
+`results/oryon_{toyl,real275}/anchor_inputs/`.
+
+Pair lists, prepared inputs, reconstructed meshes, and query results remain
+excluded from Git. Their manifests record the pair-file digest, ordered pair
+IDs, reference/query instance IDs, mask provenance, and unique-reference count.

@@ -9,6 +9,19 @@ dataset:
 | TOYL | `scripts/run_toyl_full.sh` | 1 | dataset GT instance | dataset GT instance |
 | REAL275 | `scripts/run_real275_full.sh` | 10 | dataset GT instance | dataset GT instance |
 
+The fixed-anchor results above are not protocol-equivalent to methods reported
+on Oryon's variable-reference 2K pair lists. For that comparison use:
+
+| Dataset | Launcher | Ordered pairs | Unique references |
+|---|---|---:|---:|
+| TOYL | `scripts/run_toyl_oryon_2k.sh` | 2,000 | 890 |
+| REAL275 | `scripts/run_real275_oryon_2k.sh` | 2,000 | 1,447 |
+
+Each unique reference builds its own RaySt3R, InstantMesh, and fused candidate
+pool. The removed shared-21 TOYL shortcut is not part of the released protocol.
+Both pair evaluators preserve all 2,000 requested pairs in the denominator and
+assign zero metrics to failures before or after selection.
+
 The complete environment-variable commands are in the repository README. All
 three launchers use the same candidate labels, candidate appearance mode, and
 Eq. (22) weights. Dataset-specific geometry preprocessing remains explicit in
@@ -58,6 +71,8 @@ The public validators replay the score and winner without pose estimation:
 python scripts/verify_ho3d_result.py RESULT_DIR
 python scripts/verify_paper_result.py --dataset toyl RESULT_DIR
 python scripts/verify_paper_result.py --dataset real275 RESULT_DIR
+python scripts/verify_oryon_toyl_result.py TOYL_2K_RESULT_DIR
+python scripts/verify_oryon_real275_result.py REAL275_2K_RESULT_DIR
 ```
 
 The HO3D full protocol samples 2,046 stride-10 frames. Its metadata lacks an

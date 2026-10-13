@@ -28,6 +28,11 @@ from candidate_selection import (
 )
 from candidate_admission import is_genuine_fusion, is_instantmesh_only
 from revision_protocol import runtime_provenance
+from anchor_resume import (
+    atomic_write_json,
+    load_registry_checkpoints,
+    registry_entry_complete,
+)
 
 
 def _release_cuda_memory():
@@ -337,6 +342,15 @@ def main():
     parser.add_argument("--depth_range_min_ratio", type=float, default=0.3)
     parser.add_argument("--depth_range_soft_penalty", action="store_true")
     parser.add_argument("--output_root", type=str, default=None)
+    parser.add_argument(
+        "--resume_existing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Reuse configuration-matched completed reconstructions and "
+            "per-reference anchor-pose checkpoints after an interrupted run."
+        ),
+    )
     parser.add_argument("--rayst3r_device", type=str, default="cuda:0")
     parser.add_argument("--rayst3r_checkpoint", type=str, default=None)
     parser.add_argument("--instantmesh_device", type=str, default="cuda:1")
@@ -687,6 +701,7 @@ def main():
         rgbd_scale_depth_tolerance=args.rgbd_scale_depth_tolerance,
         rgbd_scale_support_ratio=args.rgbd_scale_support_ratio,
         seed=args.seed,
+        resume_existing=args.resume_existing,
     )
     recon_results = run_construction(cfg)
     _release_cuda_memory()
@@ -696,11 +711,71 @@ def main():
     results = []
     pose_rows = []
     pose_rows_all = []
-    candidate_registry = {}
+    registry_path = os.path.join(result_root, "candidate_registry.json")
+    registry_checkpoint_dir = os.path.join(
+        result_root, "candidate_registry_entries"
+    )
+    candidate_registry = (
+        load_registry_checkpoints(registry_path, registry_checkpoint_dir)
+        if args.resume_existing
+        else {}
+    )
+    if candidate_registry:
+        print(
+            f"[RESUME] loaded {len(candidate_registry)} completed anchor-pose entries"
+        )
     glctx = dr.RasterizeCudaContext(device=args.rayst3r_device)
     device_mismatch_fail_count = 0
 
     for obj in tqdm(obj_list, desc="Object"):
+        existing_entry = candidate_registry.get(obj)
+        if args.resume_existing and registry_entry_complete(existing_entry):
+            object_number = _parse_object_number_from_source_frame(
+                os.path.join(args.anchor_folder, obj)
+            )
+            chosen_label = existing_entry["chosen"]
+            chosen = existing_entry["candidates"][chosen_label]
+            results.append(
+                {
+                    "Object": obj,
+                    "Object_Number": object_number,
+                    "Chamfer_Distance": float(chosen["l_geom"]),
+                    "Chosen_Mesh": chosen_label,
+                }
+            )
+            pose_rows.append(
+                {
+                    "Object": obj,
+                    "Object_Number": object_number,
+                    "Chosen_Mesh": chosen_label,
+                    "L_depth": float(chosen["l_depth"]),
+                    "L_mask": float(chosen["l_mask"]),
+                    "L_geom": float(chosen["l_geom"]),
+                    "S_anchor": float(chosen["s_anchor"]),
+                    "Selection_Score": float(chosen["selection_score"]),
+                }
+            )
+            for label, info in existing_entry["candidates"].items():
+                pose_rows_all.append(
+                    {
+                        "Object": obj,
+                        "Object_Number": object_number,
+                        "Candidate": label,
+                        "L_depth": float(info["l_depth"]),
+                        "L_mask": float(info["l_mask"]),
+                        "L_geom": float(info["l_geom"]),
+                        "S_anchor": float(info["s_anchor"]),
+                        "S_anchor_raw": float(info.get("s_anchor_raw", info["s_anchor"])),
+                        "Anchor_Observation_Quality": float(info.get("anchor_observation_quality", 0.0)),
+                        "Anchor_Calibration_Norm": float(info.get("anchor_calibration_norm", 0.0)),
+                        "L_depth_norm": None,
+                        "L_mask_norm": None,
+                        "L_geom_norm": None,
+                        "Selection_Score": float(info["selection_score"]),
+                    }
+                )
+            print(f"[RESUME] {obj}: reused completed anchor-pose entry")
+            continue
         if obj not in recon_results:
             print(f"Skip {obj}: no reconstruction output")
             continue
@@ -1106,15 +1181,17 @@ def main():
             "final_pose_path": os.path.abspath(os.path.join(obj_dir, f"{obj}_initial_pose.txt")),
             "K_path": os.path.abspath(k_path),
         }
+        atomic_write_json(
+            os.path.join(registry_checkpoint_dir, f"{obj}.json"),
+            {"object": obj, "entry": candidate_registry[obj]},
+        )
         _release_cuda_memory()
 
     if not results:
         print("No objects processed.")
         return
 
-    registry_path = os.path.join(result_root, "candidate_registry.json")
-    with open(registry_path, "w", encoding="utf-8") as f:
-        json.dump(candidate_registry, f, indent=2)
+    atomic_write_json(registry_path, candidate_registry)
     print(f"Candidate registry saved to: {registry_path}")
 
     run_meta = {
@@ -1177,8 +1254,7 @@ def main():
         "provenance": runtime_provenance(os.path.dirname(__file__)),
         "args": vars(args),
     }
-    with open(os.path.join(result_root, "anchor_run_meta.json"), "w", encoding="utf-8") as f:
-        json.dump(run_meta, f, indent=2)
+    atomic_write_json(os.path.join(result_root, "anchor_run_meta.json"), run_meta)
 
     df = pd.DataFrame(results).sort_values("Object")
     excel_path = os.path.join(result_root, args.summary_filename)

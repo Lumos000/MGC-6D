@@ -374,6 +374,123 @@ def _load_real275_evaluation_resources(
     }
 
 
+def _evaluate_real275_pose_metrics(
+    *,
+    pred_eval,
+    gt_eval,
+    gt_vertices_eval,
+    gt_diameter,
+    is_symmetric,
+    trans_disc,
+    intrinsic,
+    depth_m,
+    renderer,
+    object_id,
+):
+    """Evaluate one REAL275 pose with the Oryon/Any6D 2K definitions.
+
+    Geometry and translations are expressed in metres at this API boundary;
+    BOP surface distances and VSD depth are converted to millimetres.  Each
+    returned BOP component is the mean recall over the ten official thresholds
+    used by Oryon, and AR is their arithmetic mean.
+    """
+
+    pred_eval = np.asarray(pred_eval, dtype=np.float64)
+    gt_eval = np.asarray(gt_eval, dtype=np.float64)
+    vertices = np.asarray(gt_vertices_eval, dtype=np.float64)
+    intrinsic = np.asarray(intrinsic, dtype=np.float64).reshape(3, 3)
+    depth_m = np.asarray(depth_m, dtype=np.float64)
+    if (
+        pred_eval.shape != (4, 4)
+        or gt_eval.shape != (4, 4)
+        or vertices.ndim != 2
+        or vertices.shape[1] != 3
+        or not np.isfinite(pred_eval).all()
+        or not np.isfinite(gt_eval).all()
+        or not np.isfinite(vertices).all()
+        or not np.isfinite(gt_diameter)
+        or float(gt_diameter) <= 0.0
+    ):
+        return None
+
+    err_r, err_t = compute_RT_distances(pred_eval, gt_eval)
+    if err_r is None or (np.isscalar(err_r) and float(err_r) == -1.0):
+        return None
+    err_r_value = float(np.asarray(err_r).reshape(-1)[0])
+    err_t_value = float(np.asarray(err_t).reshape(-1)[0])
+
+    add = float(compute_add(vertices, pred_eval, gt_eval))
+    adds = float(compute_adds(vertices, pred_eval, gt_eval))
+    if not np.isfinite(add) or not np.isfinite(adds):
+        return None
+    add_recall = float(add <= float(gt_diameter) * 0.1)
+    adds_recall = float(adds <= float(gt_diameter) * 0.1)
+    add_s_recall = adds_recall if bool(is_symmetric) else add_recall
+
+    mssd_error_m = float(
+        mssd(
+            pose_est=pred_eval,
+            pose_gt=gt_eval,
+            pts=vertices,
+            syms=trans_disc,
+        )
+    )
+    mspd_error_px = float(
+        mspd(
+            pose_est=pred_eval,
+            pose_gt=gt_eval,
+            pts=vertices,
+            K=intrinsic,
+            syms=trans_disc,
+        )
+    )
+    normalized_thresholds = np.arange(0.05, 0.51, 0.05)
+    pixel_thresholds = np.arange(5.0, 51.0, 5.0)
+    mean_mssd = float(
+        (mssd_error_m * 1e3 < normalized_thresholds * float(gt_diameter) * 1e3).mean()
+    )
+    mean_mspd = float((mspd_error_px < pixel_thresholds).mean())
+
+    try:
+        vsd_errors = np.asarray(
+            vsd(
+                pred_eval[:3, :3],
+                pred_eval[:3, 3:4] * 1e3,
+                gt_eval[:3, :3],
+                gt_eval[:3, 3:4] * 1e3,
+                depth_m * 1e3,
+                intrinsic,
+                15.0,
+                list(normalized_thresholds),
+                True,
+                float(gt_diameter) * 1e3,
+                renderer,
+                int(object_id),
+            ),
+            dtype=np.float64,
+        )
+        recalls = np.stack(
+            [vsd_errors < threshold for threshold in normalized_thresholds],
+            axis=1,
+        )
+        mean_vsd = float(recalls.mean())
+    except Exception as exc:
+        warnings.warn(f"VSD evaluation failed for object {object_id}: {exc}")
+        mean_vsd = 0.0
+
+    return {
+        "R_error": err_r_value,
+        "T_error": err_t_value,
+        "ADD": add_recall,
+        "ADD-S": adds_recall,
+        "ADD(-S)": add_s_recall,
+        "MSSD": mean_mssd,
+        "MSPD": mean_mspd,
+        "VSD": mean_vsd,
+        "AR": float((mean_mssd + mean_mspd + mean_vsd) / 3.0),
+    }
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="REAL275 paper-protocol query evaluation")
     parser.add_argument("--name", type=str, default="any6d_real275")

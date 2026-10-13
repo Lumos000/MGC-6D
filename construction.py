@@ -26,6 +26,7 @@ from sam2_rayst3r import (
 from pose_utils import preprocess_depth, guess_translation
 from cuda_retry import run_cudnn_stream_retry
 from revision_protocol import icp_direction_passes
+from anchor_resume import atomic_write_json, completed_reconstruction
 
 
 @dataclass
@@ -118,6 +119,7 @@ class ReconstructionConfig:
     align_high_rmse_penalty: float = 0.15
     align_rmse_penalty_threshold: float = 0.02
     seed: int = 0
+    resume_existing: bool = False
 
 
 SB_SM_OBJECTS = {
@@ -2924,6 +2926,15 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
         out_dir = os.path.join(output_root, obj_name)
         os.makedirs(out_dir, exist_ok=True)
 
+        if cfg.resume_existing:
+            reusable = completed_reconstruction(
+                out_dir, obj_name, asdict(cfg)
+            )
+            if reusable is not None:
+                results[obj_name] = reusable
+                print(f"[RESUME] {obj_name}: reused completed reconstruction")
+                continue
+
         obj_cfg, obj_overrides = _object_specific_cfg(cfg, obj_name)
 
         color, depth_raw, mask, intrinsic = _load_object_inputs_raw(obj_dir)
@@ -3623,8 +3634,7 @@ def run_construction(cfg: ReconstructionConfig) -> Dict[str, Dict[str, str]]:
             "base_config": asdict(cfg),
         }
         meta_path = os.path.join(out_dir, "reconstruction_meta.json")
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=2)
+        atomic_write_json(meta_path, meta)
 
         print(
             f"{obj_name}: depth_unit={depth_unit} range_ratio={best.get('range_ratio'):.3f} "
