@@ -14,6 +14,15 @@ export MPLCONFIGDIR NUMBA_CACHE_DIR
 : "${MODELS_INFO:?Set MODELS_INFO to models_info.json}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
+if ! RESOLVED_PYTHON_BIN="$(command -v "$PYTHON_BIN" 2>/dev/null)"; then
+  RESOLVED_PYTHON_BIN="$(command -v python 2>/dev/null || true)"
+  if [[ -z "$RESOLVED_PYTHON_BIN" ]]; then
+    echo "Cannot find PYTHON_BIN=$PYTHON_BIN or a python executable in PATH." >&2
+    exit 2
+  fi
+  echo "WARNING: PYTHON_BIN=$PYTHON_BIN is unavailable; using $RESOLVED_PYTHON_BIN" >&2
+fi
+PYTHON_BIN="$RESOLVED_PYTHON_BIN"
 SEED="${SEED:-0}"
 QUERY_GPU="${QUERY_GPU:-0}"
 QUERY_NAME="${QUERY_NAME:-ho3d_open_release_eq22_seed0}"

@@ -884,7 +884,7 @@ if __name__ == "__main__":
                 f"{obj_f}: appearance={appearance_summary.mode}, "
                 f"source={appearance_summary.source_label}, "
                 f"transferred={list(appearance_summary.transferred_labels)}, "
-                f"uniform={list(appearance_summary.uniform_labels)}, "
+                f"projected={list(appearance_summary.projected_labels)}, "
                 f"projected_vertex_counts={dict(appearance_summary.projected_vertex_counts)}"
             )
             for label, cand_mesh in registry_meshes.items():

@@ -27,6 +27,7 @@ from foundationpose.Utils import (
     align_mesh_to_coordinate,
 )
 from sam2_rayst3r import running_sam_box
+from candidate_admission import is_genuine_fusion, is_instantmesh_only
 from candidate_selection import derive_anchor_reliability_scores, score_candidates
 from revision_protocol import runtime_provenance
 
@@ -279,6 +280,7 @@ def _compute_anchor_calibration_score(
     w_rmse: float,
     tau_inlier: float,
     tau_rmse: float,
+    failed_fused_uses_base: bool = False,
 ) -> float:
     """Compute a bounded geometric-compatibility prior in ``[0, 1]``.
 
@@ -293,8 +295,14 @@ def _compute_anchor_calibration_score(
     rmse = meta.get("align_rmse", float("inf"))
     consistency_ok = (fitness >= tau_inlier) and (rmse <= tau_rmse)
 
-    if label != "fused" or not consistency_ok:
+    if label != "fused":
         return 0.0
+    if not consistency_ok:
+        return (
+            float(np.clip(c_base, 0.0, 1.0))
+            if failed_fused_uses_base
+            else 0.0
+        )
     weights = np.asarray(
         [max(float(w_inlier), 0.0), max(float(w_rmse), 0.0)], dtype=np.float64
     )
@@ -677,6 +685,16 @@ def main():
         default=0.02,
         help="tau_rmse: maximum allowed RMSE for consistency (Eq. 7)",
     )
+    parser.add_argument(
+        "--fusion_admission_policy",
+        choices=("ho3d", "toyl_real275"),
+        default="ho3d",
+        help=(
+            "ho3d keeps the HO3D Fitness admission and zeroes failed fused "
+            "calibration; toyl_real275 admits genuine fusion outputs and uses "
+            "the neutral base calibration when Fitness/RMSE consistency fails"
+        ),
+    )
     parser.add_argument("--anchor_depth_scale", type=float, default=0.05)
     parser.add_argument("--anchor_mask_scale", type=float, default=0.50)
     parser.add_argument("--anchor_geom_scale", type=float, default=0.05)
@@ -893,6 +911,7 @@ def main():
         "mask_source": "dataset_gt" if not args.refine_mask else "sam2_refined",
         "geometry_units": "meters_after_construction",
         "candidate_canonicalization_scale": 1.0,
+        "fusion_admission_policy": args.fusion_admission_policy,
         "reconstruction_method": (
             "current_metric_scale_topology_preserving_visible_surface_phi_v5_ray_frame"
             if args.fusion_mode == "visible_patch"
@@ -1019,13 +1038,18 @@ def main():
         )
         if align_valid and fused_path and os.path.exists(fused_path):
             fusion_diagnostics = recon_meta.get("fusion_diagnostics", {})
-            fused_consistency_ok = (
-                recon_meta.get("align_fitness", -1.0) >= args.anchor_tau_inlier
-                and recon_meta.get("align_rmse", float("inf")) <= args.anchor_tau_rmse
-                and not bool(fusion_diagnostics.get("fallback_used", False))
-                and bool(fusion_diagnostics.get("output_valid", False))
-            )
-            if fused_consistency_ok:
+            if args.fusion_admission_policy == "toyl_real275":
+                fused_ok = is_genuine_fusion(
+                    recon_meta,
+                    instantmesh_only=is_instantmesh_only(recon_meta),
+                )
+            else:
+                fused_ok = (
+                    recon_meta.get("align_fitness", -1.0) >= args.anchor_tau_inlier
+                    and not bool(fusion_diagnostics.get("fallback_used", False))
+                    and bool(fusion_diagnostics.get("output_valid", False))
+                )
+            if fused_ok:
                 candidates["fused"] = fused_path
 
         calibration_scores = {}
@@ -1038,6 +1062,9 @@ def main():
                 w_rmse=args.anchor_w_rmse,
                 tau_inlier=args.anchor_tau_inlier,
                 tau_rmse=args.anchor_tau_rmse,
+                failed_fused_uses_base=(
+                    args.fusion_admission_policy == "toyl_real275"
+                ),
             )
 
         # ====================================================================

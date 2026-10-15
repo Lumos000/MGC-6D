@@ -14,6 +14,15 @@ export MPLCONFIGDIR NUMBA_CACHE_DIR
 : "${YCB_MODEL_PATH:?Set YCB_MODEL_PATH to the YCB model root}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
+if ! RESOLVED_PYTHON_BIN="$(command -v "$PYTHON_BIN" 2>/dev/null)"; then
+  RESOLVED_PYTHON_BIN="$(command -v python 2>/dev/null || true)"
+  if [[ -z "$RESOLVED_PYTHON_BIN" ]]; then
+    echo "Cannot find PYTHON_BIN=$PYTHON_BIN or a python executable in PATH." >&2
+    exit 2
+  fi
+  echo "WARNING: PYTHON_BIN=$PYTHON_BIN is unavailable; using $RESOLVED_PYTHON_BIN" >&2
+fi
+PYTHON_BIN="$RESOLVED_PYTHON_BIN"
 SEED="${SEED:-0}"
 ANCHOR_GPUS="${ANCHOR_GPUS:-0,1}"
 QUERY_GPU="${QUERY_GPU:-0}"
@@ -24,6 +33,7 @@ RUN_QUERY="${RUN_QUERY:-1}"
 ALIGN_STRICT_BOTH="${ALIGN_STRICT_BOTH:-0}"
 ICP_FITNESS_THRESHOLD="${ICP_FITNESS_THRESHOLD:-0.05}"
 ICP_RMSE_THRESHOLD="${ICP_RMSE_THRESHOLD:-0.02}"
+FUSION_ADMISSION_POLICY="${FUSION_ADMISSION_POLICY:-ho3d}"
 CANDIDATE_LABELS="${CANDIDATE_LABELS:-rayst3r,instantmesh,fused}"
 CANDIDATE_COLOR_MODE="${CANDIDATE_COLOR_MODE:-anchor_prior_hybrid}"
 W_DEPTH="${W_DEPTH:-0.5}"
@@ -120,6 +130,7 @@ if [[ "$RUN_ANCHOR" != "0" ]]; then
   --anchor_w_rmse 1.0 \
   --anchor_tau_inlier "$ICP_FITNESS_THRESHOLD" \
   --anchor_tau_rmse "$ICP_RMSE_THRESHOLD" \
+  --fusion_admission_policy "$FUSION_ADMISSION_POLICY" \
   --anchor_depth_scale 0.05 \
   --anchor_mask_scale 0.50 \
   --anchor_geom_scale 0.05 \
