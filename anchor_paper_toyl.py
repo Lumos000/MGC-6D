@@ -267,8 +267,8 @@ def _compute_anchor_calibration_score(meta: dict, label: str, c_base: float, w_i
         return float(c_base) * scale_factor
     fitness = meta.get("align_fitness", -1.0)
     rmse = meta.get("align_rmse", float("inf"))
-    consistency_ok = (fitness >= tau_inlier) and (rmse <= tau_rmse)
-    if label == "fused" and consistency_ok:
+    fitness_ok = fitness >= tau_inlier
+    if label == "fused" and fitness_ok:
         weight_sum = max(float(w_inlier) + float(w_rmse), 1e-8)
         rmse_quality = float(np.exp(-max(float(rmse), 0.0) / max(float(tau_rmse), 1e-8)))
         alignment_quality = (

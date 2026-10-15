@@ -293,11 +293,11 @@ def _compute_anchor_calibration_score(
 
     fitness = meta.get("align_fitness", -1.0)
     rmse = meta.get("align_rmse", float("inf"))
-    consistency_ok = (fitness >= tau_inlier) and (rmse <= tau_rmse)
+    fitness_ok = fitness >= tau_inlier
 
     if label != "fused":
         return 0.0
-    if not consistency_ok:
+    if not fitness_ok:
         return (
             float(np.clip(c_base, 0.0, 1.0))
             if failed_fused_uses_base

@@ -236,7 +236,7 @@ def _compute_anchor_calibration_score(
 
     fitness = meta.get("align_fitness", -1.0)
     rmse = meta.get("align_rmse", float("inf"))
-    if fitness >= tau_inlier and rmse <= tau_rmse:
+    if fitness >= tau_inlier:
         weight_sum = max(float(w_inlier) + float(w_rmse), 1e-8)
         rmse_quality = float(
             np.exp(-max(float(rmse), 0.0) / max(float(tau_rmse), 1e-8))

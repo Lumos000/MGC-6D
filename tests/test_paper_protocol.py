@@ -4,6 +4,7 @@ import ast
 import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -19,6 +20,24 @@ from scripts import verify_paper_result
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_standalone_function(filename: str, function_name: str):
+    """Load a pure helper without importing a CUDA-heavy anchor module."""
+
+    source = (ROOT / filename).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    node = next(
+        item
+        for item in tree.body
+        if isinstance(item, ast.FunctionDef) and item.name == function_name
+    )
+    namespace = {"np": np}
+    exec(
+        compile(ast.Module(body=[node], type_ignores=[]), filename, "exec"),
+        namespace,
+    )
+    return namespace[function_name]
 
 
 def _row(label: str, anchor: float, depth: float, mask: float, geom: float) -> dict:
@@ -60,6 +79,51 @@ def test_missing_candidate_is_allowed_without_fabricating_a_fallback() -> None:
     )
     assert tuple(filtered) == ("rayst3r", "fused")
     assert "instantmesh" not in filtered
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ("anchor_paper.py", "anchor_paper_toyl.py", "anchor_paper_real275.py"),
+)
+def test_anchor_rmse_threshold_is_a_soft_calibration_constraint(
+    filename: str,
+) -> None:
+    score = _load_standalone_function(filename, "_compute_anchor_calibration_score")
+    kwargs = {
+        "label": "fused",
+        "c_base": 0.8,
+        "w_inlier": 1.0,
+        "w_rmse": 1.0,
+        "tau_inlier": 0.05,
+        "tau_rmse": 0.02,
+    }
+    below = score(
+        {"align_fitness": 0.8, "align_rmse": 0.0199},
+        **kwargs,
+    )
+    above = score(
+        {"align_fitness": 0.8, "align_rmse": 0.0201},
+        **kwargs,
+    )
+
+    assert 0.0 < above < 0.8
+    assert abs(above - below) < 0.01
+
+
+def test_ho3d_fusion_admission_has_no_rmse_gate() -> None:
+    source = (ROOT / "anchor_paper.py").read_text(encoding="utf-8")
+    start = source.index("if align_valid and fused_path and os.path.exists(fused_path):")
+    end = source.index("calibration_scores = {}", start)
+    assert "align_rmse" not in source[start:end]
+
+
+def test_icp_direction_selection_keeps_rmse_penalty() -> None:
+    source = (ROOT / "construction.py").read_text(encoding="utf-8")
+    assert "align_score_rmse_weight: float = 40.0" in source
+    assert "align_high_rmse_penalty: float = 0.15" in source
+    assert "score = fitness - cfg.align_score_rmse_weight * rmse" in source
+    assert "if rmse > cfg.align_rmse_penalty_threshold:" in source
+    assert "score -= cfg.align_high_rmse_penalty" in source
 
 
 def test_eq22_fixed_scale_replay_and_argmax() -> None:
