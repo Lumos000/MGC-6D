@@ -24,7 +24,6 @@ import trimesh
 from pytorch_lightning import seed_everything
 from tqdm import tqdm
 
-from bop_toolkit_lib.renderer_vispy import RendererVispy
 from candidate_selection import (
     apply_candidate_appearance,
     compute_anchor_reliability_components,
@@ -409,7 +408,7 @@ def main() -> None:
         "candidate_labels": sorted(selected_labels),
         "candidate_color_mode": args.candidate_color_mode,
         "selection": {
-            "policy": "direct_eq22_argmax",
+            "policy": "direct_eq9_argmax",
             "loss_normalization": "fixed_scale",
             "w_depth": args.w_depth,
             "w_mask": args.w_mask,
@@ -463,6 +462,8 @@ def main() -> None:
         bootstrap.to_device(device)
     shared_scorer = bootstrap.scorer
     shared_refiner = bootstrap.refiner
+    from bop_toolkit_lib.renderer_vispy import RendererVispy
+
     renderer = RendererVispy(640, 480, mode="depth")
 
     grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
@@ -650,7 +651,7 @@ def main() -> None:
                 }
                 audits.append((result, audit))
 
-            # Evaluation-only inputs begin here, after the Eq. (22) winner is fixed.
+            # Evaluation-only inputs begin here, after the Eq. (9) winner is fixed.
             try:
                 anchor_gt = _gt_pose_to_meters(np.loadtxt(anchor_gt_path))
                 scene_gt = _load_json(Path(observation["scene_dir"]) / "scene_gt.json")

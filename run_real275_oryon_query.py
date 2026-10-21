@@ -28,7 +28,6 @@ from candidate_selection import (
     select_scored_candidate,
 )
 from estimater import Any6D, PoseRefinePredictor, ScorePredictor
-from bop_toolkit_lib.renderer_vispy import RendererVispy
 from oryon_real275_protocol import load_manifest
 from revision_protocol import (
     add_query_protocol_arguments,
@@ -270,7 +269,7 @@ def main() -> None:
         "candidate_labels": sorted(selected_labels),
         "candidate_color_mode": args.candidate_color_mode,
         "selection": {
-            "policy": "direct_eq22_argmax",
+            "policy": "direct_eq9_argmax",
             "w_depth": args.w_depth,
             "w_mask": args.w_mask,
             "w_geom": args.w_geom,
@@ -313,6 +312,8 @@ def main() -> None:
         debug=0,
         glctx=glctx,
     )
+    from bop_toolkit_lib.renderer_vispy import RendererVispy
+
     renderer = RendererVispy(640, 480, mode="depth")
     evaluation_cache: dict[str, dict[str, object]] = {}
     grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
@@ -482,7 +483,7 @@ def main() -> None:
                 }
                 candidate_audits.append((result, audit))
 
-            # GT pose and CAD resources are deliberately touched only after Eq.22.
+            # GT pose and CAD resources are deliberately touched only after Eq. (9).
             try:
                 if object_name not in evaluation_cache:
                     evaluation_cache[object_name] = _load_real275_evaluation_resources(

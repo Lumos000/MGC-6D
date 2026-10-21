@@ -11,20 +11,12 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
-    cmake \
     ffmpeg \
-    gcc \
-    g++ \
     git \
-    libboost-program-options-dev \
-    libboost-system-dev \
-    libboost-test-dev \
-    libboost-thread-dev \
     libegl1-mesa-dev \
     libglib2.0-0 \
     libgl1 \
     libgtk2.0-dev \
-    make \
     unzip \
     vim \
     wget \
@@ -43,12 +35,12 @@ RUN conda env create -f environment.yml \
 
 ENV PATH=${CONDA_DIR}/envs/mgc6d/bin:${PATH}
 ENV CONDA_DEFAULT_ENV=mgc6d
+ENV LD_LIBRARY_PATH=${CONDA_DIR}/envs/mgc6d/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
 
 COPY . .
 
-RUN conda install -y -c conda-forge eigen=3.4.0 \
-    && PYTHON_BIN=python CUDA_HOME=/usr/local/cuda \
-       bash scripts/install_revision_dependencies.sh
+RUN PYTHON_BIN=python CUDA_HOME=/usr/local/cuda \
+    bash scripts/install_revision_dependencies.sh
 
 # RaySt3R remains external; pin it to the commit documented in README.md and
 # set RAYST3R_ROOT at runtime. Model weights are intentionally not baked in.

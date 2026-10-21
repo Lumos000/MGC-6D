@@ -126,7 +126,7 @@ def test_icp_direction_selection_keeps_rmse_penalty() -> None:
     assert "score -= cfg.align_high_rmse_penalty" in source
 
 
-def test_eq22_fixed_scale_replay_and_argmax() -> None:
+def test_eq9_fixed_scale_replay_and_argmax() -> None:
     rows = [
         _row("rayst3r", 0.8, 0.02, 0.20, 0.03),
         _row("instantmesh", 0.6, 0.04, 0.10, 0.05),
@@ -152,6 +152,21 @@ def test_eq22_fixed_scale_replay_and_argmax() -> None:
         )
         assert row["total_score"] == pytest.approx(replay, abs=1e-12)
     assert select_scored_candidate(rows)["label"] == "fused"
+
+
+def test_ho3d_anchor_reliability_call_uses_supported_weights() -> None:
+    tree = ast.parse((ROOT / "query_paper.py").read_text(encoding="utf-8"))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "derive_anchor_reliability_scores"
+    ]
+    assert len(calls) == 1
+    assert "w_appearance" not in {
+        keyword.arg for keyword in calls[0].keywords if keyword.arg is not None
+    }
 
 
 def test_selection_rejects_gt_or_audit_fields() -> None:
@@ -347,7 +362,7 @@ def test_formal_launchers_are_executable(filename: str) -> None:
     assert (ROOT / "scripts" / filename).stat().st_mode & 0o111
 
 
-def test_result_verifier_replays_eq22_and_reports_metrics(tmp_path, monkeypatch) -> None:
+def test_result_verifier_replays_eq9_and_reports_metrics(tmp_path, monkeypatch) -> None:
     protocol = dict(verify_paper_result.PROTOCOLS["toyl"])
     protocol["frames"] = 1
     monkeypatch.setitem(verify_paper_result.PROTOCOLS, "toyl", protocol)
@@ -422,4 +437,4 @@ def test_result_verifier_replays_eq22_and_reports_metrics(tmp_path, monkeypatch)
 
     summary = verify_paper_result.verify("toyl", tmp_path)
     assert summary["winner_mismatches"] == 0
-    assert summary["max_eq22_residual"] < 1e-12
+    assert summary["score_max_abs_residual"] < 1e-12

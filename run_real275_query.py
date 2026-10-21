@@ -926,7 +926,7 @@ if __name__ == '__main__':
             if mask.sum() < args.min_mask_pixels:
                 continue
 
-            # Registration and Eq. (22) selection intentionally happen before
+            # Registration and Eq. (9) selection intentionally happen before
             # loading the query GT pose. GT instance masks remain the disclosed
             # input protocol, but pose/CAD annotations cannot affect selection.
             init_pose_cur = None
@@ -1370,7 +1370,7 @@ if __name__ == '__main__':
         "registration_failure_frames": int(registration_failure_frames),
     }
     run_manifest["runtime"] = {
-        "measurement": "registration through Eq.22 winner selection",
+        "measurement": "registration through Eq. (9) winner selection",
         "frames": int(len(selection_times)),
         "median_seconds": (
             float(np.median(selection_times)) if selection_times else None

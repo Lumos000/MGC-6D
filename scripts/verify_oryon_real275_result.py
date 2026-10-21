@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independently verify an Oryon REAL275 result and Eq. (22) selections."""
+"""Independently verify an Oryon REAL275 result and Eq. (9) selections."""
 
 from __future__ import annotations
 
@@ -31,6 +31,11 @@ def main() -> None:
     parser.add_argument("result_dir", type=Path)
     parser.add_argument("--atol", type=float, default=1e-7)
     parser.add_argument("--allow-nonofficial-split", action="store_true")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Optional JSON report path. The result directory is read-only by default.",
+    )
     args = parser.parse_args()
     root = args.result_dir.resolve()
     run = json.loads((root / "query_run_manifest.json").read_text(encoding="utf-8"))
@@ -73,7 +78,7 @@ def main() -> None:
         rtol=0.0,
         atol=args.atol,
     ):
-        raise ValueError("Saved Eq. (22) scores do not match independent replay")
+        raise ValueError("Saved Eq. (9) scores do not match independent replay")
 
     grouped = {int(pair_id): group for pair_id, group in scores.groupby("Pair_ID")}
     for _, frame in frames.iterrows():
@@ -124,14 +129,16 @@ def main() -> None:
         "status": "valid",
         "pairs": len(frames),
         "candidate_rows": len(scores),
-        "eq22_max_abs_error": float(
+        "score_max_abs_error": float(
             np.max(np.abs(replay.to_numpy() - scores["Total_Score"].to_numpy()))
         ) if len(scores) else 0.0,
         "metrics_percent": replay_metrics,
     }
-    (root / "verification.json").write_text(
-        json.dumps(result, indent=2), encoding="utf-8"
-    )
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            json.dumps(result, indent=2) + "\n", encoding="utf-8"
+        )
     print(json.dumps(result, sort_keys=True))
 
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run the disclosed Eq. (22) HO3D query protocol with an existing registry.
+# Run the disclosed Eq. (9) HO3D query protocol with an existing registry.
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mgc6d_ho3d_matplotlib}"
@@ -23,9 +23,11 @@ if ! RESOLVED_PYTHON_BIN="$(command -v "$PYTHON_BIN" 2>/dev/null)"; then
   echo "WARNING: PYTHON_BIN=$PYTHON_BIN is unavailable; using $RESOLVED_PYTHON_BIN" >&2
 fi
 PYTHON_BIN="$RESOLVED_PYTHON_BIN"
+PYTHON_PREFIX="$("$PYTHON_BIN" -c 'import sys; print(sys.prefix)')"
+export LD_LIBRARY_PATH="$PYTHON_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 SEED="${SEED:-0}"
 QUERY_GPU="${QUERY_GPU:-0}"
-QUERY_NAME="${QUERY_NAME:-ho3d_open_release_eq22_seed0}"
+QUERY_NAME="${QUERY_NAME:-ho3d_open_release_eq9_seed0}"
 RUNNING_STRIDE="${RUNNING_STRIDE:-10}"
 CANDIDATE_LABELS="${CANDIDATE_LABELS:-rayst3r,instantmesh,fused}"
 CANDIDATE_COLOR_MODE="${CANDIDATE_COLOR_MODE:-anchor_prior_hybrid}"

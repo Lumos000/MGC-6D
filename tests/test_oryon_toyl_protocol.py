@@ -156,7 +156,7 @@ def test_independent_launcher_has_separate_anchor_and_query_stages() -> None:
     assert '"method_variant": "pair_specific_geometry_reconstruction"' in query_source
 
 
-def test_result_verifier_replays_eq22_and_pair_coverage(tmp_path: Path) -> None:
+def test_result_verifier_replays_eq9_and_pair_coverage(tmp_path: Path) -> None:
     result = tmp_path / "result"
     result.mkdir()
     rows = []
@@ -261,4 +261,19 @@ def test_result_verifier_replays_eq22_and_pair_coverage(tmp_path: Path) -> None:
         cwd=REPO_ROOT,
         check=True,
     )
-    assert json.loads((result / "verification.json").read_text())["status"] == "valid"
+    assert not (result / "verification.json").exists()
+
+    audit = tmp_path / "audit" / "verification.json"
+    subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "verify_oryon_toyl_result.py"),
+            str(result),
+            "--allow-nonofficial-split",
+            "--output",
+            str(audit),
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+    )
+    assert json.loads(audit.read_text())["status"] == "valid"

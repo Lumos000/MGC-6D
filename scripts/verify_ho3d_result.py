@@ -37,6 +37,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("result_dir", type=Path)
     parser.add_argument("--score-tolerance", type=float, default=1e-9)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Optional JSON report path. The result directory is read-only by default.",
+    )
     args = parser.parse_args()
 
     root = args.result_dir.resolve()
@@ -88,7 +93,7 @@ def main() -> None:
     max_residual = float(residual.max()) if len(residual) else 0.0
     if max_residual > args.score_tolerance:
         raise RuntimeError(
-            f"Eq. (22) score mismatch: max residual {max_residual:.3e}"
+            f"Eq. (9) score mismatch: max residual {max_residual:.3e}"
         )
 
     winner_mismatches = 0
@@ -167,8 +172,13 @@ def main() -> None:
             )
 
     runtime = manifest.get("runtime", {})
-    expected_measurement = "candidate registration through Eq.22 winner selection"
-    if runtime.get("measurement") != expected_measurement:
+    accepted_measurements = {
+        "candidate registration through Eq. (9) winner selection",
+        # Compatibility with result manifests created before the equation was
+        # renumbered in the final manuscript.
+        "candidate registration through Eq.22 winner selection",
+    }
+    if runtime.get("measurement") not in accepted_measurements:
         raise RuntimeError(
             "Incorrect runtime measurement description: "
             f"{runtime.get('measurement')!r}"
@@ -197,13 +207,17 @@ def main() -> None:
         "evaluated_frames": int(len(evaluated)),
         "metrics_macro_percent": metrics,
         "candidate_distribution": distribution,
-        "eq22_max_abs_residual": max_residual,
+        "score_max_abs_residual": max_residual,
         "weighted_argmax_mismatches": 0,
         "audit_columns": [],
         "coverage": coverage,
         "runtime": runtime,
     }
-    print(json.dumps(report, indent=2))
+    rendered = json.dumps(report, indent=2)
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(rendered + "\n", encoding="utf-8")
+    print(rendered)
 
 
 if __name__ == "__main__":

@@ -10,8 +10,6 @@ The final candidate is the direct argmax of this scalar score.  No candidate
 is privileged as a default and no undisclosed hard replacement gate is used.
 The disclosed fixed-scale normalization is recorded in the run manifest and
 in the per-candidate score table so the implementation is reproducible.
-- Efficient implementation (Sec.3.4): geometry state reuse, bbox-diagonal
-  diameter approximation (Eq.26-27), and lazy tensorization (Eq.28).
 """
 
 from project_paths import setup_project_paths
@@ -352,7 +350,7 @@ def _resolve_pose_with_symmetry(
 def _select_weighted_candidate(
     candidate_results: list,
 ) -> tuple:
-    """Return the direct argmax of the paper's weighted score (Eq. 22)."""
+    """Return the direct argmax of the paper's weighted score (Eq. 9)."""
     if not candidate_results:
         raise ValueError("candidate_results must not be empty")
 
@@ -490,7 +488,7 @@ if __name__ == "__main__":
         choices=["weighted"],
         default="weighted",
         help=(
-            "Directly maximize S(G)=alpha*S_a_norm+beta*S_q (Eq.2/Eq.22); "
+            "Directly maximize S(G)=alpha*S_a_norm+beta*S_q (Eq. (9)); "
             "no default candidate, score margin, or component-wise hard gate"
         ),
     )
@@ -842,7 +840,6 @@ if __name__ == "__main__":
                 w_depth=args.w_depth,
                 w_mask=args.w_mask,
                 w_geom=args.w_geom,
-                w_appearance=args.w_appearance,
                 depth_scale=args.anchor_depth_scale,
                 mask_scale=args.anchor_mask_scale,
                 geom_scale=args.anchor_geom_scale,
@@ -1138,7 +1135,7 @@ if __name__ == "__main__":
                 r["selection_score"] = r["total_score"]
 
             # ==============================================================
-            # Direct weighted candidate selection (Eq. 22)
+            # Direct weighted candidate selection (Eq. (9))
             # ==============================================================
             candidate_results.sort(
                 key=lambda item: float(item["selection_score"]),
@@ -1187,7 +1184,7 @@ if __name__ == "__main__":
                 frame_candidate_score_rows.append(score_row)
                 result["audit_row"] = score_row
 
-            # Load evaluation-only GT only after Eq. (22) has fixed the winner.
+            # Load evaluation-only GT only after Eq. (9) has fixed the winner.
             # This ordering makes it impossible for GT pose annotations to
             # affect registration, candidate scoring, or candidate selection.
             gt_pose_q = reader.get_gt_pose(i)
@@ -1210,7 +1207,7 @@ if __name__ == "__main__":
                 continue
 
             # Only evaluated queries are part of the formal score audit and
-            # runtime summary.  Eq. (22) has already fixed the winner above, so
+            # runtime summary.  Eq. (9) has already fixed the winner above, so
             # this commit cannot leak GT into registration or selection.
             candidate_score_rows.extend(frame_candidate_score_rows)
             selection_times.append(selection_time_s)
@@ -1500,7 +1497,7 @@ if __name__ == "__main__":
         json.dump(coverage, f, indent=2)
     run_manifest["completed"] = True
     run_manifest["runtime"] = {
-        "measurement": "candidate registration through Eq.22 winner selection",
+        "measurement": "candidate registration through Eq. (9) winner selection",
         "frames": int(len(selection_times)),
         "median_seconds": (
             float(np.median(selection_times)) if selection_times else None

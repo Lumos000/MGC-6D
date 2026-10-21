@@ -23,10 +23,12 @@ if ! RESOLVED_PYTHON_BIN="$(command -v "$PYTHON_BIN" 2>/dev/null)"; then
   echo "WARNING: PYTHON_BIN=$PYTHON_BIN is unavailable; using $RESOLVED_PYTHON_BIN" >&2
 fi
 PYTHON_BIN="$RESOLVED_PYTHON_BIN"
+PYTHON_PREFIX="$("$PYTHON_BIN" -c 'import sys; print(sys.prefix)')"
+export LD_LIBRARY_PATH="$PYTHON_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 SEED="${SEED:-0}"
 ANCHOR_GPUS="${ANCHOR_GPUS:-0,1}"
 QUERY_GPU="${QUERY_GPU:-0}"
-QUERY_NAME="${QUERY_NAME:-ho3d_open_release_eq22_seed0}"
+QUERY_NAME="${QUERY_NAME:-ho3d_open_release_eq9_seed0}"
 RUNNING_STRIDE="${RUNNING_STRIDE:-10}"
 RUN_ANCHOR="${RUN_ANCHOR:-1}"
 RUN_QUERY="${RUN_QUERY:-1}"

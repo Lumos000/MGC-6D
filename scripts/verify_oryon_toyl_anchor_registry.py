@@ -20,7 +20,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--anchor-output", type=Path, required=True)
     parser.add_argument("--pair-manifest", type=Path, required=True)
-    parser.add_argument("--coverage-output", type=Path)
+    parser.add_argument(
+        "--output",
+        "--coverage-output",
+        dest="output",
+        type=Path,
+        help="Optional JSON report path. Anchor artifacts are read-only by default.",
+    )
     parser.add_argument("--allow-nonofficial-split", action="store_true")
     args = parser.parse_args()
 
@@ -85,8 +91,11 @@ def main() -> None:
         "candidate_artifacts": candidate_count,
         "missing_reference_examples": sorted(missing)[:20],
     }
-    output = args.coverage_output or args.anchor_output / "oryon_toyl_anchor_coverage.json"
-    output.write_text(json.dumps(coverage, indent=2) + "\n", encoding="utf-8")
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            json.dumps(coverage, indent=2) + "\n", encoding="utf-8"
+        )
     print(json.dumps(coverage, sort_keys=True))
 
 

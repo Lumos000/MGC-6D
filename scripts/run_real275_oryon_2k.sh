@@ -10,6 +10,12 @@ export NUMBA_CACHE_DIR
 mkdir -p results/logs "$MPLCONFIGDIR" "$NUMBA_CACHE_DIR"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
+if ! PYTHON_BIN="$(command -v "$PYTHON_BIN" 2>/dev/null)"; then
+  echo "Cannot find PYTHON_BIN in PATH." >&2
+  exit 2
+fi
+PYTHON_PREFIX="$("$PYTHON_BIN" -c 'import sys; print(sys.prefix)')"
+export LD_LIBRARY_PATH="$PYTHON_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 SEED="${SEED:-0}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 RUN_FETCH="${RUN_FETCH:-1}"

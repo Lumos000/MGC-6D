@@ -76,7 +76,7 @@ def strict_both_icp_passes(
 
 
 def add_query_protocol_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add the common Eq. (22) and candidate-pool arguments."""
+    """Add the common Eq. (9) and candidate-pool arguments."""
 
     parser.add_argument(
         "--candidate_labels",
@@ -101,7 +101,7 @@ def add_query_protocol_arguments(parser: argparse.ArgumentParser) -> None:
         default=False,
         help=(
             "Evaluate and save metrics for every registered candidate in "
-            "addition to the online Eq. (22) winner. Candidate metrics are "
+            "addition to the online Eq. (9) winner. Candidate metrics are "
             "evaluation-only and never affect scoring or selection."
         ),
     )
@@ -123,7 +123,7 @@ def validate_query_protocol(args: argparse.Namespace) -> set[str]:
         dtype=np.float64,
     )
     if not np.isfinite(weights).all() or (weights < 0.0).any():
-        raise ValueError("Eq. (22) weights must be finite and non-negative")
+        raise ValueError("Eq. (9) weights must be finite and non-negative")
     if args.w_depth + args.w_mask + args.w_geom <= 0.0:
         raise ValueError("At least one query-loss weight must be positive")
     if args.score_alpha + args.score_beta <= 0.0:

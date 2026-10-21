@@ -1,81 +1,88 @@
 # Released experiments
 
-The maintained release consists of one anchor-to-query launcher for each
-dataset:
+## Main paper accuracy protocols
 
-| Dataset | Launcher | Default stride | Anchor mask | Query mask |
-|---|---|---:|---|---|
-| HO3D | `scripts/run_ho3d_full.sh` | 10 | dataset GT | XMem prediction |
-| TOYL | `scripts/run_toyl_full.sh` | 1 | dataset GT instance | dataset GT instance |
-| REAL275 | `scripts/run_real275_full.sh` | 10 | dataset GT instance | dataset GT instance |
+The main quantitative comparisons use one fixed-reference protocol for HO3D
+and the official Oryon ordered-pair protocols for TOYL and REAL275.
 
-The fixed-anchor results above are not protocol-equivalent to methods reported
-on Oryon's variable-reference 2K pair lists. For that comparison use:
+| Dataset | Launcher | Protocol | Evaluation size |
+|---|---|---|---:|
+| HO3D | `scripts/run_ho3d_full.sh` | Fixed anchor per object, stride-10 queries | 2,008 valid queries |
+| TOYL | `scripts/run_toyl_oryon_2k.sh` | Official Oryon list | 2,000 pairs / 890 references |
+| REAL275 | `scripts/run_real275_oryon_2k.sh` | Official Oryon list | 2,000 pairs / 1,447 references |
 
-| Dataset | Launcher | Ordered pairs | Unique references |
-|---|---|---:|---:|
-| TOYL | `scripts/run_toyl_oryon_2k.sh` | 2,000 | 890 |
-| REAL275 | `scripts/run_real275_oryon_2k.sh` | 2,000 | 1,447 |
+Every Oryon reference constructs its own RaySt3R, InstantMesh, and fused
+candidate pool. Both pair evaluators retain all 2,000 requested pairs in the
+denominator and assign zero metrics to failures. The TOYL implementation splits
+anchor construction into 21 resumable object batches; it still produces 890
+independent reference reconstructions.
 
-Each unique reference builds its own RaySt3R, InstantMesh, and fused candidate
-pool. The removed shared-21 TOYL shortcut is not part of the released protocol.
-Both pair evaluators preserve all 2,000 requested pairs in the denominator and
-assign zero metrics to failures before or after selection.
+The complete environment-variable commands are in the root README. The
+launchers use the same candidate labels, candidate appearance mode, Eq. (9)
+query weights, and final argmax rule. Dataset-specific scale normalization and
+mesh preprocessing remain explicit in the saved anchor command and metadata.
 
-The complete environment-variable commands are in the repository README. All
-three launchers use the same candidate labels, candidate appearance mode, and
-Eq. (22) weights. Dataset-specific geometry preprocessing remains explicit in
-the launcher so that a saved command can be compared directly with the code.
+## Fixed-reference diagnostic analysis
+
+The following launchers keep one reference observation per object:
+
+| Dataset | Launcher | Default stride | Role in the paper |
+|---|---|---:|---|
+| TOYL | `scripts/run_toyl_full.sh` | 1 | Candidate-frequency and runtime analysis |
+| REAL275 | `scripts/run_real275_full.sh` | 10 | Candidate-frequency and runtime analysis |
+
+These fixed-reference TOYL and REAL275 runs cover 1,669 and 1,627 queries,
+respectively. Their accuracy values must not be compared directly with methods
+evaluated on Oryon's variable-reference 2K lists. HO3D uses the same fixed
+anchor protocol for its main accuracy, candidate-frequency, and runtime
+analyses.
 
 ## Anchor stage
 
-Each object folder is processed with a deterministic object-specific seed.
-RaySt3R runs on the first GPU exposed by `ANCHOR_GPUS`; InstantMesh runs on the
-second. The stage writes `anchor_run_meta.json`, `candidate_registry.json`, the
-candidate meshes and poses, alignment metadata, and construction timing.
+Each prepared reference is processed with a deterministic reference-specific
+seed. RaySt3R runs on the first GPU exposed by `ANCHOR_GPUS`; InstantMesh runs
+on the second. The stage writes `anchor_run_meta.json`,
+`candidate_registry.json`, candidate meshes and poses, alignment diagnostics,
+and construction timing.
 
-The native reconstruction stack may return status 139 while Python is tearing
-down after every output has already been flushed. A launcher continues after
-139 only when `scripts/verify_anchor_registry.py` independently confirms the
-complete source-object set, registry, meshes, poses, calibration files, and
-summary files. Any other nonzero status, incomplete output, or stale output
-directory fails closed.
+The native reconstruction stack can return status 139 during interpreter
+teardown after outputs have been flushed. A launcher continues only when the
+independent registry validator confirms that all required registry, mesh,
+pose, calibration, and summary artifacts are complete. Other nonzero status or
+incomplete output fails closed.
 
 ## Query stage
 
-Every available candidate is registered independently. The selector uses only
-the recorded anchor score and query depth, mask, and geometry losses. Ground
-truth is read after selection for metric calculation and cannot affect the
-winner. Failed frame instances remain represented by the dataset evaluator's
-coverage accounting.
+Every available candidate is registered independently. Selection uses the
+stored anchor score and query depth, mask, and geometry losses. Ground truth is
+opened only after selection for metric calculation and cannot affect the
+winner. Run manifests retain the command, seed, protocol, candidate labels,
+normalization scales, repository state, and runtime provenance.
 
-HO3D additionally provides `scripts/run_ho3d_query.sh` for reusing an existing
-validated anchor registry. For TOYL or REAL275, set `RUN_ANCHOR=0` and point
-`ANCHOR_OUT` to the existing registry before invoking the full launcher.
-
-## Saved evidence
+## Saved evidence and validation
 
 A completed query directory contains:
 
-- `query_run_manifest.json`: command, seed, repository state, parameters, mask
-  protocol, candidate fingerprints, runtime, and completion state;
-- `evaluation_coverage.json`: attempted, evaluated, failed, and missing-GT
-  accounting;
-- `0_all_candidate_scores.xlsx`: Eq. (22) components and the selected row;
-- aggregate and per-frame metric workbooks;
+- `query_run_manifest.json`: command, seed, repository state, protocol,
+  parameters, mask provenance, runtime, and completion state;
+- `evaluation_coverage.json` or `summary.json`: attempted, successful, failed,
+  and missing-GT accounting;
+- candidate-score tables containing every Eq. (9) component and selected row;
+- aggregate and per-instance metric tables;
 - candidate-selection counts.
 
-The public validators replay the score and winner without pose estimation:
+Validation is read-only unless `--output` is explicitly supplied:
 
 ```bash
-python scripts/verify_ho3d_result.py RESULT_DIR
-python scripts/verify_paper_result.py --dataset toyl RESULT_DIR
-python scripts/verify_paper_result.py --dataset real275 RESULT_DIR
+python scripts/verify_ho3d_result.py HO3D_RESULT_DIR
 python scripts/verify_oryon_toyl_result.py TOYL_2K_RESULT_DIR
 python scripts/verify_oryon_real275_result.py REAL275_2K_RESULT_DIR
+
+python scripts/verify_ho3d_result.py HO3D_RESULT_DIR \
+  --output audit/ho3d_verification.json
 ```
 
-The HO3D full protocol samples 2,046 stride-10 frames. Its metadata lacks an
-object GT pose for 38 sampled frames, so those frames are reported as
-missing-GT and are not inserted into the candidate score table. The remaining
-2,008 evaluated queries each have exactly one selected candidate.
+The HO3D protocol samples 2,046 stride-10 frames. GT object poses are absent
+for 38 sampled frames; these are recorded as missing-GT rather than inserted
+into the score table. The remaining 2,008 queries each contain exactly one
+selected candidate.

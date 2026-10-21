@@ -78,3 +78,19 @@ rayst3r/
 !foundationpose/weights/
 !sam2/checkpoints/
 !instantmesh/ckpts/
+
+# Local manuscript and internal revision orchestration (not part of the code release).
+main.tex
+revision.env.example
+scripts/check_revision_floors.py
+scripts/compare_revision_selection.py
+scripts/launch_revision_suite.sh
+scripts/print_best_config_env.py
+scripts/revision_status.py
+scripts/revision_suite_worker.sh
+scripts/summarize_revision_results.py
+scripts/sweep_revision_scores.py
+scripts/verify_revision_result.py
+scripts/write_revision_environment.py
+scripts/run_ho3d_ablation.sh
+visualize_ho3d_queries.py

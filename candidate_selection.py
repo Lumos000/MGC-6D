@@ -76,7 +76,7 @@ def paper_registry_candidates(entries: Mapping[str, Mapping]) -> dict[str, dict]
 
 
 def select_scored_candidate(candidates: list[dict]) -> dict:
-    """Select the Eq. (22) argmax before any GT/evaluation fields are attached."""
+    """Select the Eq. (9) argmax before any GT/evaluation fields are attached."""
 
     if not candidates:
         raise ValueError("Cannot select from an empty candidate list")

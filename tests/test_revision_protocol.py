@@ -169,8 +169,8 @@ def test_ho3d_missing_gt_rows_are_committed_only_after_gt_checks() -> None:
         "candidate_score_rows.extend(frame_candidate_score_rows)", anchor_gt
     )
     assert winner < pending < query_gt < anchor_gt < commit
-    assert "DINO query feature extraction through Eq.22 winner selection" not in source
-    assert "candidate registration through Eq.22 winner selection" in source
+    assert "DINO query feature extraction through Eq. (9) winner selection" not in source
+    assert "candidate registration through Eq. (9) winner selection" in source
 
 
 def test_released_query_paths_have_no_learned_reranker() -> None:

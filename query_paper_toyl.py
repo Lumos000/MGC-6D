@@ -469,7 +469,7 @@ def main():
     if (
         args.w_depth + args.w_mask + args.w_geom + args.w_appearance
     ) <= 0.0:
-        raise ValueError("At least one Eq. (22) observation weight must be positive")
+        raise ValueError("At least one Eq. (9) observation weight must be positive")
     if args.score_alpha < 0.0 or args.score_beta < 0.0:
         raise ValueError("--score_alpha and --score_beta must be non-negative")
     if args.score_alpha + args.score_beta <= 0.0:
@@ -537,10 +537,10 @@ def main():
         },
         "selection": {
             "rule": "direct weighted argmax; no default candidate or hard replacement gate",
-            "score_version": "paper_eq22_v1",
+            "score_version": "paper_eq9_v1",
             "formula": "alpha*S_anchor_norm+beta*(-wd*Ld-wm*Lm-wg*Lg)",
-            "eq22_main_score": True,
-            "appearance_role": "candidate coloring only; excluded from Eq. (22)",
+            "eq9_main_score": True,
+            "appearance_role": "candidate coloring only; excluded from Eq. (9)",
             "loss_normalization": args.query_loss_normalization,
             "w_depth": args.w_depth,
             "w_mask": args.w_mask,
@@ -1195,7 +1195,7 @@ def main():
     )
     pd.DataFrame(summary_data).to_excel(f"{save_root}/0_mean_all_metrics_classes_results.xlsx", index=False)
     df_all = pd.DataFrame(all_frame_data)
-    # Counts come from the actual Eq. (22) winner on every evaluated frame.
+    # Counts come from the actual Eq. (9) winner on every evaluated frame.
     requested_candidate_order = list(PAPER_CANDIDATE_LABELS)
     selected_series = df_all["Chosen_Candidate"].astype(str)
     overall_counts = selected_series.value_counts()
@@ -1243,7 +1243,7 @@ def main():
             f,
             indent=2,
         )
-    print("\nCandidate selection counts (Eq. 22):")
+    print("\nCandidate selection counts (Eq. (9)):")
     for row in selection_rows:
         print(
             f"  {row['Candidate']}: {row['Selected_Count']}/"
@@ -1283,7 +1283,7 @@ def main():
         "registration_failure_frames": int(registration_failure_frames),
     }
     run_manifest["runtime"] = {
-        "measurement": "registration through Eq.22 winner selection",
+        "measurement": "registration through Eq. (9) winner selection",
         "frames": int(len(selection_times)),
         "median_seconds": (
             float(np.median(selection_times)) if selection_times else None

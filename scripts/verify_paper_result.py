@@ -92,7 +92,7 @@ def verify(dataset: str, result_dir: Path) -> dict:
     )
     residual = np.abs(replay.to_numpy() - scores["Total_Score"].astype(float).to_numpy())
     max_residual = float(residual.max(initial=0.0))
-    _require(max_residual <= 1e-9, f"Eq.22 replay residual is {max_residual:.3e}")
+    _require(max_residual <= 1e-9, f"Eq. (9) replay residual is {max_residual:.3e}")
 
     winner_mismatches = 0
     selected_total = 0
@@ -104,7 +104,7 @@ def verify(dataset: str, result_dir: Path) -> dict:
             continue
         if float(selected.iloc[0]["Total_Score"]) < float(group["Total_Score"].max()) - 1e-12:
             winner_mismatches += 1
-    _require(winner_mismatches == 0, f"Eq.22 winner mismatches: {winner_mismatches}")
+    _require(winner_mismatches == 0, f"Eq. (9) winner mismatches: {winner_mismatches}")
     _require(selected_total == evaluated_frames, "Selected-candidate/frame count mismatch")
 
     metrics = _read_mean_metrics(result_dir)
@@ -122,7 +122,7 @@ def verify(dataset: str, result_dir: Path) -> dict:
         "dataset": protocol["dataset"],
         "frames": evaluated_frames,
         "metrics": metrics,
-        "max_eq22_residual": max_residual,
+        "score_max_abs_residual": max_residual,
         "winner_mismatches": winner_mismatches,
         "median_seconds": float(median_seconds),
         "candidate_counts": frames["Chosen_Candidate"].value_counts().to_dict(),
@@ -133,9 +133,18 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", required=True, choices=sorted(PROTOCOLS))
     parser.add_argument("result_dir", type=Path)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Optional JSON report path. The result directory is read-only by default.",
+    )
     args = parser.parse_args()
     summary = verify(args.dataset, args.result_dir.resolve())
-    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    rendered = json.dumps(summary, indent=2, ensure_ascii=False)
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(rendered + "\n", encoding="utf-8")
+    print(rendered)
 
 
 if __name__ == "__main__":
